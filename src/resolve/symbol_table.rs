@@ -82,8 +82,8 @@ impl Resolver for SymbolTableResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::extract::RustExtractor;
     use crate::extract::Extractor;
+    use crate::extract::RustExtractor;
 
     #[test]
     fn resolves_cross_file_call() {

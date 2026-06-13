@@ -47,7 +47,7 @@ pub mod resolve;
 pub mod symbol;
 
 pub use error::{CodegraphError, Result};
-pub use extract::{extract_file, extract_path, Extractor};
+pub use extract::{Extractor, extract_file, extract_path};
 pub use graph::{
     ByteSpan, CodeGraph, Confidence, Edge, EdgeKind, FileFacts, Occurrence, RefRole, Reference,
     Symbol, SymbolKind,

@@ -29,10 +29,7 @@ pub enum Descriptor {
     /// A term: const, static, variable, value (`ident.`).
     Term(String),
     /// A method or free function (`ident(disambiguator).`). Empty disambiguator is common.
-    Method {
-        name: String,
-        disambiguator: String,
-    },
+    Method { name: String, disambiguator: String },
     /// A generic type parameter (`[ident]`).
     TypeParameter(String),
     /// A value parameter (`(ident)`).
