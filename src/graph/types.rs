@@ -80,14 +80,17 @@ pub struct Symbol {
     pub signature: String,
 }
 
-/// The role a reference plays. `Call` and `Inherit` are live; `Import`/`Read`/`Write`
-/// arrive with richer extractors.
+/// The role a reference plays. `Call`, `Inherit`, and `Import` are live;
+/// `Read`/`Write` arrive with richer extractors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RefRole {
     /// The reference is a call or object-creation site.
     Call,
     /// The enclosing type extends or implements the referenced type.
     Inherit,
+    /// The enclosing module imports the referenced symbol (an `import`/`use`
+    /// statement). Its source resolves to the file's module symbol.
+    Import,
 }
 
 /// A reference (call site / usage) found in a source file. Pre-resolution it
@@ -121,6 +124,8 @@ pub enum EdgeKind {
     Calls,
     /// A type inherits from / implements another type (subclass → parent).
     Inherits,
+    /// A module imports a symbol (module → imported symbol).
+    Imports,
 }
 
 /// A resolved directed edge between two symbols.

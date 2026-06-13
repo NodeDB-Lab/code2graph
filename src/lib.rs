@@ -35,9 +35,8 @@
 //!
 //! ## Coverage
 //!
-//! Rust, Python, and TypeScript are implemented end-to-end. The remaining
-//! languages ([`lang::Language`] enumerates 14) are added one at a time behind
-//! the [`extract::Extractor`] trait.
+//! All 14 languages ([`lang::Language`]) are implemented end-to-end, each
+//! behind the [`extract::Extractor`] trait.
 
 pub mod error;
 pub mod extract;

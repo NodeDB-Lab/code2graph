@@ -69,6 +69,12 @@ impl Extractor for CppExtractor {
 
         let mut symbols = Vec::new();
         collect_defs(&root, &namespaces, bytes, file, &mut symbols);
+        symbols.push(super::module_symbol(
+            Language::Cpp,
+            &namespaces,
+            file,
+            source.len(),
+        ));
         let mut references =
             collect_call_references(&root, &ts_language, CALL_QUERY, Language::Cpp, bytes, file)?;
         collect_inheritance(&root, bytes, file, &mut references);

@@ -57,7 +57,13 @@ impl Extractor for JavaExtractor {
         let bytes = source.as_bytes();
         let namespaces = java_namespaces(&root, bytes, file);
 
-        let symbols = collect_symbols(&root, bytes, file, &namespaces);
+        let mut symbols = collect_symbols(&root, bytes, file, &namespaces);
+        symbols.push(super::module_symbol(
+            Language::Java,
+            &namespaces,
+            file,
+            source.len(),
+        ));
         let mut references =
             collect_call_references(&root, &ts_language, CALL_QUERY, Language::Java, bytes, file)?;
         collect_inheritance(&root, bytes, file, &mut references);

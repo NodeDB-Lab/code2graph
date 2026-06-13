@@ -55,7 +55,13 @@ impl Extractor for GoExtractor {
         let bytes = source.as_bytes();
         let namespaces = go_namespaces(file);
 
-        let symbols = collect_symbols(&root, bytes, file, &namespaces);
+        let mut symbols = collect_symbols(&root, bytes, file, &namespaces);
+        symbols.push(super::module_symbol(
+            Language::Go,
+            &namespaces,
+            file,
+            source.len(),
+        ));
         let references =
             collect_call_references(&root, &ts_language, CALL_QUERY, Language::Go, bytes, file)?;
 

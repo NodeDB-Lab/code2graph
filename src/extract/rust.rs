@@ -57,7 +57,13 @@ impl Extractor for RustExtractor {
         let bytes = source.as_bytes();
         let namespaces = rust_namespaces(file);
 
-        let symbols = collect_symbols(&root, bytes, file, &namespaces);
+        let mut symbols = collect_symbols(&root, bytes, file, &namespaces);
+        symbols.push(super::module_symbol(
+            Language::Rust,
+            &namespaces,
+            file,
+            source.len(),
+        ));
         let mut references =
             collect_call_references(&root, &ts_language, CALL_QUERY, Language::Rust, bytes, file)?;
         collect_inheritance(&root, bytes, file, &mut references);

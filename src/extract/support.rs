@@ -9,8 +9,9 @@
 use tree_sitter::{Language as TsLanguage, Node, Query, QueryCursor, StreamingIterator};
 
 use crate::error::{CodegraphError, Result};
-use crate::graph::types::{Occurrence, RefRole, Reference};
+use crate::graph::types::{ByteSpan, Occurrence, RefRole, Reference, Symbol, SymbolKind};
 use crate::lang::Language;
+use crate::symbol::{Descriptor, SymbolId};
 
 /// UTF-8 text of a node's byte range (lossy fallback on invalid UTF-8).
 pub(crate) fn node_text<'a>(node: &Node, bytes: &'a [u8]) -> &'a str {
@@ -57,6 +58,49 @@ pub(crate) fn child_text(node: &Node, kind: &str, bytes: &[u8]) -> Option<String
 pub(crate) fn field_text(node: &Node, field: &str, bytes: &[u8]) -> Option<String> {
     node.child_by_field_name(field)
         .map(|n| node_text(&n, bytes).to_owned())
+}
+
+/// The file's **module symbol** — a first-class node for the compilation unit.
+///
+/// Its identity is the file's namespace path (the same segments the extractor
+/// derives for the symbols it contains), rendered as `Namespace` descriptors with
+/// [`SymbolKind::Module`]. It spans the whole file, so any top-level reference
+/// (e.g. an `import`) is attributed to it by the resolver's span-containment rule.
+/// Every file gets exactly one; when the namespace path is empty (a root file),
+/// the file stem is used so the identity stays stable and unique.
+pub(crate) fn module_symbol(
+    lang: Language,
+    namespaces: &[String],
+    file: &str,
+    source_len: usize,
+) -> Symbol {
+    let mut descriptors: Vec<Descriptor> = namespaces
+        .iter()
+        .cloned()
+        .map(Descriptor::Namespace)
+        .collect();
+    if descriptors.is_empty() {
+        let stem = file.rsplit('/').next().unwrap_or(file);
+        let stem = stem.split('.').next().unwrap_or(stem);
+        if !stem.is_empty() {
+            descriptors.push(Descriptor::Namespace(stem.to_owned()));
+        }
+    }
+    let name = descriptors
+        .last()
+        .map_or_else(String::new, |d| d.name().to_owned());
+    Symbol {
+        id: SymbolId::global(lang.as_str(), descriptors),
+        name,
+        kind: SymbolKind::Module,
+        file: file.to_owned(),
+        line: 1,
+        span: ByteSpan {
+            start: 0,
+            end: source_len,
+        },
+        signature: String::new(),
+    }
 }
 
 /// Whether `node` has a `static` storage-class specifier among its direct children.
@@ -113,4 +157,28 @@ pub(crate) fn collect_call_references(
         }
     }
     Ok(refs)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::extract::Extractor as _;
+    use crate::extract::RustExtractor;
+    use crate::graph::types::SymbolKind;
+
+    #[test]
+    fn emits_module_symbol() {
+        let facts = RustExtractor
+            .extract("pub fn f() {}", "src/util.rs")
+            .unwrap();
+        let module_syms: Vec<_> = facts
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Module)
+            .collect();
+        assert_eq!(module_syms.len(), 1, "expected exactly one Module symbol");
+        assert_eq!(
+            module_syms[0].name, "util",
+            "module name should be the file stem"
+        );
+    }
 }

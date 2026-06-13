@@ -77,13 +77,21 @@ impl Extractor for SolidityExtractor {
         let root = tree.root_node();
         let bytes = source.as_bytes();
 
-        let ns_descriptors: Vec<Descriptor> = solidity_namespaces(file)
-            .into_iter()
+        let ns_strings = solidity_namespaces(file);
+        let ns_descriptors: Vec<Descriptor> = ns_strings
+            .iter()
+            .cloned()
             .map(Descriptor::Namespace)
             .collect();
 
         let mut symbols = Vec::new();
         collect_decls(root, &ns_descriptors, false, bytes, file, &mut symbols);
+        symbols.push(super::module_symbol(
+            Language::Solidity,
+            &ns_strings,
+            file,
+            source.len(),
+        ));
 
         let mut references = collect_call_references(
             &root,

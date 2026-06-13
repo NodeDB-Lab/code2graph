@@ -73,12 +73,10 @@ function internal() {}
                 "src/App.jsx",
             )
             .unwrap();
-        assert_eq!(facts.symbols.len(), 1);
-        assert_eq!(facts.symbols[0].name, "App");
-        assert_eq!(
-            facts.symbols[0].id.to_scip_string(),
-            "codegraph    src/App/App()."
-        );
+        // 1 declared symbol + 1 module symbol
+        assert_eq!(facts.symbols.len(), 2);
+        let app = facts.symbols.iter().find(|s| s.name == "App").unwrap();
+        assert_eq!(app.id.to_scip_string(), "codegraph    src/App/App().");
     }
 
     #[test]

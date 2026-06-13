@@ -73,6 +73,12 @@ impl Extractor for PhpExtractor {
 
         let mut symbols = Vec::new();
         collect_defs(&root, &namespaces, bytes, file, &mut symbols);
+        symbols.push(super::module_symbol(
+            Language::Php,
+            &namespaces,
+            file,
+            source.len(),
+        ));
 
         let mut references =
             collect_call_references(&root, &ts_language, CALL_QUERY, Language::Php, bytes, file)?;

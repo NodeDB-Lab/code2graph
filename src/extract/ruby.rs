@@ -60,13 +60,21 @@ impl Extractor for RubyExtractor {
         let root = tree.root_node();
         let bytes = source.as_bytes();
 
-        let namespaces: Vec<Descriptor> = ruby_namespaces(file)
-            .into_iter()
+        let ns_strings = ruby_namespaces(file);
+        let namespaces: Vec<Descriptor> = ns_strings
+            .iter()
+            .cloned()
             .map(Descriptor::Namespace)
             .collect();
 
         let mut symbols = Vec::new();
         walk(&root, &namespaces, bytes, file, &mut symbols);
+        symbols.push(super::module_symbol(
+            Language::Ruby,
+            &ns_strings,
+            file,
+            source.len(),
+        ));
 
         let mut references =
             collect_call_references(&root, &ts_language, CALL_QUERY, Language::Ruby, bytes, file)?;

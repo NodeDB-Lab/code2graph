@@ -60,7 +60,13 @@ impl Extractor for CExtractor {
         let bytes = source.as_bytes();
         let namespaces = c_namespaces(file);
 
-        let symbols = collect_symbols(&root, bytes, file, &namespaces);
+        let mut symbols = collect_symbols(&root, bytes, file, &namespaces);
+        symbols.push(super::module_symbol(
+            Language::C,
+            &namespaces,
+            file,
+            source.len(),
+        ));
         let references =
             collect_call_references(&root, &ts_language, CALL_QUERY, Language::C, bytes, file)?;
 

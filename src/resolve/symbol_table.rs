@@ -25,6 +25,7 @@ fn edge_kind(role: RefRole) -> EdgeKind {
     match role {
         RefRole::Call => EdgeKind::Calls,
         RefRole::Inherit => EdgeKind::Inherits,
+        RefRole::Import => EdgeKind::Imports,
     }
 }
 
@@ -206,5 +207,56 @@ mod tests {
         );
         assert_eq!(e.confidence, Confidence::NameOnly);
         assert_eq!(e.occ.file, "src/p.rs");
+    }
+
+    #[test]
+    fn resolves_import_edge_from_module() {
+        use crate::graph::types::{Occurrence, RefRole, Reference};
+
+        // File A defines `Config`.
+        let a = RustExtractor
+            .extract("pub struct Config {}", "src/conf.rs")
+            .unwrap();
+
+        // File B's module imports it. The extractor gives B a module symbol
+        // spanning the whole file; we inject an Import reference whose byte sits
+        // in the leading comment — inside the module span but not inside any
+        // smaller symbol — so the resolver attributes the edge's source to the
+        // module, exactly as a real top-level `use`/`import` would.
+        let mut b = RustExtractor
+            .extract("// uses Config\npub fn run() {}", "src/app.rs")
+            .unwrap();
+        b.references.push(Reference {
+            name: "Config".to_owned(),
+            occ: Occurrence {
+                file: "src/app.rs".to_owned(),
+                line: 1,
+                col: 0,
+                byte: 0,
+            },
+            role: RefRole::Import,
+        });
+
+        let graph = SymbolTableResolver.resolve(&[a, b]);
+
+        // Exactly one Imports edge: module(app) → Config
+        let imports: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Imports)
+            .collect();
+        assert_eq!(imports.len(), 1, "expected one Imports edge");
+        let e = imports[0];
+        assert!(
+            e.from.to_scip_string().ends_with("app/"),
+            "from (module) was: {}",
+            e.from.to_scip_string()
+        );
+        assert!(
+            e.to.to_scip_string().ends_with("conf/Config#"),
+            "to was: {}",
+            e.to.to_scip_string()
+        );
+        assert_eq!(e.confidence, Confidence::NameOnly);
     }
 }
