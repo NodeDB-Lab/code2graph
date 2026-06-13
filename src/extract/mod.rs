@@ -14,6 +14,7 @@ use crate::graph::FileFacts;
 use crate::graph::types::{Occurrence, RefRole, Reference};
 use crate::lang::Language;
 
+pub mod c;
 pub mod go;
 pub mod java;
 pub mod javascript;
@@ -21,6 +22,7 @@ pub mod python;
 pub mod rust;
 pub mod typescript;
 
+pub use c::CExtractor;
 pub use go::GoExtractor;
 pub use java::JavaExtractor;
 pub use javascript::JavaScriptExtractor;
@@ -44,6 +46,7 @@ pub trait Extractor {
 /// extractor yet. Languages are added one at a time behind the [`Extractor`] trait.
 pub fn extract_file(lang: Language, source: &str, file: &str) -> Result<FileFacts> {
     match lang {
+        Language::C => CExtractor.extract(source, file),
         Language::Go => GoExtractor.extract(source, file),
         Language::Java => JavaExtractor.extract(source, file),
         Language::JavaScript => JavaScriptExtractor.extract(source, file),
