@@ -447,7 +447,7 @@ interface Reader {
         assert_eq!(format_id.kind, SymbolKind::Function);
         assert_eq!(
             format_id.id.to_scip_string(),
-            "codegraph    App/Auth/format_id()."
+            "codegraph . . . App/Auth/format_id()."
         );
 
         // Class symbol.
@@ -455,7 +455,7 @@ interface Reader {
         assert_eq!(session.kind, SymbolKind::Class);
         assert_eq!(
             session.id.to_scip_string(),
-            "codegraph    App/Auth/Session#"
+            "codegraph . . . App/Auth/Session#"
         );
 
         // Class constant.
@@ -463,7 +463,7 @@ interface Reader {
         assert_eq!(max.kind, SymbolKind::Const);
         assert_eq!(
             max.id.to_scip_string(),
-            "codegraph    App/Auth/Session#MAX."
+            "codegraph . . . App/Auth/Session#MAX."
         );
 
         // Public property.
@@ -471,7 +471,7 @@ interface Reader {
         assert_eq!(token.kind, SymbolKind::Static);
         assert_eq!(
             token.id.to_scip_string(),
-            "codegraph    App/Auth/Session#token."
+            "codegraph . . . App/Auth/Session#token."
         );
 
         // Private property must not appear.
@@ -482,7 +482,7 @@ interface Reader {
         assert_eq!(validate.kind, SymbolKind::Method);
         assert_eq!(
             validate.id.to_scip_string(),
-            "codegraph    App/Auth/Session#validate()."
+            "codegraph . . . App/Auth/Session#validate()."
         );
 
         // Private method must not appear.
@@ -491,14 +491,17 @@ interface Reader {
         // Interface symbol.
         let reader = by_name("Reader").unwrap();
         assert_eq!(reader.kind, SymbolKind::Interface);
-        assert_eq!(reader.id.to_scip_string(), "codegraph    App/Auth/Reader#");
+        assert_eq!(
+            reader.id.to_scip_string(),
+            "codegraph . . . App/Auth/Reader#"
+        );
 
         // Interface method — implicitly public, no `public` modifier.
         let read = by_name("read").unwrap();
         assert_eq!(read.kind, SymbolKind::Method);
         assert_eq!(
             read.id.to_scip_string(),
-            "codegraph    App/Auth/Reader#read()."
+            "codegraph . . . App/Auth/Reader#read()."
         );
 
         assert_eq!(facts.lang, "php");
@@ -516,7 +519,7 @@ function format_date($d) {}
         assert_eq!(format_date.kind, SymbolKind::Function);
         assert_eq!(
             format_date.id.to_scip_string(),
-            "codegraph    helpers/format_date()."
+            "codegraph . . . helpers/format_date()."
         );
     }
 

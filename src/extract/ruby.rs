@@ -260,45 +260,48 @@ end
 
         let auth = by_name("Auth").unwrap();
         assert_eq!(auth.kind, SymbolKind::Module);
-        assert_eq!(auth.id.to_scip_string(), "codegraph    auth/session/Auth#");
+        assert_eq!(
+            auth.id.to_scip_string(),
+            "codegraph . . . auth/session/Auth#"
+        );
 
         let session = by_name("Session").unwrap();
         assert_eq!(session.kind, SymbolKind::Class);
         assert_eq!(
             session.id.to_scip_string(),
-            "codegraph    auth/session/Auth#Session#"
+            "codegraph . . . auth/session/Auth#Session#"
         );
 
         let max = by_name("MAX").unwrap();
         assert_eq!(max.kind, SymbolKind::Const);
         assert_eq!(
             max.id.to_scip_string(),
-            "codegraph    auth/session/Auth#Session#MAX."
+            "codegraph . . . auth/session/Auth#Session#MAX."
         );
 
         let validate = by_name("validate").unwrap();
         assert_eq!(validate.kind, SymbolKind::Method);
         assert_eq!(
             validate.id.to_scip_string(),
-            "codegraph    auth/session/Auth#Session#validate()."
+            "codegraph . . . auth/session/Auth#Session#validate()."
         );
 
         let create = by_name("create").unwrap();
         assert_eq!(create.kind, SymbolKind::Method);
         assert_eq!(
             create.id.to_scip_string(),
-            "codegraph    auth/session/Auth#Session#create()."
+            "codegraph . . . auth/session/Auth#Session#create()."
         );
 
         let top = by_name("TOP").unwrap();
         assert_eq!(top.kind, SymbolKind::Const);
-        assert_eq!(top.id.to_scip_string(), "codegraph    auth/session/TOP.");
+        assert_eq!(top.id.to_scip_string(), "codegraph . . . auth/session/TOP.");
 
         let helper = by_name("helper").unwrap();
         assert_eq!(helper.kind, SymbolKind::Method);
         assert_eq!(
             helper.id.to_scip_string(),
-            "codegraph    auth/session/helper()."
+            "codegraph . . . auth/session/helper()."
         );
 
         assert_eq!(facts.lang, "ruby");

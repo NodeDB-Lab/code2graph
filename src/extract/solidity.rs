@@ -708,14 +708,14 @@ contract Token {
         assert_eq!(token.kind, SymbolKind::Class);
         assert_eq!(
             token.id.to_scip_string(),
-            "codegraph    contracts/Token/Token#"
+            "codegraph . . . contracts/Token/Token#"
         );
 
         let mint = by_name(&facts, "mint").unwrap();
         assert_eq!(mint.kind, SymbolKind::Method);
         assert_eq!(
             mint.id.to_scip_string(),
-            "codegraph    contracts/Token/Token#mint()."
+            "codegraph . . . contracts/Token/Token#mint()."
         );
 
         // private function must NOT be emitted
@@ -740,14 +740,14 @@ library SafeMath {
         assert_eq!(iface.kind, SymbolKind::Interface);
         assert_eq!(
             iface.id.to_scip_string(),
-            "codegraph    contracts/Defs/IERC20#"
+            "codegraph . . . contracts/Defs/IERC20#"
         );
 
         let lib = by_name(&facts, "SafeMath").unwrap();
         assert_eq!(lib.kind, SymbolKind::Class);
         assert_eq!(
             lib.id.to_scip_string(),
-            "codegraph    contracts/Defs/SafeMath#"
+            "codegraph . . . contracts/Defs/SafeMath#"
         );
     }
 
@@ -767,14 +767,14 @@ contract Store {
         assert_eq!(total.kind, SymbolKind::Static);
         assert_eq!(
             total.id.to_scip_string(),
-            "codegraph    src/Store/Store#totalSupply."
+            "codegraph . . . src/Store/Store#totalSupply."
         );
 
         let max = by_name(&facts, "MAX_SUPPLY").unwrap();
         assert_eq!(max.kind, SymbolKind::Const);
         assert_eq!(
             max.id.to_scip_string(),
-            "codegraph    src/Store/Store#MAX_SUPPLY."
+            "codegraph . . . src/Store/Store#MAX_SUPPLY."
         );
     }
 
@@ -791,7 +791,7 @@ uint256 constant VERSION = 1;
         assert_eq!(ver.kind, SymbolKind::Const);
         assert_eq!(
             ver.id.to_scip_string(),
-            "codegraph    contracts/Const/VERSION."
+            "codegraph . . . contracts/Const/VERSION."
         );
     }
 
@@ -815,14 +815,14 @@ contract Market {
         assert_eq!(item.kind, SymbolKind::Struct);
         assert_eq!(
             item.id.to_scip_string(),
-            "codegraph    contracts/Market/Market#Item#"
+            "codegraph . . . contracts/Market/Market#Item#"
         );
 
         let price = by_name(&facts, "price").unwrap();
         assert_eq!(price.kind, SymbolKind::Static);
         assert_eq!(
             price.id.to_scip_string(),
-            "codegraph    contracts/Market/Market#Item#price."
+            "codegraph . . . contracts/Market/Market#Item#price."
         );
 
         let seller = by_name(&facts, "seller").unwrap();
@@ -832,14 +832,14 @@ contract Market {
         assert_eq!(status.kind, SymbolKind::Enum);
         assert_eq!(
             status.id.to_scip_string(),
-            "codegraph    contracts/Market/Market#Status#"
+            "codegraph . . . contracts/Market/Market#Status#"
         );
 
         let active = by_name(&facts, "Active").unwrap();
         assert_eq!(active.kind, SymbolKind::Const);
         assert_eq!(
             active.id.to_scip_string(),
-            "codegraph    contracts/Market/Market#Status#Active."
+            "codegraph . . . contracts/Market/Market#Status#Active."
         );
     }
 
@@ -863,14 +863,14 @@ contract Vault {
         assert_eq!(ev.kind, SymbolKind::Other);
         assert_eq!(
             ev.id.to_scip_string(),
-            "codegraph    contracts/Vault/Vault#Deposit."
+            "codegraph . . . contracts/Vault/Vault#Deposit."
         );
 
         let modifier = by_name(&facts, "onlyOwner").unwrap();
         assert_eq!(modifier.kind, SymbolKind::Method);
         assert_eq!(
             modifier.id.to_scip_string(),
-            "codegraph    contracts/Vault/Vault#onlyOwner()."
+            "codegraph . . . contracts/Vault/Vault#onlyOwner()."
         );
     }
 
@@ -889,7 +889,7 @@ function computeHash(bytes memory data) pure returns (bytes32) {
         assert_eq!(func.kind, SymbolKind::Function);
         assert_eq!(
             func.id.to_scip_string(),
-            "codegraph    lib/Utils/computeHash()."
+            "codegraph . . . lib/Utils/computeHash()."
         );
     }
 

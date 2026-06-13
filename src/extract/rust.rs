@@ -341,7 +341,7 @@ pub struct Config { pub value: u32 }
             .unwrap();
         assert_eq!(
             vt.id.to_scip_string(),
-            "codegraph    auth/session/validate_token()."
+            "codegraph . . . auth/session/validate_token()."
         );
         assert_eq!(vt.kind, SymbolKind::Function);
     }

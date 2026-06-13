@@ -634,13 +634,16 @@ class Session {
 
         let session = by_name(&facts, "Session").unwrap();
         assert_eq!(session.kind, SymbolKind::Class);
-        assert_eq!(session.id.to_scip_string(), "codegraph    com/ex/Session#");
+        assert_eq!(
+            session.id.to_scip_string(),
+            "codegraph . . . com/ex/Session#"
+        );
 
         let open = by_name(&facts, "open").unwrap();
         assert_eq!(open.kind, SymbolKind::Method);
         assert_eq!(
             open.id.to_scip_string(),
-            "codegraph    com/ex/Session#open()."
+            "codegraph . . . com/ex/Session#open()."
         );
 
         // private method must NOT be emitted
@@ -661,7 +664,7 @@ interface Readable {
         assert_eq!(readable.kind, SymbolKind::Interface);
         assert_eq!(
             readable.id.to_scip_string(),
-            "codegraph    com/ex/Readable#"
+            "codegraph . . . com/ex/Readable#"
         );
     }
 
@@ -680,14 +683,14 @@ enum class Direction {
 
         let dir = by_name(&facts, "Direction").unwrap();
         assert_eq!(dir.kind, SymbolKind::Enum);
-        assert_eq!(dir.id.to_scip_string(), "codegraph    com/ex/Direction#");
+        assert_eq!(dir.id.to_scip_string(), "codegraph . . . com/ex/Direction#");
 
         for entry in &["NORTH", "SOUTH", "EAST", "WEST"] {
             let sym = by_name(&facts, entry).unwrap();
             assert_eq!(sym.kind, SymbolKind::Const);
             assert_eq!(
                 sym.id.to_scip_string(),
-                format!("codegraph    com/ex/Direction#{entry}.")
+                format!("codegraph . . . com/ex/Direction#{entry}.")
             );
         }
     }
@@ -704,13 +707,13 @@ object Registry {
 
         let reg = by_name(&facts, "Registry").unwrap();
         assert_eq!(reg.kind, SymbolKind::Class);
-        assert_eq!(reg.id.to_scip_string(), "codegraph    com/ex/Registry#");
+        assert_eq!(reg.id.to_scip_string(), "codegraph . . . com/ex/Registry#");
 
         let register = by_name(&facts, "register").unwrap();
         assert_eq!(register.kind, SymbolKind::Method);
         assert_eq!(
             register.id.to_scip_string(),
-            "codegraph    com/ex/Registry#register()."
+            "codegraph . . . com/ex/Registry#register()."
         );
     }
 
@@ -729,14 +732,14 @@ class Config {
         assert_eq!(max.kind, SymbolKind::Const);
         assert_eq!(
             max.id.to_scip_string(),
-            "codegraph    com/ex/Config#maxRetries."
+            "codegraph . . . com/ex/Config#maxRetries."
         );
 
         let timeout = by_name(&facts, "timeout").unwrap();
         assert_eq!(timeout.kind, SymbolKind::Static);
         assert_eq!(
             timeout.id.to_scip_string(),
-            "codegraph    com/ex/Config#timeout."
+            "codegraph . . . com/ex/Config#timeout."
         );
     }
 
@@ -752,7 +755,7 @@ fun greet(name: String): String {
 
         let greet = by_name(&facts, "greet").unwrap();
         assert_eq!(greet.kind, SymbolKind::Function);
-        assert_eq!(greet.id.to_scip_string(), "codegraph    com/ex/greet().");
+        assert_eq!(greet.id.to_scip_string(), "codegraph . . . com/ex/greet().");
     }
 
     // Test 7: typealias → SymbolKind::TypeAlias (name from `type` field)
@@ -765,7 +768,10 @@ typealias StringList = List<String>
 
         let alias = by_name(&facts, "StringList").unwrap();
         assert_eq!(alias.kind, SymbolKind::TypeAlias);
-        assert_eq!(alias.id.to_scip_string(), "codegraph    com/ex/StringList#");
+        assert_eq!(
+            alias.id.to_scip_string(),
+            "codegraph . . . com/ex/StringList#"
+        );
     }
 
     // Test 8: call references captured (free call + member call)

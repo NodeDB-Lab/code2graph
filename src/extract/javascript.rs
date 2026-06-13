@@ -54,7 +54,7 @@ function internal() {}
         // the symbol's `lang` field, not in the rendered string.
         assert_eq!(
             vt.id.to_scip_string(),
-            "codegraph    src/auth/jwt/validateToken()."
+            "codegraph . . . src/auth/jwt/validateToken()."
         );
         assert_eq!(vt.kind, SymbolKind::Function);
         assert_eq!(facts.lang, "javascript");
@@ -76,7 +76,7 @@ function internal() {}
         // 1 declared symbol + 1 module symbol
         assert_eq!(facts.symbols.len(), 2);
         let app = facts.symbols.iter().find(|s| s.name == "App").unwrap();
-        assert_eq!(app.id.to_scip_string(), "codegraph    src/App/App().");
+        assert_eq!(app.id.to_scip_string(), "codegraph . . . src/App/App().");
     }
 
     #[test]

@@ -294,7 +294,7 @@ func helper() {}
         let vt = by_name("Validate").unwrap();
         assert_eq!(
             vt.id.to_scip_string(),
-            "codegraph    auth/session/Validate()."
+            "codegraph . . . auth/session/Validate()."
         );
         assert_eq!(vt.kind, SymbolKind::Function);
 
@@ -320,7 +320,7 @@ func (s *Server) Start() { }
         let facts = GoExtractor.extract(src, "src/run.go").unwrap();
         let start = facts.symbols.iter().find(|s| s.name == "Start").unwrap();
         assert_eq!(start.kind, SymbolKind::Method);
-        assert_eq!(start.id.to_scip_string(), "codegraph    run/Start().");
+        assert_eq!(start.id.to_scip_string(), "codegraph . . . run/Start().");
     }
 
     #[test]

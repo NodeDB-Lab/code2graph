@@ -155,7 +155,7 @@ mod tests {
         assert_eq!(validate.kind, SymbolKind::Function);
         assert_eq!(
             validate.id.to_scip_string(),
-            "codegraph    deploy/validate()."
+            "codegraph . . . deploy/validate()."
         );
 
         assert!(by_name("deploy").is_some());

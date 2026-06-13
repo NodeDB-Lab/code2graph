@@ -446,14 +446,14 @@ class Helper {}
         assert_eq!(sm.kind, SymbolKind::Class);
         assert_eq!(
             sm.id.to_scip_string(),
-            "codegraph    com/example/auth/SessionManager#"
+            "codegraph . . . com/example/auth/SessionManager#"
         );
 
         let validate = by_name("validate").unwrap();
         assert_eq!(validate.kind, SymbolKind::Method);
         assert_eq!(
             validate.id.to_scip_string(),
-            "codegraph    com/example/auth/SessionManager#validate()."
+            "codegraph . . . com/example/auth/SessionManager#validate()."
         );
 
         // private method — must not appear
@@ -482,21 +482,21 @@ public interface Reader {
 
         let reader = by_name("Reader").unwrap();
         assert_eq!(reader.kind, SymbolKind::Interface);
-        assert_eq!(reader.id.to_scip_string(), "codegraph    io/svc/Reader#");
+        assert_eq!(reader.id.to_scip_string(), "codegraph . . . io/svc/Reader#");
 
         // Both methods must be emitted even though they carry no `public` modifier.
         let read = by_name("read").unwrap();
         assert_eq!(read.kind, SymbolKind::Method);
         assert_eq!(
             read.id.to_scip_string(),
-            "codegraph    io/svc/Reader#read()."
+            "codegraph . . . io/svc/Reader#read()."
         );
 
         let close = by_name("close").unwrap();
         assert_eq!(close.kind, SymbolKind::Method);
         assert_eq!(
             close.id.to_scip_string(),
-            "codegraph    io/svc/Reader#close()."
+            "codegraph . . . io/svc/Reader#close()."
         );
     }
 

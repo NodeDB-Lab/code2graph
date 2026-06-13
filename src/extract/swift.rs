@@ -647,7 +647,7 @@ public class Session {
         assert_eq!(session.kind, SymbolKind::Class);
         assert_eq!(
             session.id.to_scip_string(),
-            "codegraph    Sources/Auth/Session/Session#"
+            "codegraph . . . Sources/Auth/Session/Session#"
         );
 
         // Public method emitted, nested under Type
@@ -655,7 +655,7 @@ public class Session {
         assert_eq!(validate.kind, SymbolKind::Method);
         assert_eq!(
             validate.id.to_scip_string(),
-            "codegraph    Sources/Auth/Session/Session#validate()."
+            "codegraph . . . Sources/Auth/Session/Session#validate()."
         );
 
         // Private method NOT emitted
@@ -666,7 +666,7 @@ public class Session {
         assert_eq!(token.kind, SymbolKind::Const);
         assert_eq!(
             token.id.to_scip_string(),
-            "codegraph    Sources/Auth/Session/Session#token."
+            "codegraph . . . Sources/Auth/Session/Session#token."
         );
     }
 
@@ -685,21 +685,21 @@ struct Point {
         assert_eq!(point.kind, SymbolKind::Struct);
         assert_eq!(
             point.id.to_scip_string(),
-            "codegraph    Sources/Models/Point/Point#"
+            "codegraph . . . Sources/Models/Point/Point#"
         );
 
         let x = by_name(&facts, "x").unwrap();
         assert_eq!(x.kind, SymbolKind::Const);
         assert_eq!(
             x.id.to_scip_string(),
-            "codegraph    Sources/Models/Point/Point#x."
+            "codegraph . . . Sources/Models/Point/Point#x."
         );
 
         let y = by_name(&facts, "y").unwrap();
         assert_eq!(y.kind, SymbolKind::Static);
         assert_eq!(
             y.id.to_scip_string(),
-            "codegraph    Sources/Models/Point/Point#y."
+            "codegraph . . . Sources/Models/Point/Point#y."
         );
     }
 
@@ -720,7 +720,7 @@ enum Direction {
         assert_eq!(dir.kind, SymbolKind::Enum);
         assert_eq!(
             dir.id.to_scip_string(),
-            "codegraph    Sources/Direction/Direction#"
+            "codegraph . . . Sources/Direction/Direction#"
         );
 
         for case in &["north", "south", "east", "west"] {
@@ -728,7 +728,7 @@ enum Direction {
             assert_eq!(sym.kind, SymbolKind::Const);
             assert_eq!(
                 sym.id.to_scip_string(),
-                format!("codegraph    Sources/Direction/Direction#{case}.")
+                format!("codegraph . . . Sources/Direction/Direction#{case}.")
             );
         }
     }
@@ -747,14 +747,14 @@ public protocol Readable {
         assert_eq!(proto.kind, SymbolKind::Interface);
         assert_eq!(
             proto.id.to_scip_string(),
-            "codegraph    Sources/Protocols/Readable/Readable#"
+            "codegraph . . . Sources/Protocols/Readable/Readable#"
         );
 
         let read = by_name(&facts, "read").unwrap();
         assert_eq!(read.kind, SymbolKind::Method);
         assert_eq!(
             read.id.to_scip_string(),
-            "codegraph    Sources/Protocols/Readable/Readable#read()."
+            "codegraph . . . Sources/Protocols/Readable/Readable#read()."
         );
     }
 
@@ -774,7 +774,7 @@ extension Foo {
         assert_eq!(bar.kind, SymbolKind::Method);
         assert_eq!(
             bar.id.to_scip_string(),
-            "codegraph    Sources/Foo+Ext/Foo#bar()."
+            "codegraph . . . Sources/Foo+Ext/Foo#bar()."
         );
     }
 
@@ -792,7 +792,7 @@ public func greet(name: String) -> String {
         assert_eq!(greet.kind, SymbolKind::Function);
         assert_eq!(
             greet.id.to_scip_string(),
-            "codegraph    Sources/Utils/Greeting/greet()."
+            "codegraph . . . Sources/Utils/Greeting/greet()."
         );
     }
 

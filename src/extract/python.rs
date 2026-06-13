@@ -325,7 +325,7 @@ MAX_RETRIES = 3
         let vt = by_name("validate_token").unwrap();
         assert_eq!(
             vt.id.to_scip_string(),
-            "codegraph    auth/jwt/validate_token()."
+            "codegraph . . . auth/jwt/validate_token()."
         );
         assert_eq!(vt.kind, SymbolKind::Function);
 
@@ -341,7 +341,7 @@ MAX_RETRIES = 3
             .unwrap();
         assert_eq!(
             facts.symbols[0].id.to_scip_string(),
-            "codegraph    auth/helper()."
+            "codegraph . . . auth/helper()."
         );
     }
 

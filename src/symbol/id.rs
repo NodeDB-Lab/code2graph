@@ -24,6 +24,12 @@ pub struct Package {
     pub version: String,
 }
 
+/// Return `s` trimmed, or `"."` if empty — SCIP requires `.` for unknown fields.
+fn scip_field(s: &str) -> &str {
+    let t = s.trim();
+    if t.is_empty() { "." } else { t }
+}
+
 impl Package {
     /// An entirely-unknown package (all fields empty).
     pub fn unknown() -> Self {
@@ -31,12 +37,12 @@ impl Package {
     }
 
     fn render(&self, out: &mut String) {
-        // SCIP space-joins the three fields; empty fields render as a bare space.
-        out.push_str(self.manager.trim());
+        // SCIP space-joins the three fields; empty fields render as `.` per spec.
+        out.push_str(scip_field(&self.manager));
         out.push(' ');
-        out.push_str(self.name.trim());
+        out.push_str(scip_field(&self.name));
         out.push(' ');
-        out.push_str(self.version.trim());
+        out.push_str(scip_field(&self.version));
     }
 }
 
@@ -134,8 +140,11 @@ mod tests {
                 },
             ],
         );
-        // scheme ' ' <empty manager> ' ' <empty name> ' ' <empty version> ' ' descriptors
-        assert_eq!(id.to_scip_string(), "codegraph    auth/validate_token().");
+        // scheme ' ' manager ' ' name ' ' version ' ' descriptors (empty fields → '.')
+        assert_eq!(
+            id.to_scip_string(),
+            "codegraph . . . auth/validate_token()."
+        );
         assert_eq!(id.leaf_name(), Some("validate_token"));
     }
 
@@ -143,5 +152,59 @@ mod tests {
     fn local_renders_local_form() {
         let id = SymbolId::local("src/main.rs", "x0");
         assert_eq!(id.to_scip_string(), "local x0");
+    }
+
+    // ── SCIP-compliance golden tests ──────────────────────────────────────────
+
+    #[test]
+    fn golden_namespace_only() {
+        // global, all-empty package, single Namespace → "codegraph . . . auth/"
+        let id = SymbolId::global("rust", vec![Descriptor::Namespace("auth".into())]);
+        assert_eq!(id.to_scip_string(), "codegraph . . . auth/");
+    }
+
+    // golden_namespace_and_method is covered by global_renders_scip_string above.
+
+    #[test]
+    fn golden_two_namespaces_and_type() {
+        // global, all-empty package, two Namespaces + Type
+        let id = SymbolId::global(
+            "rust",
+            vec![
+                Descriptor::Namespace("auth".into()),
+                Descriptor::Namespace("session".into()),
+                Descriptor::Type("Session".into()),
+            ],
+        );
+        assert_eq!(id.to_scip_string(), "codegraph . . . auth/session/Session#");
+    }
+
+    #[test]
+    fn golden_namespace_and_term() {
+        // global, all-empty package, Namespace + Term (const/static)
+        let id = SymbolId::global(
+            "rust",
+            vec![
+                Descriptor::Namespace("config".into()),
+                Descriptor::Term("MAX_CONN".into()),
+            ],
+        );
+        assert_eq!(id.to_scip_string(), "codegraph . . . config/MAX_CONN.");
+    }
+
+    #[test]
+    fn golden_partial_package_manager_only() {
+        // partially-populated package: manager = "npm", name/version empty
+        let id = SymbolId::Global {
+            scheme: SCHEME.to_owned(),
+            package: Package {
+                manager: "npm".into(),
+                name: String::new(),
+                version: String::new(),
+            },
+            lang: "typescript".into(),
+            descriptors: vec![Descriptor::Namespace("src".into())],
+        };
+        assert_eq!(id.to_scip_string(), "codegraph npm . . src/");
     }
 }

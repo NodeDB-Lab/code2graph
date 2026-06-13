@@ -586,7 +586,10 @@ namespace io {
         let facts = CppExtractor.extract(src, "src/net/sock.cpp").unwrap();
         let f = by_name(&facts, "connect").unwrap();
         assert_eq!(f.kind, SymbolKind::Function);
-        assert_eq!(f.id.to_scip_string(), "codegraph    net/sock/io/connect().");
+        assert_eq!(
+            f.id.to_scip_string(),
+            "codegraph . . . net/sock/io/connect()."
+        );
         assert_eq!(facts.lang, "cpp");
     }
 
@@ -606,13 +609,16 @@ namespace io {
 
         let sock = by_name(&facts, "Sock").unwrap();
         assert_eq!(sock.kind, SymbolKind::Class);
-        assert_eq!(sock.id.to_scip_string(), "codegraph    net/sock/io/Sock#");
+        assert_eq!(
+            sock.id.to_scip_string(),
+            "codegraph . . . net/sock/io/Sock#"
+        );
 
         let open = by_name(&facts, "open").unwrap();
         assert_eq!(open.kind, SymbolKind::Method);
         assert_eq!(
             open.id.to_scip_string(),
-            "codegraph    net/sock/io/Sock#open()."
+            "codegraph . . . net/sock/io/Sock#open()."
         );
 
         // private method — must be absent
@@ -631,11 +637,11 @@ struct Point {
 
         let point = by_name(&facts, "Point").unwrap();
         assert_eq!(point.kind, SymbolKind::Struct);
-        assert_eq!(point.id.to_scip_string(), "codegraph    geo/Point#");
+        assert_eq!(point.id.to_scip_string(), "codegraph . . . geo/Point#");
 
         let x = by_name(&facts, "x").unwrap();
         assert_eq!(x.kind, SymbolKind::Static);
-        assert_eq!(x.id.to_scip_string(), "codegraph    geo/Point#x.");
+        assert_eq!(x.id.to_scip_string(), "codegraph . . . geo/Point#x.");
     }
 
     #[test]
@@ -649,15 +655,15 @@ typedef int Handle;
 
         let color = by_name(&facts, "Color").unwrap();
         assert_eq!(color.kind, SymbolKind::Enum);
-        assert_eq!(color.id.to_scip_string(), "codegraph    types/Color#");
+        assert_eq!(color.id.to_scip_string(), "codegraph . . . types/Color#");
 
         let id = by_name(&facts, "Id").unwrap();
         assert_eq!(id.kind, SymbolKind::TypeAlias);
-        assert_eq!(id.id.to_scip_string(), "codegraph    types/Id#");
+        assert_eq!(id.id.to_scip_string(), "codegraph . . . types/Id#");
 
         let handle = by_name(&facts, "Handle").unwrap();
         assert_eq!(handle.kind, SymbolKind::TypeAlias);
-        assert_eq!(handle.id.to_scip_string(), "codegraph    types/Handle#");
+        assert_eq!(handle.id.to_scip_string(), "codegraph . . . types/Handle#");
     }
 
     #[test]
@@ -668,7 +674,7 @@ typedef int Handle;
         let facts = CppExtractor.extract(src, "src/conf.hpp").unwrap();
         let m = by_name(&facts, "MAX_CONN").unwrap();
         assert_eq!(m.kind, SymbolKind::Const);
-        assert_eq!(m.id.to_scip_string(), "codegraph    conf/MAX_CONN!");
+        assert_eq!(m.id.to_scip_string(), "codegraph . . . conf/MAX_CONN!");
     }
 
     #[test]

@@ -353,7 +353,7 @@ static int private_count;
         assert_eq!(auth.kind, SymbolKind::Function);
         assert_eq!(
             auth.id.to_scip_string(),
-            "codegraph    auth/token/authenticate()."
+            "codegraph . . . auth/token/authenticate()."
         );
 
         // helper: static — must be absent
@@ -364,7 +364,7 @@ static int private_count;
         assert_eq!(session.kind, SymbolKind::Struct);
         assert_eq!(
             session.id.to_scip_string(),
-            "codegraph    auth/token/Session#"
+            "codegraph . . . auth/token/Session#"
         );
 
         // Status: enum definition inside a declaration
@@ -372,7 +372,7 @@ static int private_count;
         assert_eq!(status.kind, SymbolKind::Enum);
         assert_eq!(
             status.id.to_scip_string(),
-            "codegraph    auth/token/Status#"
+            "codegraph . . . auth/token/Status#"
         );
 
         // SessionRef: typedef alias
@@ -380,7 +380,7 @@ static int private_count;
         assert_eq!(alias.kind, SymbolKind::TypeAlias);
         assert_eq!(
             alias.id.to_scip_string(),
-            "codegraph    auth/token/SessionRef#"
+            "codegraph . . . auth/token/SessionRef#"
         );
 
         // global_count: non-static variable
@@ -388,7 +388,7 @@ static int private_count;
         assert_eq!(gc.kind, SymbolKind::Static);
         assert_eq!(
             gc.id.to_scip_string(),
-            "codegraph    auth/token/global_count."
+            "codegraph . . . auth/token/global_count."
         );
 
         // private_count: static — must be absent
@@ -397,7 +397,10 @@ static int private_count;
         // MAX_LEN: object-like macro → Const
         let max = by_name("MAX_LEN").unwrap();
         assert_eq!(max.kind, SymbolKind::Const);
-        assert_eq!(max.id.to_scip_string(), "codegraph    auth/token/MAX_LEN!");
+        assert_eq!(
+            max.id.to_scip_string(),
+            "codegraph . . . auth/token/MAX_LEN!"
+        );
 
         assert_eq!(facts.lang, "c");
     }
@@ -414,12 +417,12 @@ int compute(int n);
         // SQUARE: function-like macro → Function + Descriptor::Macro
         let sq = by_name("SQUARE").unwrap();
         assert_eq!(sq.kind, SymbolKind::Function);
-        assert_eq!(sq.id.to_scip_string(), "codegraph    util/SQUARE!");
+        assert_eq!(sq.id.to_scip_string(), "codegraph . . . util/SQUARE!");
 
         // compute: function prototype in a declaration
         let comp = by_name("compute").unwrap();
         assert_eq!(comp.kind, SymbolKind::Function);
-        assert_eq!(comp.id.to_scip_string(), "codegraph    util/compute().");
+        assert_eq!(comp.id.to_scip_string(), "codegraph . . . util/compute().");
     }
 
     #[test]
