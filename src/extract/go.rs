@@ -13,11 +13,14 @@
 use tree_sitter::{Language as TsLanguage, Node, Parser};
 
 use crate::error::{CodegraphError, Result};
-use crate::graph::types::{ByteSpan, FileFacts, Symbol, SymbolKind};
+use crate::graph::types::{ByteSpan, FileFacts, RefRole, Reference, Symbol, SymbolKind};
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
 
-use super::{Extractor, collect_call_references, field_text, node_text, one_line_signature};
+use super::{
+    Extractor, collect_call_references, field_text, node_text, one_line_signature, push_ref,
+    simple_type_name,
+};
 
 /// Tree-sitter query capturing call-callee identifiers.
 const CALL_QUERY: &str = r#"
@@ -62,8 +65,9 @@ impl Extractor for GoExtractor {
             file,
             source.len(),
         ));
-        let references =
+        let mut references =
             collect_call_references(&root, &ts_language, CALL_QUERY, Language::Go, bytes, file)?;
+        collect_imports(&root, bytes, file, &mut references);
 
         Ok(FileFacts {
             file: file.to_owned(),
@@ -237,6 +241,33 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
     out
 }
 
+/// Recursively walk the tree and emit one [`RefRole::Import`] reference per
+/// `import_spec` node found anywhere in the tree.
+///
+/// tree-sitter-go grammar:
+/// - `import_declaration` → `import_spec` (single) **or** `import_spec_list`
+///   (parenthesised group) → contains `import_spec` children.
+/// - `import_spec` has field `path` (`interpreted_string_literal` or
+///   `raw_string_literal`). The optional field `name` (alias / `_` / `.`) is
+///   intentionally ignored; the package's canonical leaf name is what we emit.
+fn collect_imports(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    if node.kind() == "import_spec" {
+        if let Some(path_node) = node.child_by_field_name("path") {
+            let raw = node_text(&path_node, bytes);
+            // Strip surrounding quote characters (double-quote or backtick).
+            let dequoted = raw.trim_matches('"').trim_matches('`');
+            let leaf = simple_type_name(dequoted, "/");
+            push_ref(out, leaf, &path_node, file, RefRole::Import);
+        }
+        // import_spec has no children we need to recurse into.
+        return;
+    }
+
+    for child in node.children(&mut node.walk()) {
+        collect_imports(&child, bytes, file, out);
+    }
+}
+
 /// True if the identifier is exported (first character is uppercase).
 fn is_exported(name: &str) -> bool {
     name.chars().next().is_some_and(|c| c.is_uppercase())
@@ -306,5 +337,70 @@ func main() {
         let names: Vec<&str> = facts.references.iter().map(|r| r.name.as_str()).collect();
         assert!(names.contains(&"Validate"));
         assert!(names.contains(&"Close"));
+    }
+
+    #[test]
+    fn import_single_stdlib() {
+        let src = "package main\nimport \"fmt\"\n";
+        let facts = GoExtractor.extract(src, "src/main.go").unwrap();
+        let imports: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Import)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert_eq!(imports, vec!["fmt"]);
+    }
+
+    #[test]
+    fn import_deep_path_leaf() {
+        let src = "package main\nimport \"github.com/x/y/pkg\"\n";
+        let facts = GoExtractor.extract(src, "src/main.go").unwrap();
+        let imports: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Import)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert_eq!(imports, vec!["pkg"]);
+    }
+
+    #[test]
+    fn import_grouped() {
+        let src = "package main\nimport (\n  \"os\"\n  \"io/ioutil\"\n)\n";
+        let facts = GoExtractor.extract(src, "src/main.go").unwrap();
+        let mut imports: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Import)
+            .map(|r| r.name.as_str())
+            .collect();
+        imports.sort_unstable();
+        assert_eq!(imports, vec!["ioutil", "os"]);
+    }
+
+    #[test]
+    fn import_aliased_emits_leaf_not_alias() {
+        let src = "package main\nimport f \"fmt\"\n";
+        let facts = GoExtractor.extract(src, "src/main.go").unwrap();
+        let imports: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Import)
+            .map(|r| r.name.as_str())
+            .collect();
+        // The package leaf "fmt" must be emitted; the alias "f" must not appear
+        // as an Import reference.
+        assert_eq!(imports, vec!["fmt"]);
+        let aliases: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Import && r.name == "f")
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(
+            aliases.is_empty(),
+            "alias 'f' should not appear as an Import ref"
+        );
     }
 }
