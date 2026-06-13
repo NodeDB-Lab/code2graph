@@ -20,6 +20,7 @@ tree-sitter-go = "0.25.0"
 tree-sitter-java = "0.23.5"
 tree-sitter-c = "0.24.2"
 tree-sitter-ruby = "0.23.1"
+tree-sitter-php = "0.24.2"
 
 [profile.release]
 opt-level = 3

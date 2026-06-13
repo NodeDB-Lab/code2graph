@@ -18,6 +18,7 @@ pub mod c;
 pub mod go;
 pub mod java;
 pub mod javascript;
+pub mod php;
 pub mod python;
 pub mod ruby;
 pub mod rust;
@@ -27,6 +28,7 @@ pub use c::CExtractor;
 pub use go::GoExtractor;
 pub use java::JavaExtractor;
 pub use javascript::JavaScriptExtractor;
+pub use php::PhpExtractor;
 pub use python::PythonExtractor;
 pub use ruby::RubyExtractor;
 pub use rust::RustExtractor;
@@ -52,6 +54,7 @@ pub fn extract_file(lang: Language, source: &str, file: &str) -> Result<FileFact
         Language::Go => GoExtractor.extract(source, file),
         Language::Java => JavaExtractor.extract(source, file),
         Language::JavaScript => JavaScriptExtractor.extract(source, file),
+        Language::Php => PhpExtractor.extract(source, file),
         Language::Python => PythonExtractor.extract(source, file),
         Language::Ruby => RubyExtractor.extract(source, file),
         Language::Rust => RustExtractor.extract(source, file),
