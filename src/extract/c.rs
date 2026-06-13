@@ -19,7 +19,9 @@ use crate::graph::types::{ByteSpan, FileFacts, Symbol, SymbolKind};
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
 
-use super::{Extractor, collect_call_references, field_text, node_text, one_line_signature};
+use super::{
+    Extractor, collect_call_references, field_text, is_static, node_text, one_line_signature,
+};
 
 // NOTE: SymbolKind has no Union or Macro variants; unions map to Struct,
 // and preprocessor macros use Descriptor::Macro for SCIP identity (which
@@ -120,12 +122,6 @@ fn declarator_name(node: &Node, bytes: &[u8]) -> Option<(String, bool)> {
             None
         }
     }
-}
-
-/// True if the top-level node has a `storage_class_specifier` child of `static`.
-fn is_static(node: &Node, bytes: &[u8]) -> bool {
-    node.children(&mut node.walk())
-        .any(|c| c.kind() == "storage_class_specifier" && node_text(&c, bytes) == "static")
 }
 
 fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String]) -> Vec<Symbol> {

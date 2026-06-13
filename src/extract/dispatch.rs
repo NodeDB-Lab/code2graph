@@ -8,8 +8,8 @@ use crate::graph::FileFacts;
 use crate::lang::Language;
 
 use super::{
-    CExtractor, GoExtractor, JavaExtractor, JavaScriptExtractor, PhpExtractor, PythonExtractor,
-    RubyExtractor, RustExtractor, ShellExtractor, TypeScriptExtractor,
+    CExtractor, CppExtractor, GoExtractor, JavaExtractor, JavaScriptExtractor, PhpExtractor,
+    PythonExtractor, RubyExtractor, RustExtractor, ShellExtractor, TypeScriptExtractor,
 };
 
 /// A per-language source-to-facts extractor.
@@ -29,6 +29,7 @@ pub trait Extractor {
 pub fn extract_file(lang: Language, source: &str, file: &str) -> Result<FileFacts> {
     match lang {
         Language::C => CExtractor.extract(source, file),
+        Language::Cpp => CppExtractor.extract(source, file),
         Language::Go => GoExtractor.extract(source, file),
         Language::Java => JavaExtractor.extract(source, file),
         Language::JavaScript => JavaScriptExtractor.extract(source, file),

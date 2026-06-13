@@ -13,6 +13,7 @@ mod dispatch;
 mod support;
 
 pub mod c;
+pub mod cpp;
 pub mod go;
 pub mod java;
 pub mod javascript;
@@ -26,6 +27,7 @@ pub mod typescript;
 pub use dispatch::{Extractor, extract_file, extract_path};
 
 pub use c::CExtractor;
+pub use cpp::CppExtractor;
 pub use go::GoExtractor;
 pub use java::JavaExtractor;
 pub use javascript::JavaScriptExtractor;
@@ -37,5 +39,5 @@ pub use shell::ShellExtractor;
 pub use typescript::TypeScriptExtractor;
 
 pub(crate) use support::{
-    child_text, collect_call_references, field_text, node_text, one_line_signature,
+    child_text, collect_call_references, field_text, is_static, node_text, one_line_signature,
 };

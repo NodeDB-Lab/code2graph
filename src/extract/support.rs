@@ -59,6 +59,14 @@ pub(crate) fn field_text(node: &Node, field: &str, bytes: &[u8]) -> Option<Strin
         .map(|n| node_text(&n, bytes).to_owned())
 }
 
+/// Whether `node` has a `static` storage-class specifier among its direct children.
+/// Shared by the C-family extractors (C, C++), whose grammars spell internal linkage
+/// the same way.
+pub(crate) fn is_static(node: &Node, bytes: &[u8]) -> bool {
+    node.children(&mut node.walk())
+        .any(|c| c.kind() == "storage_class_specifier" && node_text(&c, bytes) == "static")
+}
+
 /// Run a tree-sitter call-reference query and collect its `@callee` captures as
 /// [`Reference`]s with [`RefRole::Call`]. The query must expose a capture named
 /// `callee`; captures shorter than [`MIN_REF_LEN`] are dropped. Shared by every
