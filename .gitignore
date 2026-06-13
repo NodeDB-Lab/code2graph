@@ -102,3 +102,6 @@ dmypy.json
 .gradle/
 
 .cargo/
+
+# local session scratch
+.claude/prep/
