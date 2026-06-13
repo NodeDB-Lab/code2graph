@@ -65,6 +65,7 @@ impl Extractor for JavaExtractor {
         let mut references =
             collect_call_references(&root, &ts_language, CALL_QUERY, Language::Java, bytes, file)?;
         collect_inheritance(&root, bytes, file, &mut references);
+        collect_imports(&root, bytes, file, &mut references);
 
         Ok(FileFacts {
             file: file.to_owned(),
@@ -354,6 +355,55 @@ fn push_type_list_refs(container: &Node, bytes: &[u8], file: &str, out: &mut Vec
     }
 }
 
+/// Recursively walk `node` collecting `Import` references for every
+/// `import_declaration` in the tree.
+///
+/// - Wildcard imports (`import com.x.*`) are skipped entirely.
+/// - Named imports (`import com.example.Service`) emit a single ref whose
+///   name is the leaf identifier (e.g. `Service`), positioned at that leaf.
+/// - Static named imports (`import static com.x.Util.helper`) are treated
+///   identically — only the leaf name matters.
+/// - Bare identifier imports (`import Foo`) use the identifier text directly.
+fn collect_imports(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    if node.kind() == "import_declaration" {
+        // Skip wildcard imports — any child with kind "asterisk" means `.*`.
+        let has_wildcard = node
+            .children(&mut node.walk())
+            .any(|c| c.kind() == "asterisk");
+
+        if !has_wildcard {
+            // Prefer a `scoped_identifier` child; fall back to a bare `identifier`.
+            let mut found = false;
+            for child in node.children(&mut node.walk()) {
+                if child.kind() == "scoped_identifier" {
+                    // The `name` field is the final leaf (e.g. `Foo` in `com.x.Foo`).
+                    if let Some(name_node) = child.child_by_field_name("name") {
+                        let name = super::node_text(&name_node, bytes);
+                        super::push_ref(out, name, &name_node, file, RefRole::Import);
+                        found = true;
+                    }
+                    break;
+                }
+            }
+            if !found {
+                // Bare identifier import: `import Foo;`
+                for child in node.children(&mut node.walk()) {
+                    if child.kind() == "identifier" {
+                        let name = super::node_text(&child, bytes);
+                        super::push_ref(out, name, &child, file, RefRole::Import);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // Recurse — import_declarations are top-level, but recursing everywhere is harmless.
+    for child in node.children(&mut node.walk()) {
+        collect_imports(&child, bytes, file, out);
+    }
+}
+
 /// True iff `node` has a `modifiers` child that contains the text `"public"`.
 ///
 /// If there is no `modifiers` child (package-private), returns `false`.
@@ -507,6 +557,67 @@ public class Client {
         assert!(
             inherit_names.contains(&"J"),
             "expected 'J' in {inherit_names:?}"
+        );
+    }
+
+    #[test]
+    fn extracts_named_import_reference() {
+        let src = "import com.example.Service;\nclass A {}";
+        let facts = JavaExtractor.extract(src, "src/A.java").unwrap();
+
+        let import_names: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Import)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(
+            import_names.contains(&"Service"),
+            "expected 'Service' in {import_names:?}"
+        );
+        assert_eq!(
+            import_names.len(),
+            1,
+            "unexpected extra imports: {import_names:?}"
+        );
+    }
+
+    #[test]
+    fn extracts_static_import_reference() {
+        let src = "import static com.x.Util.helper;\nclass A {}";
+        let facts = JavaExtractor.extract(src, "src/A.java").unwrap();
+
+        let import_names: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Import)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(
+            import_names.contains(&"helper"),
+            "expected 'helper' in {import_names:?}"
+        );
+        assert_eq!(
+            import_names.len(),
+            1,
+            "unexpected extra imports: {import_names:?}"
+        );
+    }
+
+    #[test]
+    fn wildcard_import_emits_no_reference() {
+        let src = "import com.x.*;\nclass A {}";
+        let facts = JavaExtractor.extract(src, "src/A.java").unwrap();
+
+        let import_refs: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Import)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(
+            import_refs.is_empty(),
+            "expected no import refs but got: {import_refs:?}"
         );
     }
 }
