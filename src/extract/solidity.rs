@@ -33,9 +33,7 @@
 use tree_sitter::{Language as TsLanguage, Node, Parser};
 
 use crate::error::{CodegraphError, Result};
-use crate::graph::types::{
-    ByteSpan, FileFacts, Occurrence, RefRole, Reference, Symbol, SymbolKind,
-};
+use crate::graph::types::{ByteSpan, FileFacts, RefRole, Reference, Symbol, SymbolKind};
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
 
@@ -624,15 +622,6 @@ fn handle_typedef(
 
 // ── Inheritance-edge helpers ─────────────────────────────────────────────────
 
-/// Return the simple (leaf) type name for a potentially dotted Solidity type.
-///
-/// Solidity uses `.` for library member types: `Lib.Base` → `Base`, `Base` → `Base`.
-fn simple_type_name(text: &str) -> &str {
-    text.rsplit_once('.')
-        .map_or(text, |(_, after)| after)
-        .trim()
-}
-
 /// Recursively walk `node` collecting `Inherit` references for every
 /// `contract_declaration` and `interface_declaration` in the tree.
 fn collect_inheritance(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
@@ -642,7 +631,13 @@ fn collect_inheritance(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Refe
             for child in node.children(&mut cursor) {
                 if child.kind() == "inheritance_specifier" {
                     if let Some(ancestor) = child.child_by_field_name("ancestor") {
-                        push_inherit_ref(&ancestor, bytes, file, out);
+                        super::push_ref(
+                            out,
+                            super::simple_type_name(node_text(&ancestor, bytes), "."),
+                            &ancestor,
+                            file,
+                            RefRole::Inherit,
+                        );
                     }
                 }
             }
@@ -654,28 +649,6 @@ fn collect_inheritance(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Refe
     for child in node.children(&mut node.walk()) {
         collect_inheritance(&child, bytes, file, out);
     }
-}
-
-/// Push one `Inherit` reference for a parent type node (`user_defined_type`).
-///
-/// Uses the node's start position as the occurrence byte, which lies inside the
-/// enclosing contract/interface symbol span — the resolver uses span containment
-/// to attribute the edge to the subclass.
-fn push_inherit_ref(type_node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
-    let name = simple_type_name(node_text(type_node, bytes));
-    if name.is_empty() {
-        return;
-    }
-    out.push(Reference {
-        name: name.to_owned(),
-        occ: Occurrence {
-            file: file.to_owned(),
-            line: (type_node.start_position().row + 1) as u32,
-            col: type_node.start_position().column as u32,
-            byte: type_node.start_byte(),
-        },
-        role: RefRole::Inherit,
-    });
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────

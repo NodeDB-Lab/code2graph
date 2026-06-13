@@ -18,9 +18,7 @@
 use tree_sitter::{Language as TsLanguage, Node, Parser};
 
 use crate::error::{CodegraphError, Result};
-use crate::graph::types::{
-    ByteSpan, FileFacts, Occurrence, RefRole, Reference, Symbol, SymbolKind,
-};
+use crate::graph::types::{ByteSpan, FileFacts, RefRole, Reference, Symbol, SymbolKind};
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
 
@@ -209,32 +207,6 @@ fn emit_named(
     }
 }
 
-/// Strip generic parameters and namespace qualification to yield a simple type
-/// name. `ns.Foo<T>` → `Foo`, `A.B` → `B`, `Bar` → `Bar`.
-fn simple_type_name(text: &str) -> &str {
-    let base = text.split_once('<').map_or(text, |(b, _)| b);
-    base.rsplit_once('.').map_or(base, |(_, a)| a).trim()
-}
-
-/// Push one `Inherit` reference for a parent-type node (its simple name + byte
-/// position, which lies inside the subclass's symbol span).
-fn push_inherit_ref(type_node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
-    let name = simple_type_name(node_text(type_node, bytes));
-    if name.is_empty() {
-        return;
-    }
-    out.push(Reference {
-        name: name.to_owned(),
-        occ: Occurrence {
-            file: file.to_owned(),
-            line: (type_node.start_position().row + 1) as u32,
-            col: type_node.start_position().column as u32,
-            byte: type_node.start_byte(),
-        },
-        role: RefRole::Inherit,
-    });
-}
-
 /// Recursively walk `node` collecting `Inherit` references for every
 /// `class_declaration` and `interface_declaration` in the tree (including nested
 /// classes).
@@ -259,7 +231,13 @@ fn collect_inheritance(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Refe
                         "extends_clause" => {
                             // The superclass is the `value` field.
                             if let Some(value) = clause.child_by_field_name("value") {
-                                push_inherit_ref(&value, bytes, file, out);
+                                super::push_ref(
+                                    out,
+                                    super::simple_type_name(node_text(&value, bytes), "."),
+                                    &value,
+                                    file,
+                                    RefRole::Inherit,
+                                );
                             }
                         }
                         "implements_clause" => {
@@ -273,7 +251,13 @@ fn collect_inheritance(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Refe
                                             | "nested_type_identifier"
                                     )
                                 {
-                                    push_inherit_ref(&type_node, bytes, file, out);
+                                    super::push_ref(
+                                        out,
+                                        super::simple_type_name(node_text(&type_node, bytes), "."),
+                                        &type_node,
+                                        file,
+                                        RefRole::Inherit,
+                                    );
                                 }
                             }
                         }
@@ -295,7 +279,13 @@ fn collect_inheritance(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Refe
                             "type_identifier" | "generic_type" | "nested_type_identifier"
                         )
                     {
-                        push_inherit_ref(&type_node, bytes, file, out);
+                        super::push_ref(
+                            out,
+                            super::simple_type_name(node_text(&type_node, bytes), "."),
+                            &type_node,
+                            file,
+                            RefRole::Inherit,
+                        );
                     }
                 }
             }

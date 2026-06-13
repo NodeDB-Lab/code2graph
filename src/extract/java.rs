@@ -15,9 +15,7 @@
 use tree_sitter::{Language as TsLanguage, Node, Parser};
 
 use crate::error::{CodegraphError, Result};
-use crate::graph::types::{
-    ByteSpan, FileFacts, Occurrence, RefRole, Reference, Symbol, SymbolKind,
-};
+use crate::graph::types::{ByteSpan, FileFacts, RefRole, Reference, Symbol, SymbolKind};
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
 
@@ -284,17 +282,6 @@ fn collect_members(
     }
 }
 
-/// Strips generic parameters and scoping to yield just the simple type name.
-///
-/// `a.b.Foo<T>` → `Foo`, `Bar` → `Bar`, `Foo<K, V>` → `Foo`.
-fn simple_type_name(text: &str) -> &str {
-    let without_generics = text.split_once('<').map_or(text, |(before, _)| before);
-    without_generics
-        .rsplit_once('.')
-        .map_or(without_generics, |(_, after)| after)
-        .trim()
-}
-
 /// Recursively walk `node` collecting `Inherit` references for every
 /// `class_declaration` and `interface_declaration` in the tree (including nested
 /// classes).
@@ -311,7 +298,13 @@ fn collect_inheritance(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Refe
                     .children(&mut superclass_node.walk())
                     .find(|c| c.is_named())
                 {
-                    push_inherit_ref(&type_node, bytes, file, out);
+                    super::push_ref(
+                        out,
+                        super::simple_type_name(node_text(&type_node, bytes), "."),
+                        &type_node,
+                        file,
+                        RefRole::Inherit,
+                    );
                 }
             }
 
@@ -350,28 +343,15 @@ fn push_type_list_refs(container: &Node, bytes: &[u8], file: &str, out: &mut Vec
     };
     for type_node in type_list.children(&mut type_list.walk()) {
         if type_node.is_named() {
-            push_inherit_ref(&type_node, bytes, file, out);
+            super::push_ref(
+                out,
+                super::simple_type_name(node_text(&type_node, bytes), "."),
+                &type_node,
+                file,
+                RefRole::Inherit,
+            );
         }
     }
-}
-
-/// Push one `Inherit` reference for a parent type node (its simple name + the
-/// node's byte position, which lies inside the subclass's symbol span).
-fn push_inherit_ref(type_node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
-    let name = simple_type_name(node_text(type_node, bytes));
-    if name.is_empty() {
-        return;
-    }
-    out.push(Reference {
-        name: name.to_owned(),
-        occ: Occurrence {
-            file: file.to_owned(),
-            line: (type_node.start_position().row + 1) as u32,
-            col: type_node.start_position().column as u32,
-            byte: type_node.start_byte(),
-        },
-        role: RefRole::Inherit,
-    });
 }
 
 /// True iff `node` has a `modifiers` child that contains the text `"public"`.

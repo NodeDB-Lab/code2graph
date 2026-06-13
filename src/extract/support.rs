@@ -103,6 +103,46 @@ pub(crate) fn module_symbol(
     }
 }
 
+/// The bare leaf name of a (possibly qualified, possibly generic) type-name text.
+///
+/// Strips a generic argument list (`Foo<T>` → `Foo`) then takes the final segment
+/// after `sep` (`a::b::Foo` → `Foo` with `sep = "::"`). `sep` is the language's
+/// path separator — `"::"` (Rust, C++, Ruby), `"."` (Java, Kotlin, Swift, TS,
+/// Solidity), or `"\\"` (PHP). Stripping generics is harmless for languages that
+/// have none, so one helper serves them all.
+pub(crate) fn simple_type_name<'a>(text: &'a str, sep: &str) -> &'a str {
+    let base = text.split_once('<').map_or(text, |(b, _)| b);
+    base.rsplit_once(sep).map_or(base, |(_, a)| a).trim()
+}
+
+/// Push a [`Reference`] for `name` at `node`'s position with the given `role`.
+///
+/// Shared by the inheritance and import passes (only the `role` and how `name` is
+/// derived differ per language). Empty names are skipped. Unlike
+/// [`collect_call_references`], no [`MIN_REF_LEN`] filter applies — short type
+/// names (e.g. `IO`) are legitimate.
+pub(crate) fn push_ref(
+    out: &mut Vec<Reference>,
+    name: &str,
+    node: &Node,
+    file: &str,
+    role: RefRole,
+) {
+    if name.is_empty() {
+        return;
+    }
+    out.push(Reference {
+        name: name.to_owned(),
+        occ: Occurrence {
+            file: file.to_owned(),
+            line: (node.start_position().row + 1) as u32,
+            col: node.start_position().column as u32,
+            byte: node.start_byte(),
+        },
+        role,
+    });
+}
+
 /// Whether `node` has a `static` storage-class specifier among its direct children.
 /// Shared by the C-family extractors (C, C++), whose grammars spell internal linkage
 /// the same way.

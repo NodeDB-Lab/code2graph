@@ -13,9 +13,7 @@
 use tree_sitter::{Language as TsLanguage, Node, Parser};
 
 use crate::error::{CodegraphError, Result};
-use crate::graph::types::{
-    ByteSpan, FileFacts, Occurrence, RefRole, Reference, Symbol, SymbolKind,
-};
+use crate::graph::types::{ByteSpan, FileFacts, RefRole, Reference, Symbol, SymbolKind};
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
 
@@ -232,11 +230,17 @@ fn collect_inheritance(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Refe
                 }
                 match child.kind() {
                     "identifier" => {
-                        push_inherit_ref(&child, node_text(&child, bytes), file, out);
+                        super::push_ref(
+                            out,
+                            node_text(&child, bytes),
+                            &child,
+                            file,
+                            RefRole::Inherit,
+                        );
                     }
                     "attribute" => {
                         if let Some(name) = field_text(&child, "attribute", bytes) {
-                            push_inherit_ref(&child, &name, file, out);
+                            super::push_ref(out, &name, &child, file, RefRole::Inherit);
                         }
                     }
                     _ => {} // subscript (Generic[T]), call, keyword_argument, etc.
@@ -249,24 +253,6 @@ fn collect_inheritance(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Refe
     for child in node.children(&mut node.walk()) {
         collect_inheritance(&child, bytes, file, out);
     }
-}
-
-/// Push one `Inherit` reference using the position of `pos_node` (the
-/// identifier/attribute node that names the base class).
-fn push_inherit_ref(pos_node: &Node, name: &str, file: &str, out: &mut Vec<Reference>) {
-    if name.is_empty() {
-        return;
-    }
-    out.push(Reference {
-        name: name.to_owned(),
-        occ: Occurrence {
-            file: file.to_owned(),
-            line: (pos_node.start_position().row + 1) as u32,
-            col: pos_node.start_position().column as u32,
-            byte: pos_node.start_byte(),
-        },
-        role: RefRole::Inherit,
-    });
 }
 
 #[cfg(test)]

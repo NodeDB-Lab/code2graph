@@ -29,9 +29,7 @@
 use tree_sitter::{Language as TsLanguage, Node, Parser};
 
 use crate::error::{CodegraphError, Result};
-use crate::graph::types::{
-    ByteSpan, FileFacts, Occurrence, RefRole, Reference, Symbol, SymbolKind,
-};
+use crate::graph::types::{ByteSpan, FileFacts, RefRole, Reference, Symbol, SymbolKind};
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
 
@@ -530,16 +528,6 @@ fn handle_secondary_constructor(
 
 // ── Inheritance extraction ───────────────────────────────────────────────────
 
-/// Strips generics and dotted qualifiers to yield just the simple type name.
-///
-/// `com.x.Base` → `Base`, `List<T>` → `List`, `Base()` text gets passed as the
-/// full `user_type` text so generics are already absent, but the helper is
-/// defensive.
-fn simple_type_name(text: &str) -> &str {
-    let base = text.split_once('<').map_or(text, |(b, _)| b);
-    base.rsplit_once('.').map_or(base, |(_, a)| a).trim()
-}
-
 /// Pre-order search returning the first descendant (or self) whose kind is
 /// `user_type`. Covers all three `delegation_specifier` sub-forms uniformly:
 /// - `constructor_invocation` → `type` child is a `user_type`
@@ -557,24 +545,6 @@ fn first_user_type<'a>(node: &Node<'a>) -> Option<Node<'a>> {
     None
 }
 
-/// Push one `Inherit` reference for a `user_type` node.
-fn push_inherit_ref(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
-    let name = simple_type_name(node_text(node, bytes));
-    if name.is_empty() {
-        return;
-    }
-    out.push(Reference {
-        name: name.to_owned(),
-        occ: Occurrence {
-            file: file.to_owned(),
-            line: (node.start_position().row + 1) as u32,
-            col: node.start_position().column as u32,
-            byte: node.start_byte(),
-        },
-        role: RefRole::Inherit,
-    });
-}
-
 /// Recursively walk the tree collecting `Inherit` references for every
 /// `class_declaration` and `object_declaration` that has a `delegation_specifiers`
 /// child.
@@ -585,7 +555,13 @@ fn collect_inheritance(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Refe
                 for spec in child.children(&mut child.walk()) {
                     if spec.kind() == "delegation_specifier" {
                         if let Some(user_type_node) = first_user_type(&spec) {
-                            push_inherit_ref(&user_type_node, bytes, file, out);
+                            super::push_ref(
+                                out,
+                                super::simple_type_name(node_text(&user_type_node, bytes), "."),
+                                &user_type_node,
+                                file,
+                                RefRole::Inherit,
+                            );
                         }
                     }
                 }

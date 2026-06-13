@@ -12,9 +12,7 @@
 use tree_sitter::{Language as TsLanguage, Node, Parser};
 
 use crate::error::{CodegraphError, Result};
-use crate::graph::types::{
-    ByteSpan, FileFacts, Occurrence, RefRole, Reference, Symbol, SymbolKind,
-};
+use crate::graph::types::{ByteSpan, FileFacts, RefRole, Reference, Symbol, SymbolKind};
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
 
@@ -205,18 +203,6 @@ fn impl_type_name(node: &Node, bytes: &[u8]) -> String {
     names.last().cloned().unwrap_or_else(|| "impl".to_owned())
 }
 
-/// Strips generic parameters and `::` path prefixes to yield just the simple
-/// type name.
-///
-/// `a::b::Foo<T>` → `Foo`, `Display` → `Display`, `std::fmt::Display` → `Display`.
-fn simple_type_name(text: &str) -> &str {
-    let without_generics = text.split_once('<').map_or(text, |(before, _)| before);
-    without_generics
-        .rsplit_once("::")
-        .map_or(without_generics, |(_, after)| after)
-        .trim()
-}
-
 /// Recursively walk `node` collecting `Inherit` references for every
 /// `impl_item` (trait implementation) and `trait_item` (supertrait bound) in
 /// the tree (including items inside `mod` blocks).
@@ -225,7 +211,13 @@ fn collect_inheritance(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Refe
         "impl_item" => {
             // Only trait impls have a `trait` field; inherent impls do not.
             if let Some(trait_node) = node.child_by_field_name("trait") {
-                push_inherit_ref(&trait_node, bytes, file, out);
+                super::push_ref(
+                    out,
+                    super::simple_type_name(node_text(&trait_node, bytes), "::"),
+                    &trait_node,
+                    file,
+                    RefRole::Inherit,
+                );
             }
         }
         "trait_item" => {
@@ -234,7 +226,13 @@ fn collect_inheritance(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Refe
                 for child in bounds.children(&mut bounds.walk()) {
                     match child.kind() {
                         "type_identifier" | "generic_type" | "scoped_type_identifier" => {
-                            push_inherit_ref(&child, bytes, file, out);
+                            super::push_ref(
+                                out,
+                                super::simple_type_name(node_text(&child, bytes), "::"),
+                                &child,
+                                file,
+                                RefRole::Inherit,
+                            );
                         }
                         _ => {}
                     }
@@ -248,25 +246,6 @@ fn collect_inheritance(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Refe
     for child in node.children(&mut node.walk()) {
         collect_inheritance(&child, bytes, file, out);
     }
-}
-
-/// Push one `Inherit` reference for a parent type node (its simple name + the
-/// node's byte position, which lies inside the subtype's symbol span).
-fn push_inherit_ref(type_node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
-    let name = simple_type_name(node_text(type_node, bytes));
-    if name.is_empty() {
-        return;
-    }
-    out.push(Reference {
-        name: name.to_owned(),
-        occ: Occurrence {
-            file: file.to_owned(),
-            line: (type_node.start_position().row + 1) as u32,
-            col: type_node.start_position().column as u32,
-            byte: type_node.start_byte(),
-        },
-        role: RefRole::Inherit,
-    });
 }
 
 #[cfg(test)]

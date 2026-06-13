@@ -46,5 +46,5 @@ pub use typescript::TypeScriptExtractor;
 
 pub(crate) use support::{
     child_text, collect_call_references, field_text, is_static, module_symbol, node_text,
-    one_line_signature,
+    one_line_signature, push_ref, simple_type_name,
 };
