@@ -16,7 +16,7 @@ use crate::graph::types::{ByteSpan, FileFacts, Occurrence, RefRole, Reference, S
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
 
-use super::Extractor;
+use super::{node_text, one_line_signature, Extractor};
 
 /// Minimum callee-name length to record as a reference (drops `ok`, `id`, …).
 const MIN_REF_LEN: usize = 3;
@@ -136,7 +136,7 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
                 start: child.start_byte(),
                 end: child.end_byte(),
             },
-            signature: signature_of(&child, bytes),
+            signature: one_line_signature(node_text(&child, bytes), &['{']),
         });
     }
     out
@@ -216,33 +216,6 @@ fn impl_type_name(node: &Node, bytes: &[u8]) -> String {
         }
     }
     names.last().cloned().unwrap_or_else(|| "impl".to_owned())
-}
-
-/// One-line signature: declaration text up to the first top-level `{`,
-/// whitespace-collapsed; falls back to the first line.
-fn signature_of(node: &Node, bytes: &[u8]) -> String {
-    let text = node_text(node, bytes);
-    let mut depth = 0i32;
-    let mut end = text.len();
-    let mut found = false;
-    for (i, c) in text.char_indices() {
-        match c {
-            '{' if depth == 0 => {
-                end = i;
-                found = true;
-                break;
-            }
-            '{' => depth += 1,
-            '}' => depth -= 1,
-            _ => {}
-        }
-    }
-    let sig = if found { &text[..end] } else { text.lines().next().unwrap_or(text) };
-    sig.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn node_text<'a>(node: &Node, bytes: &'a [u8]) -> &'a str {
-    std::str::from_utf8(&bytes[node.start_byte()..node.end_byte()]).unwrap_or("<invalid utf8>")
 }
 
 #[cfg(test)]

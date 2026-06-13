@@ -14,6 +14,8 @@ thiserror = "2"
 tree-sitter = ">=0.24, <0.27"
 # Per-language grammars are added one at a time as extractors land.
 tree-sitter-rust = "0.23"
+tree-sitter-python = "0.23"
+tree-sitter-typescript = "0.23"
 
 [profile.release]
 opt-level = 3
