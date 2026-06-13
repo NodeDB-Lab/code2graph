@@ -23,6 +23,7 @@ pub mod python;
 pub mod ruby;
 pub mod rust;
 pub mod shell;
+pub mod solidity;
 pub mod swift;
 pub mod typescript;
 
@@ -39,6 +40,7 @@ pub use python::PythonExtractor;
 pub use ruby::RubyExtractor;
 pub use rust::RustExtractor;
 pub use shell::ShellExtractor;
+pub use solidity::SolidityExtractor;
 pub use swift::SwiftExtractor;
 pub use typescript::TypeScriptExtractor;
 

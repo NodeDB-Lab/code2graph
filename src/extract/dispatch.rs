@@ -9,8 +9,8 @@ use crate::lang::Language;
 
 use super::{
     CExtractor, CppExtractor, GoExtractor, JavaExtractor, JavaScriptExtractor, KotlinExtractor,
-    PhpExtractor, PythonExtractor, RubyExtractor, RustExtractor, ShellExtractor, SwiftExtractor,
-    TypeScriptExtractor,
+    PhpExtractor, PythonExtractor, RubyExtractor, RustExtractor, ShellExtractor, SolidityExtractor,
+    SwiftExtractor, TypeScriptExtractor,
 };
 
 /// A per-language source-to-facts extractor.
@@ -25,8 +25,8 @@ pub trait Extractor {
 
 /// Extract facts from a single file, dispatching on its language.
 ///
-/// Returns [`CodegraphError::UnsupportedLanguage`] for languages without an
-/// extractor yet. Languages are added one at a time behind the [`Extractor`] trait.
+/// Every [`Language`] has an extractor, so the match is exhaustive — adding a new
+/// `Language` variant is a compile error until a dispatch arm is added here.
 pub fn extract_file(lang: Language, source: &str, file: &str) -> Result<FileFacts> {
     match lang {
         Language::C => CExtractor.extract(source, file),
@@ -41,10 +41,8 @@ pub fn extract_file(lang: Language, source: &str, file: &str) -> Result<FileFact
         Language::Shell => ShellExtractor.extract(source, file),
         Language::Swift => SwiftExtractor.extract(source, file),
         Language::Kotlin => KotlinExtractor.extract(source, file),
+        Language::Solidity => SolidityExtractor.extract(source, file),
         Language::TypeScript => TypeScriptExtractor.extract(source, file),
-        other => Err(CodegraphError::UnsupportedLanguage(
-            other.as_str().to_owned(),
-        )),
     }
 }
 
