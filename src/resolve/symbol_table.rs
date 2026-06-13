@@ -13,9 +13,20 @@
 
 use std::collections::HashMap;
 
-use crate::graph::types::{CodeGraph, Confidence, Edge, EdgeKind, FileFacts, Symbol};
+use crate::graph::types::{CodeGraph, Confidence, Edge, EdgeKind, FileFacts, RefRole, Symbol};
 
 use super::Resolver;
+
+/// Maps a [`RefRole`] to the corresponding [`EdgeKind`].
+///
+/// The match is exhaustive so that adding a new `RefRole` variant forces a
+/// compile error here, keeping the mapping intentional and explicit.
+fn edge_kind(role: RefRole) -> EdgeKind {
+    match role {
+        RefRole::Call => EdgeKind::Calls,
+        RefRole::Inherit => EdgeKind::Inherits,
+    }
+}
 
 /// Name-table resolver. See module docs.
 #[derive(Debug, Default, Clone, Copy)]
@@ -67,7 +78,7 @@ impl Resolver for SymbolTableResolver {
                     edges.push(Edge {
                         from: symbols[from_idx].id.clone(),
                         to: symbols[to_idx].id.clone(),
-                        kind: EdgeKind::Calls,
+                        kind: edge_kind(r.role),
                         confidence: Confidence::NameOnly,
                         occ: r.occ.clone(),
                     });
@@ -83,6 +94,7 @@ impl Resolver for SymbolTableResolver {
 mod tests {
     use super::*;
     use crate::extract::Extractor;
+    use crate::extract::JavaExtractor;
     use crate::extract::RustExtractor;
 
     #[test]
@@ -117,5 +129,41 @@ mod tests {
             .unwrap();
         let graph = SymbolTableResolver.resolve(&[main]);
         assert!(graph.edges.is_empty());
+    }
+
+    #[test]
+    fn resolves_cross_file_inheritance() {
+        let base = JavaExtractor
+            .extract("package p; public class Base {}", "src/p/Base.java")
+            .unwrap();
+        let sub = JavaExtractor
+            .extract(
+                "package p; public class Sub extends Base {}",
+                "src/p/Sub.java",
+            )
+            .unwrap();
+
+        let graph = SymbolTableResolver.resolve(&[base, sub]);
+
+        // exactly one Inherits edge: Sub → Base
+        let inherits: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Inherits)
+            .collect();
+        assert_eq!(inherits.len(), 1);
+        let e = inherits[0];
+        assert!(
+            e.from.to_scip_string().ends_with("p/Sub#"),
+            "from was: {}",
+            e.from.to_scip_string()
+        );
+        assert!(
+            e.to.to_scip_string().ends_with("p/Base#"),
+            "to was: {}",
+            e.to.to_scip_string()
+        );
+        assert_eq!(e.confidence, Confidence::NameOnly);
+        assert_eq!(e.occ.file, "src/p/Sub.java");
     }
 }

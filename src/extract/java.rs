@@ -15,7 +15,9 @@
 use tree_sitter::{Language as TsLanguage, Node, Parser};
 
 use crate::error::{CodegraphError, Result};
-use crate::graph::types::{ByteSpan, FileFacts, Symbol, SymbolKind};
+use crate::graph::types::{
+    ByteSpan, FileFacts, Occurrence, RefRole, Reference, Symbol, SymbolKind,
+};
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
 
@@ -56,8 +58,9 @@ impl Extractor for JavaExtractor {
         let namespaces = java_namespaces(&root, bytes, file);
 
         let symbols = collect_symbols(&root, bytes, file, &namespaces);
-        let references =
+        let mut references =
             collect_call_references(&root, &ts_language, CALL_QUERY, Language::Java, bytes, file)?;
+        collect_inheritance(&root, bytes, file, &mut references);
 
         Ok(FileFacts {
             file: file.to_owned(),
@@ -275,6 +278,96 @@ fn collect_members(
     }
 }
 
+/// Strips generic parameters and scoping to yield just the simple type name.
+///
+/// `a.b.Foo<T>` → `Foo`, `Bar` → `Bar`, `Foo<K, V>` → `Foo`.
+fn simple_type_name(text: &str) -> &str {
+    let without_generics = text.split_once('<').map_or(text, |(before, _)| before);
+    without_generics
+        .rsplit_once('.')
+        .map_or(without_generics, |(_, after)| after)
+        .trim()
+}
+
+/// Recursively walk `node` collecting `Inherit` references for every
+/// `class_declaration` and `interface_declaration` in the tree (including nested
+/// classes).
+fn collect_inheritance(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    match node.kind() {
+        "class_declaration" => {
+            // superclass: child field `superclass` is a `superclass` node;
+            // its children are the `extends` keyword + the actual type node.
+            // We skip named nodes that are keywords and take the first type node.
+            if let Some(superclass_node) = node.child_by_field_name("superclass") {
+                // The `superclass` node contains an anonymous `extends` keyword
+                // followed by the named type node. Take the first named child.
+                if let Some(type_node) = superclass_node
+                    .children(&mut superclass_node.walk())
+                    .find(|c| c.is_named())
+                {
+                    push_inherit_ref(&type_node, bytes, file, out);
+                }
+            }
+
+            // interfaces: child field `interfaces` → `super_interfaces` →
+            // `type_list` → each _type child
+            if let Some(ifaces_node) = node.child_by_field_name("interfaces") {
+                push_type_list_refs(&ifaces_node, bytes, file, out);
+            }
+        }
+        "interface_declaration" => {
+            // extends_interfaces is a CHILD (not a field) named "extends_interfaces"
+            if let Some(extends_node) = node
+                .children(&mut node.walk())
+                .find(|c| c.kind() == "extends_interfaces")
+            {
+                push_type_list_refs(&extends_node, bytes, file, out);
+            }
+        }
+        _ => {}
+    }
+
+    // Recurse into all children so nested classes are covered.
+    for child in node.children(&mut node.walk()) {
+        collect_inheritance(&child, bytes, file, out);
+    }
+}
+
+/// Descend a `super_interfaces` / `extends_interfaces` node to find
+/// `type_list` and push one `Inherit` reference per named `_type` child.
+fn push_type_list_refs(container: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    let Some(type_list) = container
+        .children(&mut container.walk())
+        .find(|c| c.kind() == "type_list")
+    else {
+        return;
+    };
+    for type_node in type_list.children(&mut type_list.walk()) {
+        if type_node.is_named() {
+            push_inherit_ref(&type_node, bytes, file, out);
+        }
+    }
+}
+
+/// Push one `Inherit` reference for a parent type node (its simple name + the
+/// node's byte position, which lies inside the subclass's symbol span).
+fn push_inherit_ref(type_node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    let name = simple_type_name(node_text(type_node, bytes));
+    if name.is_empty() {
+        return;
+    }
+    out.push(Reference {
+        name: name.to_owned(),
+        occ: Occurrence {
+            file: file.to_owned(),
+            line: (type_node.start_position().row + 1) as u32,
+            col: type_node.start_position().column as u32,
+            byte: type_node.start_byte(),
+        },
+        role: RefRole::Inherit,
+    });
+}
+
 /// True iff `node` has a `modifiers` child that contains the text `"public"`.
 ///
 /// If there is no `modifiers` child (package-private), returns `false`.
@@ -391,5 +484,43 @@ public class Client {
             "expected 'validate' in {names:?}"
         );
         assert!(names.contains(&"Server"), "expected 'Server' in {names:?}");
+    }
+
+    #[test]
+    fn extracts_class_inheritance_references() {
+        let src = "package p; public class Foo extends Bar implements Baz {}";
+        let facts = JavaExtractor.extract(src, "src/p/Foo.java").unwrap();
+
+        let inherit_names: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Inherit)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(
+            inherit_names.contains(&"Bar"),
+            "expected 'Bar' in {inherit_names:?}"
+        );
+        assert!(
+            inherit_names.contains(&"Baz"),
+            "expected 'Baz' in {inherit_names:?}"
+        );
+    }
+
+    #[test]
+    fn extracts_interface_extends_reference() {
+        let src = "package p; public interface I extends J {}";
+        let facts = JavaExtractor.extract(src, "src/p/I.java").unwrap();
+
+        let inherit_names: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Inherit)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(
+            inherit_names.contains(&"J"),
+            "expected 'J' in {inherit_names:?}"
+        );
     }
 }
