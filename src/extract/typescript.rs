@@ -79,6 +79,7 @@ pub(super) fn extract_ecmascript(source: &str, file: &str, lang: Language) -> Re
     let mut references =
         collect_call_references(&root, &ts_language, CALL_QUERY, lang, bytes, file)?;
     collect_inheritance(&root, bytes, file, &mut references);
+    collect_imports(&root, bytes, file, &mut references);
 
     Ok(FileFacts {
         file: file.to_owned(),
@@ -299,6 +300,81 @@ fn collect_inheritance(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Refe
     }
 }
 
+/// Recursively walk `node` collecting `Import` references for every
+/// `import_statement` in the tree.
+///
+/// Tree-sitter node shape (TypeScript / TSX grammar):
+/// ```text
+/// import_statement
+///   source: string            ← module path string — IGNORED
+///   import_clause
+///     identifier              ← default import: `import Foo from "x"`
+///     named_imports
+///       import_specifier
+///         name: identifier    ← named import binding: `import { A } from "x"`
+///         alias: identifier   ← IGNORED (`import { A as B }`)
+///     namespace_import        ← `import * as ns from "x"` — SKIPPED entirely
+/// ```
+///
+/// Only the binding name at the call-site is emitted; module sources and
+/// aliases are deliberately not recorded.
+fn collect_imports(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    if node.kind() == "import_statement" {
+        // Locate the `import_clause` child (may be absent for bare `import "x"`).
+        if let Some(clause) = node
+            .children(&mut node.walk())
+            .find(|c| c.kind() == "import_clause")
+        {
+            for child in clause.children(&mut clause.walk()) {
+                match child.kind() {
+                    // Default import: `import Foo from "x"`
+                    "identifier" => {
+                        let name = super::node_text(&child, bytes);
+                        if !name.is_empty() {
+                            super::push_ref(out, name, &child, file, RefRole::Import);
+                        }
+                    }
+                    // Named imports: `import { A, B as C } from "x"`
+                    "named_imports" => {
+                        for specifier in child.children(&mut child.walk()) {
+                            if specifier.kind() != "import_specifier" {
+                                continue;
+                            }
+                            // `name` field is the real (original) name, not the alias.
+                            if let Some(name_node) = specifier.child_by_field_name("name") {
+                                if name_node.kind() == "identifier" {
+                                    let name = super::node_text(&name_node, bytes);
+                                    if !name.is_empty() {
+                                        super::push_ref(
+                                            out,
+                                            name,
+                                            &name_node,
+                                            file,
+                                            RefRole::Import,
+                                        );
+                                    }
+                                }
+                                // string-named imports (exotic) → skip silently
+                            }
+                        }
+                    }
+                    // Namespace import: `import * as ns from "x"` → skip
+                    "namespace_import" => {}
+                    _ => {}
+                }
+            }
+        }
+        // Do not recurse further into `import_statement`; it cannot contain
+        // nested import statements.
+        return;
+    }
+
+    // Recurse into all other nodes so top-level and module-scoped imports are covered.
+    for child in node.children(&mut node.walk()) {
+        collect_imports(&child, bytes, file, out);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -428,6 +504,105 @@ function internal() {}
         assert!(
             inherit_names.contains(&"Base"),
             "expected 'Base' in JS inherit refs: {inherit_names:?}"
+        );
+    }
+
+    // ── Import reference tests ───────────────────────────────────────────────
+
+    #[test]
+    fn ts_named_import_emits_import_ref() {
+        // `import { Service } from "./svc";` → one Import ref `Service`
+        let src = r#"import { Service } from "./svc";"#;
+        let facts = TypeScriptExtractor.extract(src, "src/client.ts").unwrap();
+        let import_names: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Import)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert_eq!(
+            import_names,
+            vec!["Service"],
+            "expected exactly [Service], got {import_names:?}"
+        );
+    }
+
+    #[test]
+    fn ts_default_import_emits_import_ref() {
+        // `import Foo from "./foo";` → Import ref `Foo`
+        let src = r#"import Foo from "./foo";"#;
+        let facts = TypeScriptExtractor.extract(src, "src/use.ts").unwrap();
+        let import_names: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Import)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(
+            import_names.contains(&"Foo"),
+            "expected 'Foo' in import refs: {import_names:?}"
+        );
+    }
+
+    #[test]
+    fn ts_named_import_with_alias_emits_real_name() {
+        // `import { A, B as C } from "x";` → Import refs `A` and `B` (not alias `C`)
+        let src = r#"import { A, B as C } from "x";"#;
+        let facts = TypeScriptExtractor.extract(src, "src/aliases.ts").unwrap();
+        let import_names: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Import)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(
+            import_names.contains(&"A"),
+            "expected 'A' in import refs: {import_names:?}"
+        );
+        assert!(
+            import_names.contains(&"B"),
+            "expected 'B' (real name) in import refs: {import_names:?}"
+        );
+        assert!(
+            !import_names.contains(&"C"),
+            "alias 'C' must NOT appear in import refs: {import_names:?}"
+        );
+    }
+
+    #[test]
+    fn ts_namespace_import_emits_no_import_refs() {
+        // `import * as ns from "x";` → NO Import refs
+        let src = r#"import * as ns from "x";"#;
+        let facts = TypeScriptExtractor.extract(src, "src/ns.ts").unwrap();
+        let import_refs: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Import)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(
+            import_refs.is_empty(),
+            "namespace import must produce no Import refs, got {import_refs:?}"
+        );
+    }
+
+    #[test]
+    fn js_named_import_emits_import_ref() {
+        // JavaScript (.js) through the shared extract_ecmascript core.
+        // `import { thing } from "./m";` → Import ref `thing`
+        use crate::extract::Extractor as _;
+        use crate::extract::JavaScriptExtractor;
+        let src = r#"import { thing } from "./m";"#;
+        let facts = JavaScriptExtractor.extract(src, "src/consumer.js").unwrap();
+        let import_names: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Import)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(
+            import_names.contains(&"thing"),
+            "expected 'thing' in JS import refs: {import_names:?}"
         );
     }
 }
