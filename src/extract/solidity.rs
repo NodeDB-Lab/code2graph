@@ -100,6 +100,7 @@ impl Extractor for SolidityExtractor {
             file,
         )?;
         collect_inheritance(&root, bytes, file, &mut references);
+        collect_imports(&root, bytes, file, &mut references);
 
         Ok(FileFacts {
             file: file.to_owned(),
@@ -620,6 +621,32 @@ fn handle_typedef(
     );
 }
 
+// ── Import-edge helpers ──────────────────────────────────────────────────────
+
+/// Recursively walk `node` collecting `Import` references for every
+/// `import_directive` in the tree.
+///
+/// Only named imports are emitted: `import {Foo, Bar} from "./x.sol"` yields
+/// two refs (`Foo`, `Bar`). Whole-file imports (`import "./lib.sol"`) and
+/// aliased imports (`import {Foo as F}` — the alias `F` is ignored, `Foo` is
+/// emitted) are handled correctly. The `source` field (the path string) is
+/// intentionally ignored — resolution is by leaf name, not file path.
+fn collect_imports(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    if node.kind() == "import_directive" {
+        let mut cursor = node.walk();
+        for import_name_node in node.children_by_field_name("import_name", &mut cursor) {
+            let name = super::node_text(&import_name_node, bytes);
+            super::push_ref(out, name, &import_name_node, file, RefRole::Import);
+        }
+    }
+
+    // Recurse into all children so directives nested inside any structure are covered.
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_imports(&child, bytes, file, out);
+    }
+}
+
 // ── Inheritance-edge helpers ─────────────────────────────────────────────────
 
 /// Recursively walk `node` collecting `Inherit` references for every
@@ -940,6 +967,83 @@ contract Caller {
         assert!(
             !inherit.contains(&"Lib.Base"),
             "dotted form must not appear in {inherit:?}"
+        );
+    }
+
+    // Test: single named import → one Import ref.
+    #[test]
+    fn import_single_named() {
+        let src = r#"pragma solidity ^0.8.0; import {ERC20} from "./ERC20.sol";"#;
+        let facts = extract(src, "contracts/Token.sol");
+
+        let imports: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Import)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert_eq!(
+            imports,
+            vec!["ERC20"],
+            "expected [\"ERC20\"] but got {imports:?}"
+        );
+    }
+
+    // Test: multiple named imports → one Import ref per name.
+    #[test]
+    fn import_multiple_named() {
+        let src = r#"pragma solidity ^0.8.0; import {A, B} from "x.sol";"#;
+        let facts = extract(src, "contracts/Multi.sol");
+
+        let imports: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Import)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(imports.contains(&"A"), "expected 'A' in {imports:?}");
+        assert!(imports.contains(&"B"), "expected 'B' in {imports:?}");
+        assert_eq!(
+            imports.len(),
+            2,
+            "expected exactly 2 import refs, got {imports:?}"
+        );
+    }
+
+    // Test: aliased import → emit the original name, not the alias.
+    #[test]
+    fn import_aliased_emits_original_name() {
+        let src = r#"pragma solidity ^0.8.0; import {Foo as F} from "x.sol";"#;
+        let facts = extract(src, "contracts/Alias.sol");
+
+        let imports: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Import)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(imports.contains(&"Foo"), "expected 'Foo' in {imports:?}");
+        assert!(
+            !imports.contains(&"F"),
+            "alias 'F' must not appear in {imports:?}"
+        );
+    }
+
+    // Test: whole-file import (no import_name field) → no Import refs.
+    #[test]
+    fn import_whole_file_emits_nothing() {
+        let src = r#"pragma solidity ^0.8.0; import "./lib.sol";"#;
+        let facts = extract(src, "contracts/WF.sol");
+
+        let imports: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Import)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(
+            imports.is_empty(),
+            "expected no import refs but got {imports:?}"
         );
     }
 }
