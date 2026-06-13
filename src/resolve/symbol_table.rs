@@ -166,4 +166,45 @@ mod tests {
         assert_eq!(e.confidence, Confidence::NameOnly);
         assert_eq!(e.occ.file, "src/p/Sub.java");
     }
+
+    #[test]
+    fn resolves_cross_file_rust_trait_impl_inheritance() {
+        // File A defines the trait.
+        let greet = RustExtractor
+            .extract("pub trait Greet {}", "src/greet.rs")
+            .unwrap();
+        // File B defines the struct + its trait impl.
+        let p = RustExtractor
+            .extract("pub struct P;\nimpl Greet for P {}", "src/p.rs")
+            .unwrap();
+
+        let graph = SymbolTableResolver.resolve(&[greet, p]);
+
+        // Exactly one Inherits edge: P → Greet
+        let inherits: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Inherits)
+            .collect();
+        assert_eq!(
+            inherits.len(),
+            1,
+            "expected 1 Inherits edge, got {:?}",
+            inherits.len()
+        );
+        let e = inherits[0];
+        assert!(
+            e.from.to_scip_string().ends_with("p/P#") || e.from.to_scip_string().ends_with("P#"),
+            "unexpected from: {}",
+            e.from.to_scip_string()
+        );
+        assert!(
+            e.to.to_scip_string().ends_with("greet/Greet#")
+                || e.to.to_scip_string().ends_with("Greet#"),
+            "unexpected to: {}",
+            e.to.to_scip_string()
+        );
+        assert_eq!(e.confidence, Confidence::NameOnly);
+        assert_eq!(e.occ.file, "src/p.rs");
+    }
 }

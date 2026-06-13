@@ -12,7 +12,9 @@
 use tree_sitter::{Language as TsLanguage, Node, Parser};
 
 use crate::error::{CodegraphError, Result};
-use crate::graph::types::{ByteSpan, FileFacts, Symbol, SymbolKind};
+use crate::graph::types::{
+    ByteSpan, FileFacts, Occurrence, RefRole, Reference, Symbol, SymbolKind,
+};
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
 
@@ -56,8 +58,9 @@ impl Extractor for RustExtractor {
         let namespaces = rust_namespaces(file);
 
         let symbols = collect_symbols(&root, bytes, file, &namespaces);
-        let references =
+        let mut references =
             collect_call_references(&root, &ts_language, CALL_QUERY, Language::Rust, bytes, file)?;
+        collect_inheritance(&root, bytes, file, &mut references);
 
         Ok(FileFacts {
             file: file.to_owned(),
@@ -196,6 +199,70 @@ fn impl_type_name(node: &Node, bytes: &[u8]) -> String {
     names.last().cloned().unwrap_or_else(|| "impl".to_owned())
 }
 
+/// Strips generic parameters and `::` path prefixes to yield just the simple
+/// type name.
+///
+/// `a::b::Foo<T>` → `Foo`, `Display` → `Display`, `std::fmt::Display` → `Display`.
+fn simple_type_name(text: &str) -> &str {
+    let without_generics = text.split_once('<').map_or(text, |(before, _)| before);
+    without_generics
+        .rsplit_once("::")
+        .map_or(without_generics, |(_, after)| after)
+        .trim()
+}
+
+/// Recursively walk `node` collecting `Inherit` references for every
+/// `impl_item` (trait implementation) and `trait_item` (supertrait bound) in
+/// the tree (including items inside `mod` blocks).
+fn collect_inheritance(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    match node.kind() {
+        "impl_item" => {
+            // Only trait impls have a `trait` field; inherent impls do not.
+            if let Some(trait_node) = node.child_by_field_name("trait") {
+                push_inherit_ref(&trait_node, bytes, file, out);
+            }
+        }
+        "trait_item" => {
+            // `bounds` field is a `trait_bounds` node listing supertraits.
+            if let Some(bounds) = node.child_by_field_name("bounds") {
+                for child in bounds.children(&mut bounds.walk()) {
+                    match child.kind() {
+                        "type_identifier" | "generic_type" | "scoped_type_identifier" => {
+                            push_inherit_ref(&child, bytes, file, out);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    // Recurse into all children so items inside `mod` blocks are covered.
+    for child in node.children(&mut node.walk()) {
+        collect_inheritance(&child, bytes, file, out);
+    }
+}
+
+/// Push one `Inherit` reference for a parent type node (its simple name + the
+/// node's byte position, which lies inside the subtype's symbol span).
+fn push_inherit_ref(type_node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    let name = simple_type_name(node_text(type_node, bytes));
+    if name.is_empty() {
+        return;
+    }
+    out.push(Reference {
+        name: name.to_owned(),
+        occ: Occurrence {
+            file: file.to_owned(),
+            line: (type_node.start_position().row + 1) as u32,
+            col: type_node.start_position().column as u32,
+            byte: type_node.start_byte(),
+        },
+        role: RefRole::Inherit,
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,5 +299,86 @@ pub struct Config { pub value: u32 }
         let names: Vec<&str> = facts.references.iter().map(|r| r.name.as_str()).collect();
         assert!(names.contains(&"validate_token"));
         assert!(names.contains(&"helper"));
+    }
+
+    #[test]
+    fn trait_impl_emits_inherit_ref_and_inherent_impl_does_not() {
+        // Trait impl → one Inherit ref named "Display".
+        let src_trait_impl = r#"
+use std::fmt;
+pub struct Point;
+impl fmt::Display for Point {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { Ok(()) }
+}
+"#;
+        let facts = RustExtractor
+            .extract(src_trait_impl, "src/point.rs")
+            .unwrap();
+        let inherit_names: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Inherit)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(
+            inherit_names.contains(&"Display"),
+            "expected 'Display' in {inherit_names:?}"
+        );
+
+        // Inherent impl → no Inherit ref.
+        let src_inherent = "pub struct Point; impl Point { pub fn new() -> Self { Point } }";
+        let facts2 = RustExtractor.extract(src_inherent, "src/point.rs").unwrap();
+        let inherit2: Vec<&str> = facts2
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Inherit)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(
+            inherit2.is_empty(),
+            "expected no Inherit refs, got {inherit2:?}"
+        );
+    }
+
+    #[test]
+    fn supertrait_bounds_emit_inherit_refs() {
+        let src = "pub trait Foo: Bar + Baz {}";
+        let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
+        let inherit_names: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Inherit)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(
+            inherit_names.contains(&"Bar"),
+            "expected 'Bar' in {inherit_names:?}"
+        );
+        assert!(
+            inherit_names.contains(&"Baz"),
+            "expected 'Baz' in {inherit_names:?}"
+        );
+    }
+
+    #[test]
+    fn scoped_trait_path_emits_leaf_name() {
+        // `impl std::fmt::Display for Point {}` → leaf name "Display"
+        let src = r#"
+pub struct Point;
+impl std::fmt::Display for Point {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { Ok(()) }
+}
+"#;
+        let facts = RustExtractor.extract(src, "src/point.rs").unwrap();
+        let inherit_names: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Inherit)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(
+            inherit_names.contains(&"Display"),
+            "expected 'Display' in {inherit_names:?}"
+        );
     }
 }
