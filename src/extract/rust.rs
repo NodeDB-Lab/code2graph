@@ -9,7 +9,7 @@
 //!
 //! Emits neutral [`FileFacts`] — no storage entries, no source bodies.
 
-use tree_sitter::{Language as TsLanguage, Node, Parser};
+use tree_sitter::{Language as TsLanguage, Node, Parser, Query, QueryCursor, StreamingIterator};
 
 use crate::error::{CodegraphError, Result};
 use crate::graph::types::{
@@ -19,7 +19,9 @@ use crate::graph::types::{
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
 
-use super::{Extractor, child_text, collect_call_references, node_text, one_line_signature};
+use super::{
+    Extractor, child_text, collect_call_references, node_occurrence, node_text, one_line_signature,
+};
 
 /// Tree-sitter query capturing call-callee identifiers (and optional qualifier).
 const CALL_QUERY: &str = r#"
@@ -30,6 +32,20 @@ const CALL_QUERY: &str = r#"
     (scoped_identifier path: (_) @qualifier name: (identifier) @callee)
   ]
 )
+"#;
+
+/// Tree-sitter query capturing type-position nodes for [`RefRole::TypeRef`] extraction.
+///
+/// Field names verified against `tree-sitter-rust-0.23.3/src/node-types.json`:
+/// - `parameter` has field `type: _type`
+/// - `function_item` has field `return_type: _type`
+/// - `field_declaration` has field `type: _type`
+/// - `ordered_field_declaration_list` has field `type: _type` (multiple = true, for tuple structs)
+const TYPE_QUERY: &str = r#"
+(parameter type: (_) @ty)
+(function_item return_type: (_) @ty)
+(field_declaration type: (_) @ty)
+(ordered_field_declaration_list type: (_) @ty)
 "#;
 
 /// Extracts Rust symbols and references.
@@ -68,6 +84,7 @@ impl Extractor for RustExtractor {
             collect_call_references(&root, &ts_language, CALL_QUERY, Language::Rust, bytes, file)?;
         collect_inheritance(&root, bytes, file, &mut references);
         collect_imports(&root, bytes, file, &mut references, &module_id);
+        collect_type_references(&root, &ts_language, bytes, file, &mut references)?;
 
         let scopes = collect_scopes(&root, source.len());
         attach_reference_scopes(&mut references, &scopes);
@@ -357,6 +374,95 @@ fn collect_imports(
     for child in node.children(&mut node.walk()) {
         collect_imports(&child, bytes, file, out, module_id);
     }
+}
+
+// ── Type reference capture ────────────────────────────────────────────────────
+
+/// Reduce a (possibly compound) type node to its base named type.
+///
+/// Returns `(bare_name, qualifier)` for the type forms we handle in v1.
+/// Returns `None` for forms we defer (tuple, array, pointer, slice, fn pointer,
+/// lifetime-only, etc.) — they produce no [`RefRole::TypeRef`] reference.
+///
+/// Recursion depth is bounded by type nesting depth (a handful of levels at
+/// most); no panic paths, no `unwrap`.
+///
+/// **Primitive types are skipped** (`primitive_type` matches `None`): they
+/// never resolve to a user-defined [`Symbol`], so capturing them adds noise
+/// with zero benefit. E.g. `u32`, `bool`, `i64` produce no TypeRef ref.
+fn base_type_name(node: &Node, bytes: &[u8]) -> Option<(String, Option<String>)> {
+    match node.kind() {
+        "type_identifier" => Some((node_text(node, bytes).to_owned(), None)),
+        // Primitive types (u8, i32, bool, str, …) — skip to reduce noise.
+        "primitive_type" => None,
+        "scoped_type_identifier" => {
+            // Grammar-verified fields: `name: type_identifier`, `path: ...`
+            let name = node
+                .child_by_field_name("name")
+                .map(|n| node_text(&n, bytes).to_owned())?;
+            let qual = node
+                .child_by_field_name("path")
+                .map(|n| node_text(&n, bytes).to_owned());
+            Some((name, qual))
+        }
+        // Vec<Config> → base name "Vec"; the Config inside type_arguments is
+        // deferred in v1 (not captured here).
+        "generic_type" => node
+            .child_by_field_name("type")
+            .and_then(|t| base_type_name(&t, bytes)),
+        // &Config / &mut Config → descend through the `type` field (grammar-verified).
+        "reference_type" => node
+            .child_by_field_name("type")
+            .and_then(|t| base_type_name(&t, bytes)),
+        // Defer: tuple_type, array_type, pointer_type, slice_type, abstract_type,
+        // dynamic_type, fn types, macro_invocation types, etc.
+        _ => None,
+    }
+}
+
+/// Run [`TYPE_QUERY`] over the tree and push one [`RefRole::TypeRef`]
+/// [`Reference`] per resolved base named type.
+///
+/// Mirrors [`collect_call_references`] in structure (Query + QueryCursor).
+/// `primitive_type` nodes are deferred by [`base_type_name`] — they produce
+/// no reference. All other unrecognised type forms (tuples, slices, …) are
+/// also silently skipped per the v1 boundary.
+fn collect_type_references(
+    root: &Node,
+    ts_lang: &TsLanguage,
+    bytes: &[u8],
+    file: &str,
+    out: &mut Vec<Reference>,
+) -> Result<()> {
+    let query = Query::new(ts_lang, TYPE_QUERY).map_err(|e| CodegraphError::Query {
+        lang: "rust".to_owned(),
+        msg: e.to_string(),
+    })?;
+    let ty_idx = query
+        .capture_index_for_name("ty")
+        .ok_or_else(|| CodegraphError::Query {
+            lang: "rust".to_owned(),
+            msg: "missing @ty capture".to_owned(),
+        })?;
+
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(&query, *root, bytes);
+    while let Some(m) = matches.next() {
+        for cap in m.captures.iter().filter(|c| c.index == ty_idx) {
+            if let Some((name, qualifier)) = base_type_name(&cap.node, bytes) {
+                out.push(Reference {
+                    name,
+                    occ: node_occurrence(&cap.node, file),
+                    role: RefRole::TypeRef,
+                    source_module: None,
+                    from_path: None,
+                    qualifier,
+                    scope: None, // filled in by attach_reference_scopes
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 // ── Scope tree ───────────────────────────────────────────────────────────────
@@ -1460,6 +1566,134 @@ impl std::fmt::Display for Point {
                 .iter()
                 .any(|b| b.kind == BindingKind::Local && b.name == "y"),
             "expected a Local binding for 'y' (regression check)"
+        );
+    }
+
+    // ── TypeRef tests ─────────────────────────────────────────────────────────
+
+    fn type_refs(facts: &crate::graph::FileFacts) -> Vec<&Reference> {
+        facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::TypeRef)
+            .collect()
+    }
+
+    #[test]
+    fn typeref_param_and_return_types_captured() {
+        // `fn validate(cfg: Config) -> Outcome {}` → TypeRef refs for `Config` (param)
+        // and `Outcome` (return type).
+        let src = "fn validate(cfg: Config) -> Outcome {}";
+        let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
+        let names: Vec<&str> = type_refs(&facts).iter().map(|r| r.name.as_str()).collect();
+        assert!(
+            names.contains(&"Config"),
+            "expected TypeRef for 'Config' in {names:?}"
+        );
+        assert!(
+            names.contains(&"Outcome"),
+            "expected TypeRef for 'Outcome' in {names:?}"
+        );
+        for r in type_refs(&facts) {
+            assert_eq!(
+                r.role,
+                RefRole::TypeRef,
+                "role should be TypeRef, got {:?}",
+                r.role
+            );
+        }
+    }
+
+    #[test]
+    fn typeref_struct_field_type_captured() {
+        // `struct Holder { item: Widget }` → TypeRef ref named `Widget`.
+        let src = "struct Holder { item: Widget }";
+        let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
+        let names: Vec<&str> = type_refs(&facts).iter().map(|r| r.name.as_str()).collect();
+        assert!(
+            names.contains(&"Widget"),
+            "expected TypeRef for 'Widget' in {names:?}"
+        );
+    }
+
+    #[test]
+    fn typeref_generic_base_type_captured_inner_deferred() {
+        // `fn f(v: Vec<Config>) {}` → TypeRef ref for `Vec` (the base generic type).
+        // `Config` inside the type_arguments is NOT captured (v1 boundary).
+        let src = "fn f(v: Vec<Config>) {}";
+        let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
+        let names: Vec<&str> = type_refs(&facts).iter().map(|r| r.name.as_str()).collect();
+        assert!(
+            names.contains(&"Vec"),
+            "expected TypeRef for 'Vec' (base generic) in {names:?}"
+        );
+        assert!(
+            !names.contains(&"Config"),
+            "Config inside generic args should NOT be captured in v1 (got {names:?})"
+        );
+    }
+
+    #[test]
+    fn typeref_scoped_type_emits_leaf_and_qualifier() {
+        // `fn f(r: std::io::Result) {}` → TypeRef ref `name == "Result"`,
+        // `qualifier == Some("std::io")`.
+        let src = "fn f(r: std::io::Result) {}";
+        let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
+        let r = type_refs(&facts)
+            .into_iter()
+            .find(|r| r.name == "Result")
+            .expect("expected a TypeRef ref named 'Result'");
+        assert_eq!(
+            r.qualifier,
+            Some("std::io".to_owned()),
+            "qualifier should be 'std::io', got {:?}",
+            r.qualifier
+        );
+    }
+
+    #[test]
+    fn typeref_reference_type_descends_through_borrow() {
+        // `fn f(c: &Config) {}` → TypeRef ref named `Config` (descended through `&`).
+        let src = "fn f(c: &Config) {}";
+        let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
+        let names: Vec<&str> = type_refs(&facts).iter().map(|r| r.name.as_str()).collect();
+        assert!(
+            names.contains(&"Config"),
+            "expected TypeRef for 'Config' through '&' in {names:?}"
+        );
+    }
+
+    #[test]
+    fn typeref_primitive_type_not_captured() {
+        // Primitives (u32, bool, i64, …) are skipped — they never resolve to a
+        // user-defined Symbol, so capturing them only adds noise.
+        let src = "fn f(n: u32, b: bool) -> i64 { 0 }";
+        let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
+        let names: Vec<&str> = type_refs(&facts).iter().map(|r| r.name.as_str()).collect();
+        assert!(
+            !names.contains(&"u32"),
+            "primitive 'u32' should NOT be captured as TypeRef (got {names:?})"
+        );
+        assert!(
+            !names.contains(&"bool"),
+            "primitive 'bool' should NOT be captured as TypeRef (got {names:?})"
+        );
+        assert!(
+            !names.contains(&"i64"),
+            "primitive 'i64' should NOT be captured as TypeRef (got {names:?})"
+        );
+    }
+
+    #[test]
+    fn typeref_empty_fn_no_types_emits_no_typeref() {
+        // `fn f() {}` with no type annotations → zero TypeRef refs.
+        let src = "fn f() {}";
+        let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
+        let trefs = type_refs(&facts);
+        assert!(
+            trefs.is_empty(),
+            "fn with no types should produce no TypeRef refs, got {:?}",
+            trefs.iter().map(|r| &r.name).collect::<Vec<_>>()
         );
     }
 }

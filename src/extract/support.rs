@@ -117,7 +117,7 @@ pub(crate) fn simple_type_name<'a>(text: &'a str, sep: &str) -> &'a str {
 
 /// Build an [`Occurrence`] from a tree-sitter node and file path.
 #[inline]
-fn node_occurrence(node: &Node, file: &str) -> Occurrence {
+pub(crate) fn node_occurrence(node: &Node, file: &str) -> Occurrence {
     Occurrence {
         file: file.to_owned(),
         line: (node.start_position().row + 1) as u32,

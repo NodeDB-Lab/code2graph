@@ -80,7 +80,7 @@ pub struct Symbol {
     pub signature: String,
 }
 
-/// The role a reference plays. `Call`, `IsImplementation`, and `Import` are live;
+/// The role a reference plays. `Call`, `IsImplementation`, `Import`, and `TypeRef` are live;
 /// `Read`/`Write` arrive with richer extractors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RefRole {
@@ -91,6 +91,11 @@ pub enum RefRole {
     /// The enclosing module imports the referenced symbol (an `import`/`use`
     /// statement). Its source resolves to the file's module symbol.
     Import,
+    /// The enclosing symbol references the named type in a signature or
+    /// declaration position (parameter type, return type, field type, …) — a
+    /// structural type-usage fact. The resolver links it to the type's
+    /// definition like any other name reference.
+    TypeRef,
 }
 
 /// A reference (call site / usage) found in a source file. Pre-resolution it
