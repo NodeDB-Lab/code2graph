@@ -12,7 +12,9 @@
 use tree_sitter::{Language as TsLanguage, Node, Parser};
 
 use crate::error::{CodegraphError, Result};
-use crate::graph::types::{ByteSpan, FileFacts, RefRole, Reference, Symbol, SymbolKind};
+use crate::graph::types::{
+    ByteSpan, FileFacts, RefRole, Reference, Scope, ScopeId, ScopeKind, Symbol, SymbolKind,
+};
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
 
@@ -64,12 +66,15 @@ impl Extractor for RustExtractor {
         collect_inheritance(&root, bytes, file, &mut references);
         collect_imports(&root, bytes, file, &mut references, &module_id);
 
+        let scopes = collect_scopes(&root, source.len());
+        attach_reference_scopes(&mut references, &scopes);
+
         Ok(FileFacts {
             file: file.to_owned(),
             lang: Language::Rust.as_str().to_owned(),
             symbols,
             references,
-            scopes: Vec::new(),
+            scopes,
             bindings: Vec::new(),
         })
     }
@@ -345,6 +350,132 @@ fn collect_imports(
     }
     for child in node.children(&mut node.walk()) {
         collect_imports(&child, bytes, file, out, module_id);
+    }
+}
+
+// ── Scope tree ───────────────────────────────────────────────────────────────
+
+/// Append a new scope to `scopes` and return its [`ScopeId`].
+fn push_scope(
+    scopes: &mut Vec<Scope>,
+    parent: Option<ScopeId>,
+    span: ByteSpan,
+    kind: ScopeKind,
+) -> ScopeId {
+    let id = scopes.len();
+    scopes.push(Scope { parent, span, kind });
+    id
+}
+
+/// `ByteSpan` covering the whole extent of `node`.
+fn node_span(node: &Node) -> ByteSpan {
+    ByteSpan {
+        start: node.start_byte(),
+        end: node.end_byte(),
+    }
+}
+
+/// DFS that builds the scope tree for one file.
+///
+/// The file-root scope (`scopes[0]`) must already be pushed before calling
+/// this for the root node's children. `scope_dfs` is called once per node:
+/// it inspects `node`'s own kind, opens a new scope for `node` when
+/// appropriate, and then recurses into whichever children carry nested scopes.
+///
+/// `parent_id` is the [`ScopeId`] of the innermost scope already open when
+/// this node is visited; new scopes opened for `node` itself use it as their
+/// parent.
+fn scope_dfs(node: &Node, parent_id: ScopeId, scopes: &mut Vec<Scope>) {
+    match node.kind() {
+        "function_item" | "closure_expression" => {
+            let fn_id = push_scope(
+                scopes,
+                Some(parent_id),
+                node_span(node),
+                ScopeKind::Function,
+            );
+            // Recurse into body's children to avoid double-opening the block.
+            if let Some(body) = node.child_by_field_name("body") {
+                for child in body.children(&mut body.walk()) {
+                    scope_dfs(&child, fn_id, scopes);
+                }
+            } else {
+                for child in node.children(&mut node.walk()) {
+                    scope_dfs(&child, fn_id, scopes);
+                }
+            }
+        }
+        "mod_item" | "impl_item" | "trait_item" | "struct_item" | "enum_item" => {
+            if let Some(body) = node.child_by_field_name("body") {
+                let kind = if node.kind() == "mod_item" {
+                    ScopeKind::Module
+                } else {
+                    ScopeKind::Type
+                };
+                let body_id = push_scope(scopes, Some(parent_id), node_span(&body), kind);
+                for child in body.children(&mut body.walk()) {
+                    scope_dfs(&child, body_id, scopes);
+                }
+            } else {
+                // No body (e.g. `mod foo;` declaration) — recurse with the same parent.
+                for child in node.children(&mut node.walk()) {
+                    scope_dfs(&child, parent_id, scopes);
+                }
+            }
+        }
+        "block" => {
+            let block_id = push_scope(scopes, Some(parent_id), node_span(node), ScopeKind::Block);
+            for child in node.children(&mut node.walk()) {
+                scope_dfs(&child, block_id, scopes);
+            }
+        }
+        // Macro bodies are not reliable AST — skip entirely.
+        "macro_definition" | "macro_invocation" => {}
+        // All other nodes: open no scope, recurse children with the same parent.
+        _ => {
+            for child in node.children(&mut node.walk()) {
+                scope_dfs(&child, parent_id, scopes);
+            }
+        }
+    }
+}
+
+/// Build and return the full lexical scope tree for `source_len` bytes.
+///
+/// `scopes[0]` is always the file-root `Module` scope spanning `[0, source_len)`.
+fn collect_scopes(root: &Node, source_len: usize) -> Vec<Scope> {
+    let mut scopes = Vec::new();
+    // Push the file-root scope first (index 0).
+    push_scope(
+        &mut scopes,
+        None,
+        ByteSpan {
+            start: 0,
+            end: source_len,
+        },
+        ScopeKind::Module,
+    );
+    // DFS from each top-level child of source_file with parent = 0.
+    for child in root.children(&mut root.walk()) {
+        scope_dfs(&child, 0, &mut scopes);
+    }
+    scopes
+}
+
+/// Attach each reference to the innermost scope that contains its byte offset.
+///
+/// Ties on span length (e.g. a function whose body spans the whole file, so its
+/// scope equals the root scope) resolve to the higher index: `collect_scopes`
+/// always pushes a parent before its children, so the larger index is the more
+/// deeply nested scope.
+fn attach_reference_scopes(refs: &mut [Reference], scopes: &[Scope]) {
+    for r in refs {
+        r.scope = scopes
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.span.contains(r.occ.byte))
+            .min_by_key(|(id, s)| (s.span.len(), std::cmp::Reverse(*id)))
+            .map(|(id, _)| id);
     }
 }
 
@@ -636,5 +767,157 @@ impl std::fmt::Display for Point {
                 r.from_path
             );
         }
+    }
+
+    // ── Scope tree tests ──────────────────────────────────────────────────────
+
+    #[test]
+    fn scope_fn_with_call_has_function_scope_and_ref_attaches_to_it() {
+        // A function containing a call: assert root Module scope (index 0) and a
+        // Function scope; the call reference's scope should be Some(fn_scope_id),
+        // not Some(0) (the root).
+        let src = "pub fn greet() { helper(); }";
+        let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
+
+        // scopes[0] must be the file-root Module.
+        assert!(!facts.scopes.is_empty(), "scopes must not be empty");
+        assert_eq!(
+            facts.scopes[0].kind,
+            ScopeKind::Module,
+            "scopes[0] must be Module"
+        );
+        assert_eq!(facts.scopes[0].parent, None, "root scope has no parent");
+
+        // There must be at least one Function scope.
+        let fn_scope_pos = facts
+            .scopes
+            .iter()
+            .position(|s| s.kind == ScopeKind::Function)
+            .expect("expected a Function scope");
+
+        // The call reference to `helper` must be attributed to the Function scope,
+        // not the root.
+        let helper_ref = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Call && r.name == "helper")
+            .expect("expected a Call ref for 'helper'");
+        assert_eq!(
+            helper_ref.scope,
+            Some(fn_scope_pos),
+            "helper call should be attributed to the Function scope ({}), got {:?}",
+            fn_scope_pos,
+            helper_ref.scope
+        );
+    }
+
+    #[test]
+    fn nested_block_scope_parent_chains_correctly() {
+        // A function whose body contains an inner bare `{ }` block:
+        //   fn outer() { { inner_call(); } }
+        // Scopes expected: root Module (0), Function (1), Block (2).
+        // A ref inside the block must attribute to the Block scope,
+        // and the Block scope's parent must be the Function scope.
+        let src = "fn outer() { { inner_call(); } }";
+        let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
+
+        let fn_scope_id = facts
+            .scopes
+            .iter()
+            .position(|s| s.kind == ScopeKind::Function)
+            .expect("expected a Function scope");
+        let block_scope_id = facts
+            .scopes
+            .iter()
+            .position(|s| s.kind == ScopeKind::Block)
+            .expect("expected a Block scope");
+
+        // Block's parent must be the Function scope.
+        assert_eq!(
+            facts.scopes[block_scope_id].parent,
+            Some(fn_scope_id),
+            "Block scope parent should be the Function scope"
+        );
+
+        // The call ref inside the block must attribute to the Block scope (innermost).
+        let inner_ref = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Call && r.name == "inner_call")
+            .expect("expected a Call ref for 'inner_call'");
+        assert_eq!(
+            inner_ref.scope,
+            Some(block_scope_id),
+            "inner_call should attribute to the Block scope ({}), got {:?}",
+            block_scope_id,
+            inner_ref.scope
+        );
+    }
+
+    #[test]
+    fn empty_source_produces_exactly_one_root_scope() {
+        // Empty source → collect_scopes returns exactly one scope (the file root),
+        // does not panic.
+        let ts_language = tree_sitter::Language::from(tree_sitter_rust::LANGUAGE);
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&ts_language).unwrap();
+        let tree = parser.parse("", None).unwrap();
+        let root = tree.root_node();
+
+        let scopes = collect_scopes(&root, 0);
+        assert_eq!(
+            scopes.len(),
+            1,
+            "empty source should produce exactly one scope"
+        );
+        assert_eq!(scopes[0].kind, ScopeKind::Module);
+        assert_eq!(scopes[0].parent, None);
+    }
+
+    #[test]
+    fn impl_block_with_method_nests_type_then_function_scope() {
+        // `impl Foo { fn bar() { call(); } }`
+        // Expected nesting: root Module (0) → Type (impl body) → Function (method)
+        // A call inside the method attributes to the Function scope (innermost).
+        let src = "pub struct Foo; impl Foo { pub fn bar(&self) { call(); } }";
+        let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
+
+        let type_scope_id = facts
+            .scopes
+            .iter()
+            .position(|s| s.kind == ScopeKind::Type)
+            .expect("expected a Type scope for the impl body");
+        let fn_scope_id = facts
+            .scopes
+            .iter()
+            .position(|s| s.kind == ScopeKind::Function)
+            .expect("expected a Function scope for the method");
+
+        // Type scope's parent must be the root (0).
+        assert_eq!(
+            facts.scopes[type_scope_id].parent,
+            Some(0),
+            "impl body Type scope parent should be root (0)"
+        );
+        // Function scope's parent must be the Type scope.
+        assert_eq!(
+            facts.scopes[fn_scope_id].parent,
+            Some(type_scope_id),
+            "method Function scope parent should be the Type scope"
+        );
+
+        // The call ref must attribute to the Function scope (innermost).
+        let call_ref = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Call && r.name == "call")
+            .expect("expected a Call ref for 'call'");
+        assert_eq!(
+            call_ref.scope,
+            Some(fn_scope_id),
+            "call() should attribute to the Function scope ({}), got {:?}",
+            fn_scope_id,
+            call_ref.scope
+        );
     }
 }
