@@ -21,13 +21,13 @@ use crate::symbol::{Descriptor, SymbolId};
 
 use super::{Extractor, child_text, collect_call_references, node_text, one_line_signature};
 
-/// Tree-sitter query capturing call-callee identifiers.
+/// Tree-sitter query capturing call-callee identifiers (and optional qualifier).
 const CALL_QUERY: &str = r#"
 (call_expression
   function: [
     (identifier) @callee
     (field_expression field: (field_identifier) @callee)
-    (scoped_identifier name: (identifier) @callee)
+    (scoped_identifier path: (_) @qualifier name: (identifier) @callee)
   ]
 )
 "#;
@@ -1343,6 +1343,79 @@ impl std::fmt::Display for Point {
         assert_eq!(
             def_bindings[0].name, "foo",
             "the sole Definition binding must be 'foo', not the module stem"
+        );
+    }
+
+    // ── qualifier capture tests (unit 8a) ────────────────────────────────────
+
+    #[test]
+    fn qualified_call_single_segment_captures_qualifier() {
+        // `mod_a::process()` → leaf "process", qualifier Some("mod_a")
+        let src = "pub fn caller() { mod_a::process(); }";
+        let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
+        let r = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Call && r.name == "process")
+            .expect("expected a Call ref for 'process'");
+        assert_eq!(
+            r.qualifier,
+            Some("mod_a".to_owned()),
+            "qualifier should be 'mod_a', got {:?}",
+            r.qualifier
+        );
+    }
+
+    #[test]
+    fn qualified_call_nested_segments_captures_full_qualifier() {
+        // `a::b::process()` → leaf "process", qualifier Some("a::b")
+        let src = "pub fn caller() { a::b::process(); }";
+        let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
+        let r = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Call && r.name == "process")
+            .expect("expected a Call ref for 'process'");
+        assert_eq!(
+            r.qualifier,
+            Some("a::b".to_owned()),
+            "qualifier should be 'a::b', got {:?}",
+            r.qualifier
+        );
+    }
+
+    #[test]
+    fn unqualified_call_has_no_qualifier() {
+        // `helper()` → qualifier None
+        let src = "pub fn caller() { helper(); }";
+        let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
+        let r = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Call && r.name == "helper")
+            .expect("expected a Call ref for 'helper'");
+        assert_eq!(
+            r.qualifier, None,
+            "unqualified call should have qualifier == None, got {:?}",
+            r.qualifier
+        );
+    }
+
+    #[test]
+    fn method_call_via_field_expression_has_no_qualifier() {
+        // `obj.method()` — field_expression arm → leaf "method", qualifier None
+        // (obj is the receiver, not a qualifier)
+        let src = "pub fn caller(obj: Foo) { obj.method(); }";
+        let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
+        let r = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Call && r.name == "method")
+            .expect("expected a Call ref for 'method'");
+        assert_eq!(
+            r.qualifier, None,
+            "method call via field_expression should have qualifier == None, got {:?}",
+            r.qualifier
         );
     }
 

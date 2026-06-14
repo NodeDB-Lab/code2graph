@@ -151,6 +151,7 @@ pub(crate) fn push_ref(
         role,
         source_module: None,
         from_path: None,
+        qualifier: None,
         scope: None,
     });
 }
@@ -183,6 +184,7 @@ pub(crate) fn push_import_ref(
         } else {
             Some(from_path.to_owned())
         },
+        qualifier: None,
         scope: None,
     });
 }
@@ -218,11 +220,22 @@ pub(crate) fn collect_call_references(
                 lang: lang.as_str().to_owned(),
                 msg: "missing @callee capture".to_owned(),
             })?;
+    // Optional: queries that have no `@qualifier` capture (every language except
+    // Rust after unit 8a) return `None` here, keeping qualifier `None` everywhere
+    // for those languages → zero behavior change.
+    let qualifier_idx = query.capture_index_for_name("qualifier");
 
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(&query, *root, bytes);
     let mut refs = Vec::new();
     while let Some(m) = matches.next() {
+        // Resolve this match's qualifier once (at most one `@qualifier` per match).
+        let qualifier = qualifier_idx.and_then(|qi| {
+            m.captures
+                .iter()
+                .find(|c| c.index == qi)
+                .map(|c| node_text(&c.node, bytes).to_owned())
+        });
         for cap in m.captures.iter().filter(|c| c.index == callee_idx) {
             let name = node_text(&cap.node, bytes).to_owned();
             if name.len() < MIN_REF_LEN {
@@ -234,6 +247,7 @@ pub(crate) fn collect_call_references(
                 role: RefRole::Call,
                 source_module: None,
                 from_path: None,
+                qualifier: qualifier.clone(),
                 scope: None,
             });
         }

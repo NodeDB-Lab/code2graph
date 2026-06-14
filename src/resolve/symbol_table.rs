@@ -315,6 +315,7 @@ mod tests {
             role: RefRole::Import,
             source_module: None,
             from_path: None,
+            qualifier: None,
             scope: None,
         });
 
