@@ -1,0 +1,4 @@
+# A native Python extension boundary (PyO3). Python calls `tok`, but the Rust
+# definition is `tokenize`, exposed to Python as `tok` via `#[pyo3(name = ...)]`.
+# Name/scope resolution cannot bridge it; the FFI bridge follows the export.
+app.py:2 Call ext.rs:3

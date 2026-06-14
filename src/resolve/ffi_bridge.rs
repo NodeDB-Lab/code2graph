@@ -3,14 +3,18 @@
 //! FFI-bridge resolver — links cross-language call sites to FFI exports.
 //!
 //! Some definitions are deliberately exposed across a runtime boundary: a Rust
-//! `#[no_mangle]` function is callable from C under a stable linker name. The
-//! extractor records that as a neutral [`FfiExport`] fact; this resolver bridges
-//! it to call sites **in other languages** that name the export.
+//! `#[no_mangle]` function is callable from C under a stable linker name, and a
+//! PyO3 `#[pyfunction]` is callable from Python. The extractor records each as a
+//! neutral [`FfiExport`] fact (tagged with its [`FfiAbi`]); this resolver bridges
+//! it to call sites in a language that **consumes that ABI**
+//! ([`FfiAbi::consumers`]) — so a C call binds to a C-ABI export, a Python call
+//! to a Python-ABI export, never crossed.
 //!
 //! It is the honest, deterministic subset of cross-language linking: the export
 //! side is grounded in a real syntactic marker, and the bridge fires only across
-//! a language boundary (a same-language use of the name is an ordinary call, not
-//! an FFI crossing). The consumer side is matched by name, so edges carry honest
+//! a language boundary (a definition's own language never consumes its ABI, so
+//! same-language use is an ordinary call, not an FFI crossing). The consumer side
+//! is matched by name, so edges carry honest
 //! confidence — [`Confidence::Scoped`] when the export is unique, otherwise
 //! [`Confidence::NameOnly`] — and always [`Provenance::FfiBridge`], so a consumer
 //! can treat boundary-crossing edges distinctly.
@@ -28,21 +32,23 @@
 
 use std::collections::HashMap;
 
-use crate::graph::types::{CodeGraph, Confidence, Edge, FileFacts, Provenance, RefRole, Symbol};
+use crate::graph::types::{
+    CodeGraph, Confidence, Edge, FfiAbi, FileFacts, Provenance, RefRole, Symbol,
+};
 use crate::symbol::SymbolId;
 
 use super::Resolver;
 use super::enclosing_symbol_index;
 
-/// A cross-language FFI export with the language it was declared in (so the
-/// resolver can require a genuine language crossing).
+/// A cross-language FFI export plus the ABI it is exposed under (so the resolver
+/// can bridge it only to call sites in a language that consumes that ABI).
 struct ExportRec {
     symbol: SymbolId,
-    lang: String,
+    abi: FfiAbi,
 }
 
 /// Links cross-language call sites to deterministic FFI exports
-/// ([`Provenance::FfiBridge`](crate::graph::Provenance::FfiBridge)).
+/// ([`Provenance::FfiBridge`]).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct FfiBridgeResolver;
 
@@ -62,7 +68,7 @@ impl Resolver for FfiBridgeResolver {
                     .or_default()
                     .push(ExportRec {
                         symbol: e.symbol.clone(),
-                        lang: f.lang.clone(),
+                        abi: e.abi,
                     });
             }
         }
@@ -90,8 +96,13 @@ impl Resolver for FfiBridgeResolver {
                 let Some(targets) = exports.get(r.name.as_str()) else {
                     continue;
                 };
-                // Only exports in a *different* language are FFI crossings.
-                let cross: Vec<&ExportRec> = targets.iter().filter(|e| e.lang != f.lang).collect();
+                // An FFI crossing: this call's language consumes the export's ABI
+                // (which excludes same-language use — a definition's own language
+                // is never in its ABI's consumer set).
+                let cross: Vec<&ExportRec> = targets
+                    .iter()
+                    .filter(|e| e.abi.consumers().contains(&f.lang.as_str()))
+                    .collect();
                 if cross.is_empty() {
                     continue;
                 }
@@ -126,7 +137,7 @@ impl Resolver for FfiBridgeResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::extract::{CExtractor, Extractor, RustExtractor};
+    use crate::extract::{CExtractor, Extractor, PythonExtractor, RustExtractor};
 
     /// Rust `#[no_mangle]` export, called from C → one FfiBridge edge.
     #[test]
@@ -218,6 +229,89 @@ mod tests {
         assert!(
             rust.ffi_exports.is_empty(),
             "extern \"C\" alone is mangled — not a stable export"
+        );
+    }
+
+    /// Rust PyO3 `#[pyfunction]` export, called from Python → one FfiBridge edge.
+    #[test]
+    fn bridges_rust_pyfunction_export_to_python_call() {
+        let rust = RustExtractor
+            .extract(
+                "#[pyfunction]\npub fn tokenize() -> u32 { 0 }",
+                "src/ext.rs",
+            )
+            .unwrap();
+        assert_eq!(rust.ffi_exports.len(), 1, "expected one FFI export");
+        assert_eq!(rust.ffi_exports[0].abi, FfiAbi::Python);
+        assert_eq!(rust.ffi_exports[0].export_name, "tokenize");
+
+        let py = PythonExtractor
+            .extract("def run():\n    tokenize()", "app.py")
+            .unwrap();
+
+        let graph = FfiBridgeResolver.resolve(&[rust, py]);
+        assert_eq!(graph.edges.len(), 1, "expected one FFI bridge edge");
+        let e = &graph.edges[0];
+        assert_eq!(e.provenance, Provenance::FfiBridge);
+        assert!(
+            e.to.to_scip_string().ends_with("ext/tokenize()."),
+            "to was: {}",
+            e.to.to_scip_string()
+        );
+        assert_eq!(e.occ.file, "app.py");
+    }
+
+    /// `#[pyo3(name = "…")]` overrides the Python-side name.
+    #[test]
+    fn pyo3_name_attribute_overrides_export_name() {
+        let rust = RustExtractor
+            .extract(
+                "#[pyfunction]\n#[pyo3(name = \"tok\")]\npub fn tokenize() -> u32 { 0 }",
+                "src/ext.rs",
+            )
+            .unwrap();
+        assert_eq!(rust.ffi_exports[0].export_name, "tok");
+
+        let py = PythonExtractor
+            .extract("def run():\n    tok()", "app.py")
+            .unwrap();
+        let graph = FfiBridgeResolver.resolve(&[rust, py]);
+        assert_eq!(graph.edges.len(), 1);
+        assert!(
+            graph.edges[0]
+                .to
+                .to_scip_string()
+                .ends_with("ext/tokenize().")
+        );
+    }
+
+    /// ABI isolation: a C call must NOT bridge to a Python-only (PyO3) export of
+    /// the same name, nor a Python call to a C-only export.
+    #[test]
+    fn abi_consumers_are_isolated() {
+        let py_export = RustExtractor
+            .extract("#[pyfunction]\npub fn shared() -> u32 { 0 }", "src/ext.rs")
+            .unwrap();
+        let c = CExtractor
+            .extract("void run(void) { shared(); }", "app.c")
+            .unwrap();
+        assert!(
+            FfiBridgeResolver.resolve(&[py_export, c]).edges.is_empty(),
+            "C cannot consume a Python-only export"
+        );
+
+        let c_export = RustExtractor
+            .extract(
+                "#[no_mangle]\npub extern \"C\" fn shared() -> u32 { 0 }",
+                "src/ffi.rs",
+            )
+            .unwrap();
+        let py = PythonExtractor
+            .extract("def run():\n    shared()", "app.py")
+            .unwrap();
+        assert!(
+            FfiBridgeResolver.resolve(&[c_export, py]).edges.is_empty(),
+            "Python cannot consume a C-only export"
         );
     }
 }

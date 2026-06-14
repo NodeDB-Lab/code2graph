@@ -218,16 +218,20 @@ fn is_fully_pub(node: &Node, bytes: &[u8]) -> bool {
         .unwrap_or(false)
 }
 
-/// Collect cross-language (C ABI) export markers from top-level functions.
+/// Collect cross-language export markers from top-level functions.
 ///
-/// A `#[no_mangle]` (or 2024-edition `#[unsafe(no_mangle)]`) function is exposed
-/// to C under its own name; `#[export_name = "…"]` overrides that name. Either
-/// marker yields a stable linker symbol callable across the FFI boundary — that
-/// is the deterministic fact we record. A plain `extern "C"` function *without*
-/// such a marker gets a mangled name and is intentionally not treated as a
-/// stable export. Only functions that were themselves extracted as symbols (the
-/// public ones) are bridged; the export is matched to its symbol by definition
-/// span, so the SCIP identity is exactly the one the resolver will see.
+/// Detected today:
+/// - **C ABI** — `#[no_mangle]` / `#[unsafe(no_mangle)]` (exported under the
+///   function name) and `#[export_name = "…"]` (name override). A plain
+///   `extern "C"` *without* such a marker is mangled and intentionally not an
+///   export.
+/// - **Python ABI** — PyO3 `#[pyfunction]` (exported under the function name, or
+///   a `#[pyo3(name = "…")]` / `#[pyfunction(name = "…")]` override).
+///
+/// Only functions extracted as symbols (the public ones) are bridged; each
+/// export is matched to its symbol by definition span, so the SCIP identity is
+/// exactly the one the resolver will see. A function may export under more than
+/// one ABI.
 fn collect_ffi_exports(root: &Node, bytes: &[u8], defs: &[Symbol]) -> Vec<FfiExport> {
     let mut out = Vec::new();
     for child in root.children(&mut root.walk()) {
@@ -240,10 +244,10 @@ fn collect_ffi_exports(root: &Node, bytes: &[u8], defs: &[Symbol]) -> Vec<FfiExp
         else {
             continue; // not a (public) extracted symbol — no identity to bridge
         };
-        if let Some(export_name) = ffi_c_export_name(&child, bytes, &sym.name) {
+        for (abi, export_name) in fn_ffi_exports(&child, bytes, &sym.name) {
             out.push(FfiExport {
                 symbol: sym.id.clone(),
-                abi: FfiAbi::C,
+                abi,
                 export_name,
             });
         }
@@ -251,32 +255,57 @@ fn collect_ffi_exports(root: &Node, bytes: &[u8], defs: &[Symbol]) -> Vec<FfiExp
     out
 }
 
-/// The C-ABI export name a function is exposed under, or `None` if it carries no
-/// stable-export attribute. `#[export_name = "x"]` wins over `#[no_mangle]`
-/// (which uses `fn_name`). Detection reads the attribute text, so it is robust
-/// to both `#[no_mangle]` and `#[unsafe(no_mangle)]` spellings.
+/// The FFI exports a function declares, derived from its attributes.
 ///
 /// In tree-sitter-rust an item's outer attributes are its **preceding siblings**
 /// (not children), so we walk back over the run of `attribute_item` nodes.
-fn ffi_c_export_name(func: &Node, bytes: &[u8], fn_name: &str) -> Option<String> {
-    let mut no_mangle = false;
-    let mut override_name = None;
+/// Detection reads attribute text, so it is robust to spelling variants
+/// (`#[no_mangle]` vs `#[unsafe(no_mangle)]`).
+fn fn_ffi_exports(func: &Node, bytes: &[u8], fn_name: &str) -> Vec<(FfiAbi, String)> {
+    let mut c_no_mangle = false;
+    let mut c_override: Option<String> = None;
+    let mut py = false;
+    let mut py_override: Option<String> = None;
+
     let mut sib = func.prev_sibling();
     while let Some(node) = sib {
         if node.kind() != "attribute_item" {
             break;
         }
         let text = node_text(&node, bytes);
+        // C ABI markers.
         if text.contains("export_name") {
-            if let Some(v) = first_quoted(text) {
-                override_name = Some(v.to_owned());
-            }
+            c_override = first_quoted(text).map(str::to_owned);
         } else if text.contains("no_mangle") {
-            no_mangle = true;
+            c_no_mangle = true;
+        }
+        // Python (PyO3) markers — independent of the C markers above.
+        if text.contains("pyfunction") {
+            py = true;
+            if let Some(v) = first_quoted(text) {
+                py_override = Some(v.to_owned()); // `#[pyfunction(name = "…")]`
+            }
+        } else if text.contains("pyo3") {
+            if let Some(v) = first_quoted(text) {
+                py_override = Some(v.to_owned()); // `#[pyo3(name = "…")]`
+            }
         }
         sib = node.prev_sibling();
     }
-    override_name.or_else(|| no_mangle.then(|| fn_name.to_owned()))
+
+    let mut out = Vec::new();
+    if let Some(name) = c_override {
+        out.push((FfiAbi::C, name));
+    } else if c_no_mangle {
+        out.push((FfiAbi::C, fn_name.to_owned()));
+    }
+    if py {
+        out.push((
+            FfiAbi::Python,
+            py_override.unwrap_or_else(|| fn_name.to_owned()),
+        ));
+    }
+    out
 }
 
 /// The contents of the first double-quoted span in `s`, if any.

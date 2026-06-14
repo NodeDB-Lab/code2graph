@@ -249,13 +249,29 @@ pub enum Provenance {
 // ── FFI / cross-language boundary facts ──────────────────────────────────────
 
 /// The application binary interface a symbol is exported under for
-/// cross-language linkage. Cross-language superset; only the C ABI is detected
-/// today.
+/// cross-language linkage. Cross-language superset; grows as binding generators
+/// are recognised.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FfiAbi {
     /// The C ABI — the lingua-franca FFI boundary (`#[no_mangle]` / `extern "C"`
-    /// in Rust, `extern` declarations in C, callable from most languages).
+    /// in Rust, `extern` declarations in C).
     C,
+    /// A native Python extension binding (e.g. Rust PyO3 `#[pyfunction]`),
+    /// callable from Python under the exported name.
+    Python,
+}
+
+impl FfiAbi {
+    /// The language tags ([`Language::as_str`](crate::lang::Language::as_str))
+    /// whose call sites can consume an export under this ABI. A bridge is only
+    /// drawn to a consumer in one of these languages — so a C call never binds
+    /// to a Python-only export, and vice versa.
+    pub fn consumers(&self) -> &'static [&'static str] {
+        match self {
+            FfiAbi::C => &["c", "cpp"],
+            FfiAbi::Python => &["python"],
+        }
+    }
 }
 
 /// A neutral cross-language export fact: the definition identified by [`symbol`]
