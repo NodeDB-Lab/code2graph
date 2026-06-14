@@ -7,14 +7,19 @@
 //! Tier-A recall, a Tier-B false positive, or an erosion of the scope-tier's
 //! precision advantage all fail the build here.
 
-use codegraph::{ScopeGraphResolver, SymbolTableResolver};
+use codegraph::{FfiBridgeResolver, ScopeGraphResolver, SymbolTableResolver};
 use codegraph_eval::corpus::{Case, load_corpus};
-use codegraph_eval::runner::{corpus_total, per_language};
+use codegraph_eval::runner::{corpus_total, per_language, score_case};
 use std::path::Path;
 
 fn corpus() -> Vec<Case> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus");
     load_corpus(&root).expect("corpus loads")
+}
+
+/// Cases in a given language directory.
+fn cases_in<'a>(cases: &'a [Case], lang: &str) -> Vec<&'a Case> {
+    cases.iter().filter(|c| c.lang == lang).collect()
 }
 
 #[test]
@@ -24,15 +29,51 @@ fn corpus_is_non_empty() {
 
 #[test]
 fn tier_a_is_recall_first() {
-    // Tier-A is the recall-first tier: it must find every ground-truth edge in
-    // the corpus (it may over-connect, which costs precision, not recall).
-    let total = corpus_total(&corpus(), &SymbolTableResolver);
+    // Tier-A is the recall-first tier: within its lane (intra-language name
+    // resolution) it must find every ground-truth edge. The `ffi` lane is a
+    // different resolver's job (cross-runtime boundaries), so it is excluded.
+    let cases = corpus();
+    let in_lane: Vec<Case> = cases.into_iter().filter(|c| c.lang != "ffi").collect();
+    let total = corpus_total(&in_lane, &SymbolTableResolver);
     assert_eq!(
         total.recall(),
         1.0,
-        "Tier-A must retain full recall (TP={}, FN={})",
+        "Tier-A must retain full recall in its lane (TP={}, FN={})",
         total.true_positives,
         total.false_negatives
+    );
+}
+
+#[test]
+fn ffi_bridge_recovers_what_name_resolution_cannot() {
+    // The FFI corpus deliberately uses an `#[export_name]` mismatch: the call
+    // name differs from the definition name, so name/scope resolution cannot
+    // bridge it, but the FFI resolver follows the export marker.
+    let cases = corpus();
+    let ffi = cases_in(&cases, "ffi");
+    assert!(!ffi.is_empty(), "expected ffi corpus cases");
+
+    let mut ffi_tier = codegraph_eval::score::Scorecard::default();
+    let mut name_tier = codegraph_eval::score::Scorecard::default();
+    let mut scope_tier = codegraph_eval::score::Scorecard::default();
+    for c in &ffi {
+        ffi_tier.merge(&score_case(c, &FfiBridgeResolver));
+        name_tier.merge(&score_case(c, &SymbolTableResolver));
+        scope_tier.merge(&score_case(c, &ScopeGraphResolver));
+    }
+    assert_eq!(
+        ffi_tier.recall(),
+        1.0,
+        "FFI bridge must resolve the boundary"
+    );
+    assert_eq!(ffi_tier.false_positives, 0, "FFI bridge must be precise");
+    assert_eq!(
+        name_tier.true_positives, 0,
+        "name resolution must not recover the export-name-mismatched edge"
+    );
+    assert_eq!(
+        scope_tier.true_positives, 0,
+        "scope resolution must not either"
     );
 }
 

@@ -1,0 +1,5 @@
+# A cross-runtime boundary edge that name resolution cannot recover: the C call
+# is to `c_create`, but the Rust definition is named `rust_create` and only
+# exposes `c_create` via `#[export_name]`. Tier-A/Tier-B (name/scope) miss it;
+# the FFI bridge follows the export marker to the real definition.
+app.c:1 Call ffi.rs:2

@@ -53,6 +53,12 @@ recall-first baseline. Both resolvers emit the same schema, so a consumer picks 
 changing how it reads the output. Identity rendering and the graph schema may still evolve before
 `0.1`.
 
+Every edge also carries a `Provenance` tag — which analysis derived it (name table, scope graph,
+or FFI bridge) — orthogonal to its `Confidence`. On top of the tiers, an `FfiBridgeResolver` links
+cross-language boundaries deterministically: a Rust `#[no_mangle]` / `#[export_name]` function and
+its call sites in C resolve to one edge even when the linker name differs from the definition name —
+a boundary plain name resolution cannot recover.
+
 ## Measuring resolution quality
 
 Resolution quality is measured, not asserted. The `codegraph-eval` crate scores ref→def
@@ -69,8 +75,9 @@ cargo test -p codegraph-eval    # regression gate on the invariants
 
 The scorer is independent of where the ground truth comes from, so a SCIP precision oracle
 (rust-analyzer / scip-java) can be plugged in alongside the hand-authored fixtures. The numbers
-quantify the tier tradeoff directly: the recall-first name tier finds everything but over-connects
-on ambiguity, while the scope-aware tier resolves a narrower set with no false positives.
+quantify each resolver's lane directly: the recall-first name tier finds everything but
+over-connects on ambiguity, the scope-aware tier resolves a narrower set with no false positives,
+and the FFI bridge recovers cross-language boundary edges the other two cannot.
 
 ## License
 

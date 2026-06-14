@@ -6,7 +6,7 @@
 //! cargo run -p codegraph-eval
 //! ```
 
-use codegraph::{ScopeGraphResolver, SymbolTableResolver};
+use codegraph::{FfiBridgeResolver, ScopeGraphResolver, SymbolTableResolver};
 use codegraph_eval::corpus::load_corpus;
 use codegraph_eval::runner::{corpus_total, per_language};
 use codegraph_eval::score::Scorecard;
@@ -45,6 +45,11 @@ fn main() -> ExitCode {
             label: "Tier-B (scope)",
             per_lang: per_language(&cases, &ScopeGraphResolver),
             total: corpus_total(&cases, &ScopeGraphResolver),
+        },
+        TierReport {
+            label: "FFI (bridge)",
+            per_lang: per_language(&cases, &FfiBridgeResolver),
+            total: corpus_total(&cases, &FfiBridgeResolver),
         },
     ];
 
