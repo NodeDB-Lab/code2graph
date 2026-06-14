@@ -15,7 +15,7 @@
 use tree_sitter::{Language as TsLanguage, Node, Parser};
 
 use crate::error::{CodegraphError, Result};
-use crate::graph::types::{ByteSpan, FileFacts, Symbol, SymbolKind};
+use crate::graph::types::{ByteSpan, FfiAbi, FfiExport, FileFacts, Symbol, SymbolKind};
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
 
@@ -61,6 +61,7 @@ impl Extractor for CExtractor {
         let namespaces = c_namespaces(file);
 
         let mut symbols = collect_symbols(&root, bytes, file, &namespaces);
+        let ffi_exports = jni_exports(&symbols);
         symbols.push(super::module_symbol(
             Language::C,
             &namespaces,
@@ -77,7 +78,7 @@ impl Extractor for CExtractor {
             references,
             scopes: Vec::new(),
             bindings: Vec::new(),
-            ffi_exports: Vec::new(),
+            ffi_exports,
         })
     }
 }
@@ -96,6 +97,21 @@ fn c_namespaces(file: &str) -> Vec<String> {
     p.split('/')
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
+        .collect()
+}
+
+/// Emit a JNI [`FfiExport`] for each function whose name follows the `Java_*`
+/// mangling — the common case where a Java `native` method's implementation is
+/// written in C. The resolver bridges it to the declaring Java method.
+fn jni_exports(symbols: &[Symbol]) -> Vec<FfiExport> {
+    symbols
+        .iter()
+        .filter(|s| s.kind == SymbolKind::Function && s.name.starts_with("Java_"))
+        .map(|s| FfiExport {
+            symbol: s.id.clone(),
+            abi: FfiAbi::Jni,
+            export_name: s.name.clone(),
+        })
         .collect()
 }
 

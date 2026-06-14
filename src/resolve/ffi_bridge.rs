@@ -379,6 +379,38 @@ mod tests {
         );
     }
 
+    /// JNI: a Java `native` method bridges to a C implementation too (the common
+    /// NDK case), via the `Java_*` export the C extractor emits.
+    #[test]
+    fn bridges_java_native_method_to_c_jni_impl() {
+        let java = JavaExtractor
+            .extract(
+                "package com.example;\npublic class Foo {\n    public native int compute(int x);\n}\n",
+                "Foo.java",
+            )
+            .unwrap();
+        let c = CExtractor
+            .extract(
+                "int Java_com_example_Foo_compute(void* env, void* obj, int x) { return x; }",
+                "jni.c",
+            )
+            .unwrap();
+        assert_eq!(c.ffi_exports.len(), 1, "C must export the Java_ function");
+        assert_eq!(c.ffi_exports[0].abi, FfiAbi::Jni);
+
+        let graph = FfiBridgeResolver.resolve(&[java, c]);
+        let bridges: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.provenance == Provenance::FfiBridge)
+            .collect();
+        assert_eq!(
+            bridges.len(),
+            1,
+            "expected one JNI bridge edge to the C impl"
+        );
+    }
+
     /// ABI isolation: a C call must NOT bridge to a Python-only (PyO3) export of
     /// the same name, nor a Python call to a C-only export.
     #[test]
