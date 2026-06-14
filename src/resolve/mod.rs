@@ -13,9 +13,11 @@
 //! [`FileFacts`]: crate::graph::FileFacts
 
 mod resolver;
+pub mod scope_graph;
 mod support;
 pub mod symbol_table;
 
 pub use resolver::Resolver;
+pub use scope_graph::ScopeGraphResolver;
 pub(crate) use support::enclosing_symbol_index;
 pub use symbol_table::SymbolTableResolver;
