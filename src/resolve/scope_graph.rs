@@ -3,21 +3,26 @@
 //! Tier-B scope-aware resolver (**in progress**).
 //!
 //! This resolver walks each file's lexical scopes to bind references the way the
-//! language's name-resolution rules would. It currently resolves two binding
-//! kinds to [`Confidence::Scoped`] edges:
+//! language's name-resolution rules would. It resolves three binding kinds:
 //!
 //! * **Local/param bindings** — a reference that resolves to a local variable or
-//!   parameter within the file's scopes produces an edge whose target is a
-//!   synthesized [`SymbolId::Local`].
+//!   parameter within the file's scopes produces a [`Confidence::Scoped`] edge
+//!   whose target is a synthesized [`SymbolId::Local`].
 //! * **Same-file top-level definitions** — a reference whose name walks out to a
-//!   scope-0 [`BindingKind::Definition`] binding produces an edge directly to
-//!   that definition's [`SymbolId`], eliminating Tier-A's name-only fan-out
-//!   across files.
+//!   scope-0 [`BindingKind::Definition`] binding produces a [`Confidence::Scoped`]
+//!   edge directly to that definition's [`SymbolId`], eliminating Tier-A's
+//!   name-only fan-out across files.
+//! * **Imports (cross-file)** — a reference that walks out to a
+//!   [`BindingKind::Import`] binding is resolved across files: when the import's
+//!   path (the imported-from module, as written) **uniquely** matches one global
+//!   definition's namespace suffix, it produces a single [`Confidence::Exact`]
+//!   edge to that definition — turning Tier-A's ambiguous import fan-out into one
+//!   precise edge. An import whose path matches no definition, or matches two or
+//!   more ambiguously, yields **no** edge (Tier-B never fakes precision; Tier-A
+//!   still provides recall via fan-out for those cases).
 //!
-//! Cross-file and import resolution is **not yet handled**: `Import` bindings
-//! are currently a no-op (future unit U7 will fill those in via the same
-//! [`scope_walk`] core). A reference with `scope: None` (every extractor except
-//! Rust, for now) or a name that binds to nothing simply yields no edge.
+//! A reference with `scope: None` (every extractor except Rust, for now) or a
+//! name that binds to nothing simply yields no edge.
 
 use std::collections::HashMap;
 
@@ -28,10 +33,9 @@ use crate::graph::types::{
 use crate::symbol::SymbolId;
 
 use super::Resolver;
-use super::enclosing_symbol_index;
+use super::{enclosing_symbol_index, namespaces_end_with, normalize_from_path};
 
-/// Scope-aware resolver. See module docs — currently resolves local/param
-/// references only.
+/// Scope-aware resolver. See module docs.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ScopeGraphResolver;
 
@@ -49,6 +53,15 @@ impl Resolver for ScopeGraphResolver {
         let mut syms_by_file: HashMap<&str, Vec<usize>> = HashMap::new();
         for (i, s) in symbols.iter().enumerate() {
             syms_by_file.entry(s.file.as_str()).or_default().push(i);
+        }
+
+        // Global leaf-name → indices into `symbols`, for cross-file import
+        // resolution (mirrors Tier-A's `by_name`).
+        let mut by_name: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (i, s) in symbols.iter().enumerate() {
+            if let Some(n) = s.id.leaf_name() {
+                by_name.entry(n).or_default().push(i);
+            }
         }
 
         let mut edges: Vec<Edge> = Vec::new();
@@ -111,8 +124,39 @@ impl Resolver for ScopeGraphResolver {
                         }
                         // (A Definition binding always carries Def(_); the `if let` is defensive.)
                     }
-                    // U7 will handle Import bindings here.
-                    BindingKind::Import => continue,
+                    BindingKind::Import => {
+                        if let BindingTarget::Import(from_path) = &binding.target {
+                            let segs = normalize_from_path(from_path);
+                            if !segs.is_empty() {
+                                // Among global symbols sharing the imported name, find the
+                                // UNIQUE one whose namespace chain ends with the import path
+                                // segments.
+                                if let Some(&to_idx) =
+                                    by_name.get(binding.name.as_str()).and_then(|cands| {
+                                        let mut it = cands.iter().filter(|&&i| {
+                                            namespaces_end_with(&symbols[i].id, &segs)
+                                        });
+                                        let first = it.next();
+                                        match (first, it.next()) {
+                                            (Some(only), None) => Some(only), // exactly one match
+                                            _ => None, // zero or ambiguous → no edge
+                                        }
+                                    })
+                                {
+                                    edges.push(Edge {
+                                        from: symbols[from_idx].id.clone(),
+                                        to: symbols[to_idx].id.clone(),
+                                        role: r.role,
+                                        confidence: Confidence::Exact,
+                                        occ: r.occ.clone(),
+                                    });
+                                }
+                            }
+                        }
+                        // No from_path, empty segs, or non-unique match → no edge
+                        // (Tier-B never fakes precision; Tier-A still provides recall
+                        // via fan-out for those).
+                    }
                 }
             }
         }
@@ -439,6 +483,123 @@ mod tests {
         assert!(
             to_scip.starts_with("local "),
             "let-binding must shadow top-level definition: target should be a local, got: {to_scip}"
+        );
+    }
+
+    // ── U7: Import arm (cross-file import resolution) ─────────────────────────
+
+    /// All Import-role edges in the graph.
+    fn import_edges(graph: &CodeGraph) -> Vec<&Edge> {
+        graph
+            .edges
+            .iter()
+            .filter(|e| e.role == crate::graph::types::RefRole::Import)
+            .collect()
+    }
+
+    #[test]
+    fn resolves_unique_cross_file_import_exact() {
+        // `src/conf.rs` defines `Config` (namespace chain ["conf"]).
+        // `src/app.rs` does `use conf::Config;` → from_path "conf" → segs ["conf"]
+        // which uniquely suffix-matches conf::Config. Expect exactly one Import
+        // edge, Confidence::Exact, targeting conf/Config#.
+        let conf = RustExtractor
+            .extract("pub struct Config {}", "src/conf.rs")
+            .unwrap();
+        let app = RustExtractor
+            .extract("use conf::Config;\npub fn run() {}", "src/app.rs")
+            .unwrap();
+
+        let graph = ScopeGraphResolver.resolve(&[conf, app]);
+
+        let imports = import_edges(&graph);
+        assert_eq!(
+            imports.len(),
+            1,
+            "expected exactly one Import edge, got: {:?}",
+            imports
+                .iter()
+                .map(|e| e.to.to_scip_string())
+                .collect::<Vec<_>>()
+        );
+        let e = imports[0];
+        assert_eq!(
+            e.confidence,
+            Confidence::Exact,
+            "cross-file import edge must be Exact"
+        );
+        assert!(
+            e.to.to_scip_string().ends_with("conf/Config#"),
+            "import edge must target conf::Config, got: {}",
+            e.to.to_scip_string()
+        );
+        assert!(
+            e.from.to_scip_string().ends_with("app/"),
+            "import edge source should be app's module symbol, got: {}",
+            e.from.to_scip_string()
+        );
+    }
+
+    #[test]
+    fn ambiguous_import_becomes_precise_single_exact_edge() {
+        // Two files define `Config` in DIFFERENT namespaces:
+        //   src/conf.rs   → ["conf"]
+        //   src/other.rs  → ["other"]   (the decoy)
+        // The importer does `use conf::Config;` → from_path "conf".
+        // Tier-A would fan out to BOTH; Tier-B emits exactly ONE Exact edge to
+        // conf::Config and NOT to the decoy.
+        let conf = RustExtractor
+            .extract("pub struct Config {}", "src/conf.rs")
+            .unwrap();
+        let other = RustExtractor
+            .extract("pub struct Config {}", "src/other.rs")
+            .unwrap();
+        let app = RustExtractor
+            .extract("use conf::Config;\npub fn run() {}", "src/app.rs")
+            .unwrap();
+
+        let graph = ScopeGraphResolver.resolve(&[conf, other, app]);
+
+        let imports = import_edges(&graph);
+        assert_eq!(
+            imports.len(),
+            1,
+            "expected exactly one precise Import edge (not a fan-out), got: {:?}",
+            imports
+                .iter()
+                .map(|e| e.to.to_scip_string())
+                .collect::<Vec<_>>()
+        );
+        let e = imports[0];
+        assert_eq!(e.confidence, Confidence::Exact);
+        assert!(
+            e.to.to_scip_string().ends_with("conf/Config#"),
+            "must resolve to conf::Config, got: {}",
+            e.to.to_scip_string()
+        );
+        // Explicitly assert the decoy was NOT targeted.
+        assert!(
+            !e.to.to_scip_string().ends_with("other/Config#"),
+            "must NOT resolve to the decoy other::Config"
+        );
+    }
+
+    #[test]
+    fn unmatched_import_yields_no_edge() {
+        // Importer's from_path ("missing") matches no definition's namespace
+        // suffix → Tier-B emits no Import edge (honest no-op).
+        let conf = RustExtractor
+            .extract("pub struct Config {}", "src/conf.rs")
+            .unwrap();
+        let app = RustExtractor
+            .extract("use missing::Config;\npub fn run() {}", "src/app.rs")
+            .unwrap();
+
+        let graph = ScopeGraphResolver.resolve(&[conf, app]);
+
+        assert!(
+            import_edges(&graph).is_empty(),
+            "import whose path matches no definition must yield no Tier-B edge"
         );
     }
 }
