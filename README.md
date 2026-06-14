@@ -45,10 +45,13 @@ and confidence-tagged edges (`calls`, `imports`, `inherits`). Symbol identity is
 descriptor path rendering to a stable string, so cross-file matching is string equality.
 
 The baseline resolver is **recall-first**: it matches by name and tags every edge `NameOnly`, so
-an ambiguous name links to all same-named definitions. A precise, scope-aware resolver (emitting
-`Scoped`/`Exact` edges) is in progress behind the stable `Resolver` trait — a consumer picks the
-tier and the output schema does not change. Identity rendering and the graph schema may still
-evolve before `0.1`.
+an ambiguous name links to all same-named definitions. A precise, scope-aware resolver
+(`ScopeGraphResolver`) now sits behind the same `Resolver` trait, emitting `Scoped`/`Exact` edges
+by resolving references through lexical scopes, imports, and qualified paths instead of name
+fan-out. Scope analysis is currently implemented for Rust; other languages fall back to the
+recall-first baseline. Both resolvers emit the same schema, so a consumer picks the tier without
+changing how it reads the output. Identity rendering and the graph schema may still evolve before
+`0.1`.
 
 ## License
 

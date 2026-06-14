@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Tier-B scope-aware resolver (**in progress**).
+//! Tier-B scope-aware resolver — precise resolution via lexical scopes (Rust-first).
 //!
 //! This resolver walks each file's lexical scopes to bind references the way the
 //! language's name-resolution rules would. It resolves four binding kinds:

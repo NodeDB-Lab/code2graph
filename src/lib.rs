@@ -27,9 +27,12 @@
 //! - **Identity** ([`symbol`]) is SCIP-aligned: a symbol is a descriptor path
 //!   rendering to a stable, human-readable string, so cross-file matching is
 //!   string equality.
-//! - **Resolution** ([`resolve`]) is a tier seam: the fast [`SymbolTableResolver`]
-//!   (name/scope, all languages) and a future precise stack-graphs resolver emit
-//!   the **same** schema, tagging every edge with a [`graph::Confidence`].
+//! - **Resolution** ([`resolve`]) is a tier seam: the fast recall-first
+//!   [`SymbolTableResolver`] (name matching, all languages, `NameOnly` edges) and
+//!   the precise scope-aware [`ScopeGraphResolver`] (lexical-scope + import +
+//!   qualified-path resolution, `Scoped`/`Exact` edges, currently Rust) emit the
+//!   **same** schema, tagging every edge with a [`graph::Confidence`]. A consumer
+//!   picks the tier; the output shape is identical.
 //! - **No storage, no source bodies** — [`graph::Symbol`]s carry a byte span;
 //!   consumers slice what they need.
 //!
@@ -52,5 +55,5 @@ pub use graph::{
     Occurrence, RefRole, Reference, Scope, ScopeId, ScopeKind, Symbol, SymbolKind,
 };
 pub use lang::Language;
-pub use resolve::{Resolver, SymbolTableResolver};
+pub use resolve::{Resolver, ScopeGraphResolver, SymbolTableResolver};
 pub use symbol::{Descriptor, Package, SymbolId};
