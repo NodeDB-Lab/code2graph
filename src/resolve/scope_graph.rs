@@ -54,8 +54,8 @@
 use std::collections::HashMap;
 
 use crate::graph::types::{
-    Binding, BindingKind, BindingTarget, CodeGraph, Confidence, Edge, FileFacts, Scope, ScopeId,
-    Symbol,
+    Binding, BindingKind, BindingTarget, CodeGraph, Confidence, Edge, FileFacts, Provenance, Scope,
+    ScopeId, Symbol,
 };
 use crate::symbol::SymbolId;
 
@@ -134,6 +134,7 @@ impl Resolver for ScopeGraphResolver {
                                 to: symbols[to_idx].id.clone(),
                                 role: r.role,
                                 confidence: Confidence::Exact,
+                                provenance: Provenance::ScopeGraph,
                                 occ: r.occ.clone(),
                             });
                         }
@@ -166,6 +167,7 @@ impl Resolver for ScopeGraphResolver {
                             to,
                             role: r.role,
                             confidence: Confidence::Exact,
+                            provenance: Provenance::ScopeGraph,
                             occ: r.occ.clone(),
                         });
                     }
@@ -177,6 +179,7 @@ impl Resolver for ScopeGraphResolver {
                                 to: target_id.clone(),
                                 role: r.role,
                                 confidence: Confidence::Scoped,
+                                provenance: Provenance::ScopeGraph,
                                 occ: r.occ.clone(),
                             });
                         }
@@ -200,6 +203,7 @@ impl Resolver for ScopeGraphResolver {
                                         to: symbols[to_idx].id.clone(),
                                         role: r.role,
                                         confidence: Confidence::Exact,
+                                        provenance: Provenance::ScopeGraph,
                                         occ: r.occ.clone(),
                                     });
                                 }
@@ -315,6 +319,8 @@ mod tests {
         );
         let e = locals[0];
         assert_eq!(e.confidence, Confidence::Exact);
+        // The scope-aware resolver stamps every edge with ScopeGraph provenance.
+        assert_eq!(e.provenance, Provenance::ScopeGraph);
         assert!(
             e.from.to_scip_string().ends_with("run()."),
             "from was: {}",

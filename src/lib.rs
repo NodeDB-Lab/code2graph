@@ -52,7 +52,7 @@ pub use error::{CodegraphError, Result};
 pub use extract::{Extractor, extract_file, extract_path};
 pub use graph::{
     Binding, BindingKind, BindingTarget, ByteSpan, CodeGraph, Confidence, Edge, FileFacts,
-    Occurrence, RefRole, Reference, Scope, ScopeId, ScopeKind, Symbol, SymbolKind,
+    Occurrence, Provenance, RefRole, Reference, Scope, ScopeId, ScopeKind, Symbol, SymbolKind,
 };
 pub use lang::Language;
 pub use resolve::{Resolver, ScopeGraphResolver, SymbolTableResolver};

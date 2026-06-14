@@ -19,7 +19,7 @@
 
 use std::collections::HashMap;
 
-use crate::graph::types::{CodeGraph, Confidence, Edge, FileFacts, RefRole, Symbol};
+use crate::graph::types::{CodeGraph, Confidence, Edge, FileFacts, Provenance, RefRole, Symbol};
 
 use super::Resolver;
 use super::{enclosing_symbol_index, namespaces_end_with, normalize_from_path};
@@ -117,6 +117,7 @@ impl Resolver for SymbolTableResolver {
                         to: symbols[to_idx].id.clone(),
                         role: r.role,
                         confidence,
+                        provenance: Provenance::SymbolTable,
                         occ: r.occ.clone(),
                     });
                 }
@@ -156,6 +157,8 @@ mod tests {
         assert!(e.from.to_scip_string().ends_with("run()."));
         assert!(e.to.to_scip_string().ends_with("util/helper()."));
         assert_eq!(e.confidence, Confidence::Scoped);
+        // Provenance records the deriving analysis, independent of confidence.
+        assert_eq!(e.provenance, Provenance::SymbolTable);
         assert_eq!(e.occ.file, "src/main.rs");
     }
 

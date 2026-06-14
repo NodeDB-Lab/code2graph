@@ -224,6 +224,28 @@ pub enum Confidence {
     NameOnly,
 }
 
+/// Which analysis derived an [`Edge`] — its provenance.
+///
+/// This is **orthogonal to [`Confidence`]**: confidence answers "how sure are we
+/// this binding is correct?", provenance answers "which mechanism produced it?".
+/// A consumer uses provenance to filter or weight edges by *how* they were found
+/// — e.g. trust scope-resolved edges over name-matched ones, or treat the
+/// deterministic-but-cross-runtime FFI bridges specially — independently of the
+/// per-edge confidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Provenance {
+    /// Derived by name-based matching against the global symbol table (the
+    /// recall-first resolver). May over-connect on ambiguous names.
+    SymbolTable,
+    /// Derived by lexical scope-graph resolution through scopes, imports, and
+    /// qualified paths (the scope-aware resolver).
+    ScopeGraph,
+    /// Derived by matching a cross-language FFI boundary (e.g. `#[no_mangle]`
+    /// / `extern` C ABI, PyO3, wasm-bindgen, NAPI, JNI). Links a symbol in one
+    /// language to its counterpart across a runtime boundary.
+    FfiBridge,
+}
+
 /// A resolved directed edge between two symbols.
 #[derive(Debug, Clone)]
 pub struct Edge {
@@ -235,6 +257,8 @@ pub struct Edge {
     pub role: RefRole,
     /// Resolver precision for this edge.
     pub confidence: Confidence,
+    /// Which analysis derived this edge — orthogonal to [`confidence`](Self::confidence).
+    pub provenance: Provenance,
     /// The reference site that produced the edge — the evidence trail.
     pub occ: Occurrence,
 }
