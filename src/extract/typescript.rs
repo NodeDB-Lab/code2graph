@@ -18,11 +18,17 @@
 use tree_sitter::{Language as TsLanguage, Node, Parser};
 
 use crate::error::{CodegraphError, Result};
-use crate::graph::types::{ByteSpan, FileFacts, RefRole, Reference, Symbol, SymbolKind};
+use crate::graph::types::{
+    Binding, BindingKind, ByteSpan, FileFacts, RefRole, Reference, Scope, ScopeId, ScopeKind,
+    Symbol, SymbolKind,
+};
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
 
-use super::{Extractor, child_text, collect_call_references, node_text, one_line_signature};
+use super::{
+    Extractor, attach_reference_scopes, child_text, collect_call_references, definition_bindings,
+    import_bindings, node_span, node_text, one_line_signature, push_binding, push_scope,
+};
 
 /// Tree-sitter query capturing call-callee identifiers.
 const CALL_QUERY: &str = r#"
@@ -74,7 +80,9 @@ pub(super) fn extract_ecmascript(source: &str, file: &str, lang: Language) -> Re
     let bytes = source.as_bytes();
     let namespaces = module_namespaces(file);
 
-    let mut symbols = collect_symbols(&root, bytes, file, &namespaces, lang);
+    let defs = collect_symbols(&root, bytes, file, &namespaces, lang);
+    let def_bindings = definition_bindings(&defs);
+    let mut symbols = defs;
     let mod_sym = super::module_symbol(lang, &namespaces, file, source.len());
     let module_id = mod_sym.id.to_scip_string();
     symbols.push(mod_sym);
@@ -83,13 +91,19 @@ pub(super) fn extract_ecmascript(source: &str, file: &str, lang: Language) -> Re
     collect_inheritance(&root, bytes, file, &mut references);
     collect_imports(&root, bytes, file, &mut references, &module_id);
 
+    let scopes = collect_scopes(&root, source.len());
+    attach_reference_scopes(&mut references, &scopes);
+    let mut bindings = collect_bindings(&root, bytes, &scopes);
+    bindings.extend(def_bindings);
+    bindings.extend(import_bindings(&references, &scopes));
+
     Ok(FileFacts {
         file: file.to_owned(),
         lang: lang.as_str().to_owned(),
         symbols,
         references,
-        scopes: Vec::new(),
-        bindings: Vec::new(),
+        scopes,
+        bindings,
         ffi_exports: Vec::new(),
     })
 }
@@ -398,6 +412,155 @@ fn collect_imports(
     }
 }
 
+// ── Scope tree (Tier-B) ──────────────────────────────────────────────────────
+
+/// ECMAScript function-like node kinds — each opens a `Function` scope.
+const FN_KINDS: &[&str] = &[
+    "function_declaration",
+    "function_expression",
+    "arrow_function",
+    "method_definition",
+    "generator_function_declaration",
+    "generator_function",
+];
+
+/// Build the lexical scope tree for one TS/JS file.
+///
+/// `scopes[0]` is the file-root `Module` scope. ECMAScript is block-scoped:
+/// every function-like node opens a `Function` scope and every standalone
+/// `statement_block` (an `if`/`for`/`while` body or a bare block) opens a
+/// `Block` scope. A `class` body opens no scope — like Python's LEGB, a method's
+/// unqualified name lookup does not see class members.
+///
+/// Known v1 boundary: `var` is function-scoped but is recorded as a block-scoped
+/// local (treated like `let`); hoisting of `var` is not modelled.
+fn collect_scopes(root: &Node, source_len: usize) -> Vec<Scope> {
+    let mut scopes = Vec::new();
+    push_scope(
+        &mut scopes,
+        None,
+        ByteSpan {
+            start: 0,
+            end: source_len,
+        },
+        ScopeKind::Module,
+    );
+    for child in root.children(&mut root.walk()) {
+        scope_dfs(&child, 0, &mut scopes);
+    }
+    scopes
+}
+
+fn scope_dfs(node: &Node, parent_id: ScopeId, scopes: &mut Vec<Scope>) {
+    if FN_KINDS.contains(&node.kind()) {
+        let fn_id = push_scope(
+            scopes,
+            Some(parent_id),
+            node_span(node),
+            ScopeKind::Function,
+        );
+        // Recurse the body. For a brace body, descend into its children directly
+        // so the body `statement_block` does not open a redundant nested scope.
+        if let Some(body) = node.child_by_field_name("body") {
+            if body.kind() == "statement_block" {
+                for child in body.children(&mut body.walk()) {
+                    scope_dfs(&child, fn_id, scopes);
+                }
+            } else {
+                scope_dfs(&body, fn_id, scopes); // arrow with an expression body
+            }
+        }
+    } else if node.kind() == "statement_block" {
+        let block_id = push_scope(scopes, Some(parent_id), node_span(node), ScopeKind::Block);
+        for child in node.children(&mut node.walk()) {
+            scope_dfs(&child, block_id, scopes);
+        }
+    } else {
+        for child in node.children(&mut node.walk()) {
+            scope_dfs(&child, parent_id, scopes);
+        }
+    }
+}
+
+// ── Bindings (Tier-B) ────────────────────────────────────────────────────────
+
+/// Collect parameter and variable [`Binding`]s for one TS/JS file.
+///
+/// Covers function parameters and `let`/`const`/`var` declarators (each a bare
+/// `identifier` name; destructuring patterns are deferred). Top-level definitions
+/// and imports are added by the caller from the shared helpers.
+fn collect_bindings(root: &Node, bytes: &[u8], scopes: &[Scope]) -> Vec<Binding> {
+    let mut out = Vec::new();
+    collect_bindings_dfs(root, bytes, scopes, &mut out);
+    out
+}
+
+fn collect_bindings_dfs(node: &Node, bytes: &[u8], scopes: &[Scope], out: &mut Vec<Binding>) {
+    if FN_KINDS.contains(&node.kind()) {
+        if let Some(params) = node.child_by_field_name("parameters") {
+            collect_params(&params, bytes, scopes, out);
+        } else if let Some(p) = node.child_by_field_name("parameter") {
+            // single-identifier arrow parameter, e.g. `x => …`
+            if p.kind() == "identifier" {
+                push_binding(
+                    out,
+                    node_text(&p, bytes).to_owned(),
+                    p.start_byte(),
+                    BindingKind::Param,
+                    scopes,
+                );
+            }
+        }
+        for child in node.children(&mut node.walk()) {
+            collect_bindings_dfs(&child, bytes, scopes, out);
+        }
+    } else if node.kind() == "variable_declarator" {
+        // `let`/`const` (lexical_declaration) and `var` (variable_declaration)
+        // both nest a `variable_declarator` with a `name` field.
+        if let Some(name) = node.child_by_field_name("name") {
+            if name.kind() == "identifier" {
+                push_binding(
+                    out,
+                    node_text(&name, bytes).to_owned(),
+                    name.start_byte(),
+                    BindingKind::Local,
+                    scopes,
+                );
+            }
+        }
+        for child in node.children(&mut node.walk()) {
+            collect_bindings_dfs(&child, bytes, scopes, out);
+        }
+    } else {
+        for child in node.children(&mut node.walk()) {
+            collect_bindings_dfs(&child, bytes, scopes, out);
+        }
+    }
+}
+
+/// Emit a [`BindingKind::Param`] for each parameter in a `formal_parameters`
+/// node, unwrapping the typed `required_parameter`/`optional_parameter` forms.
+fn collect_params(params: &Node, bytes: &[u8], scopes: &[Scope], out: &mut Vec<Binding>) {
+    for child in params.named_children(&mut params.walk()) {
+        let ident = match child.kind() {
+            "identifier" => Some(child),
+            "required_parameter" | "optional_parameter" => child.child_by_field_name("pattern"),
+            _ => None,
+        };
+        if let Some(id) = ident {
+            if id.kind() == "identifier" {
+                push_binding(
+                    out,
+                    node_text(&id, bytes).to_owned(),
+                    id.start_byte(),
+                    BindingKind::Param,
+                    scopes,
+                );
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -437,6 +600,32 @@ function internal() {}
         assert_eq!(facts.symbols.len(), 2);
         let app = facts.symbols.iter().find(|s| s.name == "App").unwrap();
         assert_eq!(app.id.to_scip_string(), "codegraph . . . src/App/App().");
+    }
+
+    #[test]
+    fn emits_function_block_scopes_and_bindings() {
+        let src = "export function run(arg: number) {\n  const local = 1;\n  if (arg) { helper(local); }\n}\n";
+        let facts = TypeScriptExtractor.extract(src, "src/main.ts").unwrap();
+        assert!(
+            facts.scopes.iter().any(|s| s.kind == ScopeKind::Function),
+            "expected a Function scope"
+        );
+        assert!(
+            facts.scopes.iter().any(|s| s.kind == ScopeKind::Block),
+            "expected a Block scope (the if body)"
+        );
+        let has = |name: &str, kind: BindingKind| {
+            facts
+                .bindings
+                .iter()
+                .any(|b| b.name == name && b.kind == kind)
+        };
+        assert!(has("arg", BindingKind::Param), "param binding missing");
+        assert!(
+            has("local", BindingKind::Local),
+            "const local binding missing"
+        );
+        assert!(has("run", BindingKind::Definition), "def binding missing");
     }
 
     #[test]

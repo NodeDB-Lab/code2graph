@@ -3,7 +3,8 @@
 //! Tier-B scope-aware resolver — precise resolution via lexical scopes.
 //!
 //! The resolver itself is language-agnostic; it resolves whatever scope/binding
-//! facts an extractor emits. Scope-aware extractors today: Rust and Python.
+//! facts an extractor emits. Scope-aware extractors today: Rust, Python, and
+//! TypeScript/JavaScript.
 //!
 //! This resolver walks each file's lexical scopes to bind references the way the
 //! language's name-resolution rules would. It resolves four binding kinds:
@@ -309,6 +310,44 @@ mod tests {
             .extract(
                 "from alpha import process\n\ndef run():\n    process()\n",
                 "main.py",
+            )
+            .unwrap();
+
+        let graph = ScopeGraphResolver.resolve(&[alpha, beta, main]);
+        let calls: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.role == RefRole::Call)
+            .collect();
+        assert_eq!(
+            calls.len(),
+            1,
+            "expected exactly one call edge (no fan-out)"
+        );
+        assert_eq!(calls[0].provenance, Provenance::ScopeGraph);
+        assert!(
+            calls[0].to.to_scip_string().contains("alpha"),
+            "call must bind to alpha's process, got {}",
+            calls[0].to.to_scip_string()
+        );
+    }
+
+    /// TypeScript: an import disambiguates an ambiguous cross-file call, exactly
+    /// as for Python — the scope tier binds to the imported definition alone.
+    #[test]
+    fn typescript_import_disambiguates_ambiguous_call() {
+        use crate::extract::TypeScriptExtractor;
+        use crate::graph::types::RefRole;
+        let alpha = TypeScriptExtractor
+            .extract("export function process() {}\n", "alpha.ts")
+            .unwrap();
+        let beta = TypeScriptExtractor
+            .extract("export function process() {}\n", "beta.ts")
+            .unwrap();
+        let main = TypeScriptExtractor
+            .extract(
+                "import { process } from \"./alpha\";\n\nexport function run() {\n  process();\n}\n",
+                "main.ts",
             )
             .unwrap();
 

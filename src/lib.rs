@@ -30,7 +30,8 @@
 //! - **Resolution** ([`resolve`]) is a tier seam: the fast recall-first
 //!   [`SymbolTableResolver`] (name matching, all languages, `NameOnly` edges) and
 //!   the precise scope-aware [`ScopeGraphResolver`] (lexical-scope + import +
-//!   qualified-path resolution, `Scoped`/`Exact` edges, Rust and Python) emit the
+//!   qualified-path resolution, `Scoped`/`Exact` edges, Rust/Python/TypeScript)
+//!   emit the
 //!   **same** schema, tagging every edge with a [`graph::Confidence`] and a
 //!   [`graph::Provenance`] (which analysis derived it, orthogonal to confidence).
 //!   A consumer picks the tier; the output shape is identical.

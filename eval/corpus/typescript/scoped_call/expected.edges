@@ -1,0 +1,4 @@
+# Two same-named exported `process`; the import fixes which one `run` calls.
+# Tier-A fans out to both; Tier-B follows the import binding to alpha alone.
+main.ts:1 Import alpha.ts:1
+main.ts:4 Call alpha.ts:1

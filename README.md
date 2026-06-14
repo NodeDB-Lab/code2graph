@@ -48,8 +48,8 @@ The baseline resolver is **recall-first**: it matches by name and tags every edg
 an ambiguous name links to all same-named definitions. A precise, scope-aware resolver
 (`ScopeGraphResolver`) now sits behind the same `Resolver` trait, emitting `Scoped`/`Exact` edges
 by resolving references through lexical scopes, imports, and qualified paths instead of name
-fan-out. Scope analysis is currently implemented for Rust and Python; other languages fall back to
-the recall-first baseline. Both resolvers emit the same schema, so a consumer picks the tier without
+fan-out. Scope analysis is currently implemented for Rust, Python, and TypeScript/JavaScript; other
+languages fall back to the recall-first baseline. Both resolvers emit the same schema, so a consumer picks the tier without
 changing how it reads the output. Identity rendering and the graph schema may still evolve before
 `0.1`.
 

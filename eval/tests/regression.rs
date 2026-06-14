@@ -98,7 +98,7 @@ fn scope_tier_beats_name_tier_on_precision_where_it_resolves() {
     let cases = corpus();
     let a = per_language(&cases, &SymbolTableResolver);
     let b = per_language(&cases, &ScopeGraphResolver);
-    for lang in ["rust", "python"] {
+    for lang in ["rust", "python", "typescript"] {
         let (Some(a_l), Some(b_l)) = (a.get(lang), b.get(lang)) else {
             panic!("corpus must include {lang} cases");
         };
