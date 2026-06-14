@@ -13,12 +13,18 @@
 //!   emitted. Zero matches or two-or-more matches yield **no** edge — Tier-B never
 //!   fakes precision.
 //! * **Local/param bindings** — a reference that resolves to a local variable or
-//!   parameter within the file's scopes produces a [`Confidence::Scoped`] edge
-//!   whose target is a synthesized [`SymbolId::Local`].
+//!   parameter within the file's scopes produces a [`Confidence::Exact`] edge
+//!   whose target is a synthesized [`SymbolId::Local`]. Local/param resolution is
+//!   the most certain kind: the inner-first scope walk guarantees the binding is
+//!   lexically pinned with no confounders (a local always shadows any same-name
+//!   import or definition in an outer scope).
 //! * **Same-file top-level definitions** — a reference whose name walks out to a
 //!   scope-0 [`BindingKind::Definition`] binding produces a [`Confidence::Scoped`]
 //!   edge directly to that definition's [`SymbolId`], eliminating Tier-A's
-//!   name-only fan-out across files.
+//!   name-only fan-out across files. This is [`Confidence::Scoped`] (not `Exact`)
+//!   because a same-name import also lives at module scope (scope 0); the walk
+//!   breaks the tie by byte-order, which is not the language's real resolution
+//!   rule — so this resolution is genuinely confoundable.
 //! * **Imports (cross-file)** — a reference that walks out to a
 //!   [`BindingKind::Import`] binding is resolved across files: when the import's
 //!   path (the imported-from module, as written) **uniquely** matches one global
@@ -30,6 +36,20 @@
 //!
 //! A reference with `scope: None` (every extractor except Rust, for now) or a
 //! name that binds to nothing simply yields no edge.
+//!
+//! ## Confidence contract
+//!
+//! | Resolution kind                                      | [`Confidence`]  |
+//! |------------------------------------------------------|-----------------|
+//! | Local variable / parameter                           | `Exact`         |
+//! | Same-file top-level definition                       | `Scoped`        |
+//! | Cross-file import (unique path-suffix match)         | `Exact`         |
+//! | Path-qualified call (unique namespace-suffix match)  | `Exact`         |
+//! | Ambiguous or unresolved                              | no edge emitted |
+//!
+//! Tier-B never emits `NameOnly` edges; it either resolves with honest
+//! confidence or emits nothing (Tier-A still provides recall via fan-out for
+//! those cases).
 
 use std::collections::HashMap;
 
@@ -145,7 +165,7 @@ impl Resolver for ScopeGraphResolver {
                             from: symbols[from_idx].id.clone(),
                             to,
                             role: r.role,
-                            confidence: Confidence::Scoped,
+                            confidence: Confidence::Exact,
                             occ: r.occ.clone(),
                         });
                     }
@@ -294,7 +314,7 @@ mod tests {
             locals.len()
         );
         let e = locals[0];
-        assert_eq!(e.confidence, Confidence::Scoped);
+        assert_eq!(e.confidence, Confidence::Exact);
         assert!(
             e.from.to_scip_string().ends_with("run()."),
             "from was: {}",
@@ -349,7 +369,7 @@ mod tests {
             "expected one local edge, got {:?}",
             locals.len()
         );
-        assert_eq!(locals[0].confidence, Confidence::Scoped);
+        assert_eq!(locals[0].confidence, Confidence::Exact);
     }
 
     #[test]
@@ -822,5 +842,129 @@ mod tests {
             "nested-namespace edge must target a/b/process, got: {}",
             edge.to.to_scip_string()
         );
+    }
+
+    // ── Confidence contract (single source of truth) ──────────────────────────
+
+    /// Lock the full confidence contract in one place.
+    ///
+    /// | Kind                                   | Expected confidence |
+    /// |----------------------------------------|---------------------|
+    /// | Local variable / parameter             | `Exact`             |
+    /// | Same-file top-level definition         | `Scoped`            |
+    /// | Cross-file import (unique path-suffix) | `Exact`             |
+    /// | Path-qualified call (unique ns-suffix) | `Exact`             |
+    #[test]
+    fn confidence_contract_per_resolution_kind() {
+        // ── 1. Local binding → Exact ─────────────────────────────────────────
+        {
+            let facts = RustExtractor
+                .extract(
+                    "pub fn run() { let buffer = make(); buffer() }",
+                    "src/main.rs",
+                )
+                .unwrap();
+            let graph = ScopeGraphResolver.resolve(&[facts]);
+            let locals = local_edges(&graph);
+            assert_eq!(locals.len(), 1, "expected one local edge for 'buffer'");
+            assert_eq!(
+                locals[0].confidence,
+                Confidence::Exact,
+                "local binding must be Exact"
+            );
+        }
+
+        // ── 2. Param binding → Exact ─────────────────────────────────────────
+        {
+            let facts = RustExtractor
+                .extract("pub fn run(handler: u32) { handler() }", "src/main.rs")
+                .unwrap();
+            let graph = ScopeGraphResolver.resolve(&[facts]);
+            let locals = local_edges(&graph);
+            assert_eq!(locals.len(), 1, "expected one local edge for 'handler'");
+            assert_eq!(
+                locals[0].confidence,
+                Confidence::Exact,
+                "param binding must be Exact"
+            );
+        }
+
+        // ── 3. Same-file definition → Scoped ────────────────────────────────
+        {
+            let facts = RustExtractor
+                .extract(
+                    "pub fn compute() {} pub fn run() { compute() }",
+                    "src/main.rs",
+                )
+                .unwrap();
+            let graph = ScopeGraphResolver.resolve(&[facts]);
+            let def_edges: Vec<&Edge> = graph
+                .edges
+                .iter()
+                .filter(|e| {
+                    e.from.to_scip_string().ends_with("run().")
+                        && e.to.to_scip_string().ends_with("compute().")
+                        && !e.to.to_scip_string().starts_with("local ")
+                })
+                .collect();
+            assert_eq!(
+                def_edges.len(),
+                1,
+                "expected one definition edge for 'compute'"
+            );
+            assert_eq!(
+                def_edges[0].confidence,
+                Confidence::Scoped,
+                "same-file definition must be Scoped"
+            );
+        }
+
+        // ── 4. Cross-file import (unique path-suffix match) → Exact ─────────
+        {
+            let service = RustExtractor
+                .extract("pub struct Service {}", "src/service.rs")
+                .unwrap();
+            let app = RustExtractor
+                .extract("use service::Service;\npub fn run() {}", "src/app.rs")
+                .unwrap();
+            let graph = ScopeGraphResolver.resolve(&[service, app]);
+            let imports = import_edges(&graph);
+            assert_eq!(imports.len(), 1, "expected one import edge for 'Service'");
+            assert_eq!(
+                imports[0].confidence,
+                Confidence::Exact,
+                "cross-file import must be Exact"
+            );
+        }
+
+        // ── 5. Path-qualified call (unique namespace-suffix match) → Exact ───
+        {
+            let util = RustExtractor
+                .extract("pub fn validate() {}", "src/util.rs")
+                .unwrap();
+            let caller = RustExtractor
+                .extract("pub fn run() { util::validate() }", "src/caller.rs")
+                .unwrap();
+            let graph = ScopeGraphResolver.resolve(&[util, caller]);
+            let run_edges = call_edges_from_run(&graph);
+            assert_eq!(
+                run_edges.len(),
+                1,
+                "expected one qualified-call edge for 'util::validate'"
+            );
+            assert_eq!(
+                run_edges[0].confidence,
+                Confidence::Exact,
+                "qualified call must be Exact"
+            );
+            assert!(
+                run_edges[0]
+                    .to
+                    .to_scip_string()
+                    .ends_with("util/validate()."),
+                "qualified call must target util::validate, got: {}",
+                run_edges[0].to.to_scip_string()
+            );
+        }
     }
 }
