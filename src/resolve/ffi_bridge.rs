@@ -137,7 +137,9 @@ impl Resolver for FfiBridgeResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::extract::{CExtractor, Extractor, PythonExtractor, RustExtractor};
+    use crate::extract::{
+        CExtractor, Extractor, JavaScriptExtractor, PythonExtractor, RustExtractor,
+    };
 
     /// Rust `#[no_mangle]` export, called from C → one FfiBridge edge.
     #[test]
@@ -283,6 +285,31 @@ mod tests {
                 .to_scip_string()
                 .ends_with("ext/tokenize().")
         );
+    }
+
+    /// Rust `#[wasm_bindgen]` export, called from JavaScript → one FfiBridge edge.
+    #[test]
+    fn bridges_rust_wasm_bindgen_export_to_js_call() {
+        let rust = RustExtractor
+            .extract("#[wasm_bindgen]\npub fn greet() -> u32 { 0 }", "src/lib.rs")
+            .unwrap();
+        assert_eq!(rust.ffi_exports.len(), 1, "expected one FFI export");
+        assert_eq!(rust.ffi_exports[0].abi, FfiAbi::Wasm);
+        assert_eq!(rust.ffi_exports[0].export_name, "greet");
+
+        let js = JavaScriptExtractor
+            .extract("function run() { greet(); }", "app.js")
+            .unwrap();
+        let graph = FfiBridgeResolver.resolve(&[rust, js]);
+        assert_eq!(graph.edges.len(), 1, "expected one FFI bridge edge");
+        let e = &graph.edges[0];
+        assert_eq!(e.provenance, Provenance::FfiBridge);
+        assert!(
+            e.to.to_scip_string().ends_with("greet()."),
+            "to was: {}",
+            e.to.to_scip_string()
+        );
+        assert_eq!(e.occ.file, "app.js");
     }
 
     /// ABI isolation: a C call must NOT bridge to a Python-only (PyO3) export of

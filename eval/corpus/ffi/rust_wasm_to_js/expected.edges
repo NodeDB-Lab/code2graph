@@ -1,0 +1,4 @@
+# A WebAssembly/JS boundary (wasm-bindgen). JS calls `greet`, but the Rust
+# definition is `greet_user`, exposed to JS as `greet` via `js_name`. Name/scope
+# resolution cannot bridge it; the FFI bridge follows the export.
+app.js:1 Call lib.rs:2

@@ -259,6 +259,9 @@ pub enum FfiAbi {
     /// A native Python extension binding (e.g. Rust PyO3 `#[pyfunction]`),
     /// callable from Python under the exported name.
     Python,
+    /// A WebAssembly/JavaScript binding (e.g. Rust `#[wasm_bindgen]`), callable
+    /// from JavaScript or TypeScript under the exported name.
+    Wasm,
 }
 
 impl FfiAbi {
@@ -270,6 +273,7 @@ impl FfiAbi {
         match self {
             FfiAbi::C => &["c", "cpp"],
             FfiAbi::Python => &["python"],
+            FfiAbi::Wasm => &["javascript", "typescript"],
         }
     }
 }
