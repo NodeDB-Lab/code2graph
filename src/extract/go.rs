@@ -76,6 +76,7 @@ impl Extractor for GoExtractor {
             references,
             scopes: Vec::new(),
             bindings: Vec::new(),
+            ffi_exports: Vec::new(),
         })
     }
 }

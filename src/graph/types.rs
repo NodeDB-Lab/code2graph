@@ -246,6 +246,36 @@ pub enum Provenance {
     FfiBridge,
 }
 
+// ── FFI / cross-language boundary facts ──────────────────────────────────────
+
+/// The application binary interface a symbol is exported under for
+/// cross-language linkage. Cross-language superset; only the C ABI is detected
+/// today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FfiAbi {
+    /// The C ABI — the lingua-franca FFI boundary (`#[no_mangle]` / `extern "C"`
+    /// in Rust, `extern` declarations in C, callable from most languages).
+    C,
+}
+
+/// A neutral cross-language export fact: the definition identified by [`symbol`]
+/// is callable from another language under [`export_name`] via [`abi`]. The
+/// extractor records it from a deterministic syntactic marker (e.g. Rust's
+/// `#[no_mangle]`); a resolver bridges it to use-sites in other languages.
+///
+/// [`symbol`]: Self::symbol
+/// [`export_name`]: Self::export_name
+/// [`abi`]: Self::abi
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FfiExport {
+    /// The exported definition's SCIP identity.
+    pub symbol: SymbolId,
+    /// The ABI the symbol is exposed under.
+    pub abi: FfiAbi,
+    /// The symbol name as seen across the boundary (the stable linker/ABI name).
+    pub export_name: String,
+}
+
 /// A resolved directed edge between two symbols.
 #[derive(Debug, Clone)]
 pub struct Edge {
@@ -280,6 +310,9 @@ pub struct FileFacts {
     /// Name bindings discovered in this file. Empty until a scope-aware
     /// extractor populates it.
     pub bindings: Vec<Binding>,
+    /// Cross-language export markers discovered in this file (e.g. Rust
+    /// `#[no_mangle]` functions). Empty unless the language has FFI exports.
+    pub ffi_exports: Vec<FfiExport>,
 }
 
 /// The resolved whole-project graph: definitions plus cross-file edges.

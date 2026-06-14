@@ -105,6 +105,7 @@ impl Extractor for KotlinExtractor {
             references,
             scopes: Vec::new(),
             bindings: Vec::new(),
+            ffi_exports: Vec::new(),
         })
     }
 }

@@ -13,8 +13,8 @@ use tree_sitter::{Language as TsLanguage, Node, Parser, Query, QueryCursor, Stre
 
 use crate::error::{CodegraphError, Result};
 use crate::graph::types::{
-    Binding, BindingKind, BindingTarget, ByteSpan, FileFacts, RefRole, Reference, Scope, ScopeId,
-    ScopeKind, Symbol, SymbolKind,
+    Binding, BindingKind, BindingTarget, ByteSpan, FfiAbi, FfiExport, FileFacts, RefRole,
+    Reference, Scope, ScopeId, ScopeKind, Symbol, SymbolKind,
 };
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
@@ -76,6 +76,7 @@ impl Extractor for RustExtractor {
 
         let defs = collect_symbols(&root, bytes, file, &namespaces);
         let def_bindings = definition_bindings(&defs);
+        let ffi_exports = collect_ffi_exports(&root, bytes, &defs);
         let mut symbols = defs;
         let mod_sym = super::module_symbol(Language::Rust, &namespaces, file, source.len());
         let module_id = mod_sym.id.to_scip_string();
@@ -99,6 +100,7 @@ impl Extractor for RustExtractor {
             references,
             scopes,
             bindings,
+            ffi_exports,
         })
     }
 }
@@ -214,6 +216,75 @@ fn is_fully_pub(node: &Node, bytes: &[u8]) -> bool {
         .find(|c| c.kind() == "visibility_modifier")
         .map(|c| node_text(&c, bytes).trim() == "pub")
         .unwrap_or(false)
+}
+
+/// Collect cross-language (C ABI) export markers from top-level functions.
+///
+/// A `#[no_mangle]` (or 2024-edition `#[unsafe(no_mangle)]`) function is exposed
+/// to C under its own name; `#[export_name = "…"]` overrides that name. Either
+/// marker yields a stable linker symbol callable across the FFI boundary — that
+/// is the deterministic fact we record. A plain `extern "C"` function *without*
+/// such a marker gets a mangled name and is intentionally not treated as a
+/// stable export. Only functions that were themselves extracted as symbols (the
+/// public ones) are bridged; the export is matched to its symbol by definition
+/// span, so the SCIP identity is exactly the one the resolver will see.
+fn collect_ffi_exports(root: &Node, bytes: &[u8], defs: &[Symbol]) -> Vec<FfiExport> {
+    let mut out = Vec::new();
+    for child in root.children(&mut root.walk()) {
+        if child.kind() != "function_item" {
+            continue;
+        }
+        let Some(sym) = defs
+            .iter()
+            .find(|s| s.kind == SymbolKind::Function && s.span.start == child.start_byte())
+        else {
+            continue; // not a (public) extracted symbol — no identity to bridge
+        };
+        if let Some(export_name) = ffi_c_export_name(&child, bytes, &sym.name) {
+            out.push(FfiExport {
+                symbol: sym.id.clone(),
+                abi: FfiAbi::C,
+                export_name,
+            });
+        }
+    }
+    out
+}
+
+/// The C-ABI export name a function is exposed under, or `None` if it carries no
+/// stable-export attribute. `#[export_name = "x"]` wins over `#[no_mangle]`
+/// (which uses `fn_name`). Detection reads the attribute text, so it is robust
+/// to both `#[no_mangle]` and `#[unsafe(no_mangle)]` spellings.
+///
+/// In tree-sitter-rust an item's outer attributes are its **preceding siblings**
+/// (not children), so we walk back over the run of `attribute_item` nodes.
+fn ffi_c_export_name(func: &Node, bytes: &[u8], fn_name: &str) -> Option<String> {
+    let mut no_mangle = false;
+    let mut override_name = None;
+    let mut sib = func.prev_sibling();
+    while let Some(node) = sib {
+        if node.kind() != "attribute_item" {
+            break;
+        }
+        let text = node_text(&node, bytes);
+        if text.contains("export_name") {
+            if let Some(v) = first_quoted(text) {
+                override_name = Some(v.to_owned());
+            }
+        } else if text.contains("no_mangle") {
+            no_mangle = true;
+        }
+        sib = node.prev_sibling();
+    }
+    override_name.or_else(|| no_mangle.then(|| fn_name.to_owned()))
+}
+
+/// The contents of the first double-quoted span in `s`, if any.
+fn first_quoted(s: &str) -> Option<&str> {
+    let start = s.find('"')? + 1;
+    let rest = &s[start..];
+    let end = rest.find('"')?;
+    Some(&rest[..end])
 }
 
 /// Display name for an `impl` block: the last type identifier before the body.

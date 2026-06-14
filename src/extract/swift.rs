@@ -101,6 +101,7 @@ impl Extractor for SwiftExtractor {
             references,
             scopes: Vec::new(),
             bindings: Vec::new(),
+            ffi_exports: Vec::new(),
         })
     }
 }

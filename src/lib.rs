@@ -31,8 +31,12 @@
 //!   [`SymbolTableResolver`] (name matching, all languages, `NameOnly` edges) and
 //!   the precise scope-aware [`ScopeGraphResolver`] (lexical-scope + import +
 //!   qualified-path resolution, `Scoped`/`Exact` edges, currently Rust) emit the
-//!   **same** schema, tagging every edge with a [`graph::Confidence`]. A consumer
-//!   picks the tier; the output shape is identical.
+//!   **same** schema, tagging every edge with a [`graph::Confidence`] and a
+//!   [`graph::Provenance`] (which analysis derived it, orthogonal to confidence).
+//!   A consumer picks the tier; the output shape is identical.
+//! - **Cross-language bridges** ([`FfiBridgeResolver`]) link call sites to FFI
+//!   exports (Rust `#[no_mangle]` → C, today) across a language boundary,
+//!   deterministically and with honest confidence — composable on top of any tier.
 //! - **No storage, no source bodies** — [`graph::Symbol`]s carry a byte span;
 //!   consumers slice what they need.
 //!
@@ -51,9 +55,10 @@ pub mod symbol;
 pub use error::{CodegraphError, Result};
 pub use extract::{Extractor, extract_file, extract_path};
 pub use graph::{
-    Binding, BindingKind, BindingTarget, ByteSpan, CodeGraph, Confidence, Edge, FileFacts,
-    Occurrence, Provenance, RefRole, Reference, Scope, ScopeId, ScopeKind, Symbol, SymbolKind,
+    Binding, BindingKind, BindingTarget, ByteSpan, CodeGraph, Confidence, Edge, FfiAbi, FfiExport,
+    FileFacts, Occurrence, Provenance, RefRole, Reference, Scope, ScopeId, ScopeKind, Symbol,
+    SymbolKind,
 };
 pub use lang::Language;
-pub use resolve::{Resolver, ScopeGraphResolver, SymbolTableResolver};
+pub use resolve::{FfiBridgeResolver, Resolver, ScopeGraphResolver, SymbolTableResolver};
 pub use symbol::{Descriptor, Package, SymbolId};

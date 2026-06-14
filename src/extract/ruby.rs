@@ -85,6 +85,7 @@ impl Extractor for RubyExtractor {
             references,
             scopes: Vec::new(),
             bindings: Vec::new(),
+            ffi_exports: Vec::new(),
         })
     }
 }

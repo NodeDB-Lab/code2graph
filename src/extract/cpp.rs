@@ -84,6 +84,7 @@ impl Extractor for CppExtractor {
             references,
             scopes: Vec::new(),
             bindings: Vec::new(),
+            ffi_exports: Vec::new(),
         })
     }
 }

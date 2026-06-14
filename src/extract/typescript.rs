@@ -90,6 +90,7 @@ pub(super) fn extract_ecmascript(source: &str, file: &str, lang: Language) -> Re
         references,
         scopes: Vec::new(),
         bindings: Vec::new(),
+        ffi_exports: Vec::new(),
     })
 }
 

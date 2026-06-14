@@ -54,6 +54,7 @@ impl Extractor for SqlExtractor {
             references,
             scopes: Vec::new(),
             bindings: Vec::new(),
+            ffi_exports: Vec::new(),
         })
     }
 }

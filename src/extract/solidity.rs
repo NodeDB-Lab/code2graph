@@ -109,6 +109,7 @@ impl Extractor for SolidityExtractor {
             references,
             scopes: Vec::new(),
             bindings: Vec::new(),
+            ffi_exports: Vec::new(),
         })
     }
 }
