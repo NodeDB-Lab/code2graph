@@ -13,14 +13,16 @@ use tree_sitter::{Language as TsLanguage, Node, Parser, Query, QueryCursor, Stre
 
 use crate::error::{CodegraphError, Result};
 use crate::graph::types::{
-    Binding, BindingKind, BindingTarget, ByteSpan, FfiAbi, FfiExport, FileFacts, RefRole,
-    Reference, Scope, ScopeId, ScopeKind, Symbol, SymbolKind,
+    Binding, BindingKind, ByteSpan, FfiAbi, FfiExport, FileFacts, RefRole, Reference, Scope,
+    ScopeId, ScopeKind, Symbol, SymbolKind,
 };
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
 
 use super::{
-    Extractor, child_text, collect_call_references, node_occurrence, node_text, one_line_signature,
+    Extractor, attach_reference_scopes, child_text, collect_call_references, definition_bindings,
+    import_bindings, node_occurrence, node_span, node_text, one_line_signature, push_binding,
+    push_scope,
 };
 
 /// Tree-sitter query capturing call-callee identifiers (and optional qualifier).
@@ -585,26 +587,6 @@ fn collect_type_references(
 
 // ── Scope tree ───────────────────────────────────────────────────────────────
 
-/// Append a new scope to `scopes` and return its [`ScopeId`].
-fn push_scope(
-    scopes: &mut Vec<Scope>,
-    parent: Option<ScopeId>,
-    span: ByteSpan,
-    kind: ScopeKind,
-) -> ScopeId {
-    let id = scopes.len();
-    scopes.push(Scope { parent, span, kind });
-    id
-}
-
-/// `ByteSpan` covering the whole extent of `node`.
-fn node_span(node: &Node) -> ByteSpan {
-    ByteSpan {
-        start: node.start_byte(),
-        end: node.end_byte(),
-    }
-}
-
 /// DFS that builds the scope tree for one file.
 ///
 /// The file-root scope (`scopes[0]`) must already be pushed before calling
@@ -692,28 +674,6 @@ fn collect_scopes(root: &Node, source_len: usize) -> Vec<Scope> {
     scopes
 }
 
-/// Return the [`ScopeId`] of the innermost scope whose span contains `byte`.
-///
-/// Ties on span length resolve to the higher index: `collect_scopes` always
-/// pushes a parent before its children, so the larger index is the more deeply
-/// nested scope.  Returns `None` only when `scopes` is empty (which cannot
-/// happen in practice because the file-root scope is always index 0).
-fn innermost_scope(byte: usize, scopes: &[Scope]) -> Option<ScopeId> {
-    scopes
-        .iter()
-        .enumerate()
-        .filter(|(_, s)| s.span.contains(byte))
-        .min_by_key(|(id, s)| (s.span.len(), std::cmp::Reverse(*id)))
-        .map(|(id, _)| id)
-}
-
-/// Attach each reference to the innermost scope that contains its byte offset.
-fn attach_reference_scopes(refs: &mut [Reference], scopes: &[Scope]) {
-    for r in refs {
-        r.scope = innermost_scope(r.occ.byte, scopes);
-    }
-}
-
 /// Resolve the bare identifier node for a pattern, unwrapping one level of
 /// `mut_pattern` or `ref_pattern` if necessary.
 ///
@@ -738,26 +698,6 @@ fn resolve_pattern_ident<'tree>(pattern: &Node<'tree>) -> Option<Node<'tree>> {
         // Destructuring patterns — not handled in this unit (see NOTE above).
         _ => None,
     }
-}
-
-/// Push a single [`Binding`] with `target = BindingTarget::Local`, computing
-/// `scope` via [`innermost_scope`].
-#[inline]
-fn push_binding(
-    out: &mut Vec<Binding>,
-    name: String,
-    intro: usize,
-    kind: BindingKind,
-    scopes: &[Scope],
-) {
-    let scope = innermost_scope(intro, scopes).unwrap_or(0);
-    out.push(Binding {
-        scope,
-        name,
-        intro,
-        kind,
-        target: BindingTarget::Local,
-    });
 }
 
 /// Walk `node` recursively, collecting parameter and local-variable [`Binding`]s.
@@ -859,45 +799,10 @@ fn collect_params(params_node: &Node, bytes: &[u8], scopes: &[Scope], out: &mut 
     }
 }
 
-/// Emit a [`BindingKind::Definition`] binding for each top-level definition.
-///
-/// `collect_symbols` only captures top-level items, so each binds in the file
-/// root scope (`scopes[0]`). Definitions nested in `mod`/`impl` blocks are not
-/// yet captured as symbols, so they get no binding here — revisit when
-/// nested-definition extraction lands.
-fn definition_bindings(defs: &[Symbol]) -> Vec<Binding> {
-    defs.iter()
-        .map(|d| Binding {
-            scope: 0, // top-level defs bind in the file root scope
-            name: d.name.clone(),
-            intro: d.span.start,
-            kind: BindingKind::Definition,
-            target: BindingTarget::Def(d.id.clone()),
-        })
-        .collect()
-}
-
-/// Emit a [`BindingKind::Import`] binding for each [`RefRole::Import`] reference.
-///
-/// The binding's target carries the imported-from path as written (empty when
-/// unavailable). `scope` is resolved via [`innermost_scope`] on the reference's
-/// byte offset, defaulting to the file root scope (0) when no scope contains it.
-fn import_bindings(refs: &[Reference], scopes: &[Scope]) -> Vec<Binding> {
-    refs.iter()
-        .filter(|r| r.role == RefRole::Import)
-        .map(|r| Binding {
-            scope: innermost_scope(r.occ.byte, scopes).unwrap_or(0),
-            name: r.name.clone(),
-            intro: r.occ.byte,
-            kind: BindingKind::Import,
-            target: BindingTarget::Import(r.from_path.clone().unwrap_or_default()),
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graph::types::BindingTarget;
 
     #[test]
     fn extracts_defs_with_scip_ids() {

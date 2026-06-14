@@ -9,7 +9,10 @@
 use tree_sitter::{Language as TsLanguage, Node, Query, QueryCursor, StreamingIterator};
 
 use crate::error::{CodegraphError, Result};
-use crate::graph::types::{ByteSpan, Occurrence, RefRole, Reference, Symbol, SymbolKind};
+use crate::graph::types::{
+    Binding, BindingKind, BindingTarget, ByteSpan, Occurrence, RefRole, Reference, Scope, ScopeId,
+    ScopeKind, Symbol, SymbolKind,
+};
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
 
@@ -271,6 +274,112 @@ pub(crate) fn collect_call_references(
         }
     }
     Ok(refs)
+}
+
+// ── Tier-B scope / binding helpers (language-agnostic) ──────────────────────
+//
+// The scope tree and binding collection are driven by per-language tree walks
+// (each extractor knows its own grammar's scope-opening node kinds), but these
+// primitives — pushing scopes, locating the innermost scope for a byte, and
+// emitting the grammar-independent binding kinds — are identical across
+// languages and live here so every scope-aware extractor shares one definition.
+
+/// `ByteSpan` covering the whole extent of `node`.
+pub(crate) fn node_span(node: &Node) -> ByteSpan {
+    ByteSpan {
+        start: node.start_byte(),
+        end: node.end_byte(),
+    }
+}
+
+/// Push a [`Scope`] and return its [`ScopeId`] (its index). Callers must push a
+/// parent before its children so that index order matches nesting depth (relied
+/// on by [`innermost_scope`] for tie-breaking).
+pub(crate) fn push_scope(
+    scopes: &mut Vec<Scope>,
+    parent: Option<ScopeId>,
+    span: ByteSpan,
+    kind: ScopeKind,
+) -> ScopeId {
+    let id = scopes.len();
+    scopes.push(Scope { parent, span, kind });
+    id
+}
+
+/// Return the [`ScopeId`] of the innermost scope whose span contains `byte`.
+///
+/// Ties on span length resolve to the higher index: a parent scope is always
+/// pushed before its children, so the larger index is the more deeply nested
+/// scope. Returns `None` only when no scope contains the byte (in practice the
+/// file-root scope at index 0 spans the whole file).
+pub(crate) fn innermost_scope(byte: usize, scopes: &[Scope]) -> Option<ScopeId> {
+    scopes
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.span.contains(byte))
+        .min_by_key(|(id, s)| (s.span.len(), std::cmp::Reverse(*id)))
+        .map(|(id, _)| id)
+}
+
+/// Attach each reference to the innermost scope that contains its byte offset.
+pub(crate) fn attach_reference_scopes(refs: &mut [Reference], scopes: &[Scope]) {
+    for r in refs {
+        r.scope = innermost_scope(r.occ.byte, scopes);
+    }
+}
+
+/// Push a single [`Binding`] with `target = BindingTarget::Local`, computing its
+/// `scope` via [`innermost_scope`] (defaulting to the file root, scope 0).
+#[inline]
+pub(crate) fn push_binding(
+    out: &mut Vec<Binding>,
+    name: String,
+    intro: usize,
+    kind: BindingKind,
+    scopes: &[Scope],
+) {
+    let scope = innermost_scope(intro, scopes).unwrap_or(0);
+    out.push(Binding {
+        scope,
+        name,
+        intro,
+        kind,
+        target: BindingTarget::Local,
+    });
+}
+
+/// Emit a [`BindingKind::Definition`] binding for each top-level definition.
+///
+/// Each binds in the file-root scope (`scopes[0]`); `intro` is the definition's
+/// start byte and `target` points at its extracted [`SymbolId`].
+pub(crate) fn definition_bindings(defs: &[Symbol]) -> Vec<Binding> {
+    defs.iter()
+        .map(|d| Binding {
+            scope: 0,
+            name: d.name.clone(),
+            intro: d.span.start,
+            kind: BindingKind::Definition,
+            target: BindingTarget::Def(d.id.clone()),
+        })
+        .collect()
+}
+
+/// Emit a [`BindingKind::Import`] binding for each [`RefRole::Import`] reference.
+///
+/// The binding's target carries the imported-from path as written (empty when
+/// unavailable); `scope` is resolved via [`innermost_scope`], defaulting to the
+/// file root (0).
+pub(crate) fn import_bindings(refs: &[Reference], scopes: &[Scope]) -> Vec<Binding> {
+    refs.iter()
+        .filter(|r| r.role == RefRole::Import)
+        .map(|r| Binding {
+            scope: innermost_scope(r.occ.byte, scopes).unwrap_or(0),
+            name: r.name.clone(),
+            intro: r.occ.byte,
+            kind: BindingKind::Import,
+            target: BindingTarget::Import(r.from_path.clone().unwrap_or_default()),
+        })
+        .collect()
 }
 
 #[cfg(test)]
