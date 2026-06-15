@@ -20,9 +20,9 @@ use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
 
 use super::{
-    Extractor, attach_reference_scopes, child_text, collect_call_references, definition_bindings,
-    import_bindings, node_occurrence, node_span, node_text, one_line_signature, push_binding,
-    push_scope,
+    Extractor, MIN_REF_LEN, attach_reference_scopes, child_text, collect_call_references,
+    definition_bindings, import_bindings, node_occurrence, node_span, node_text,
+    one_line_signature, push_binding, push_ref, push_scope,
 };
 
 /// Tree-sitter query capturing call-callee identifiers (and optional qualifier).
@@ -88,6 +88,8 @@ impl Extractor for RustExtractor {
         collect_inheritance(&root, bytes, file, &mut references);
         collect_imports(&root, bytes, file, &mut references, &module_id);
         collect_type_references(&root, &ts_language, bytes, file, &mut references)?;
+        collect_read_references(&root, bytes, file, &mut references);
+        collect_write_references(&root, bytes, file, &mut references);
 
         let scopes = collect_scopes(&root, source.len());
         attach_reference_scopes(&mut references, &scopes);
@@ -611,6 +613,122 @@ fn collect_type_references(
         }
     }
     Ok(())
+}
+
+// ── Edge richness: Read / Write ──────────────────────────────────────────────
+
+/// Returns `true` when `node` (an `identifier`) is in a Rust position that is
+/// already captured by another collector and must NOT also be emitted as a Read.
+///
+/// Skipped positions:
+/// - Call callee (`call_expression` `function:` field)
+/// - Declaration name (`function_item`, `struct_item`, `enum_item`, `const_item`,
+///   `static_item`, `mod_item`, `trait_item`, `type_item` → `name:` field)
+/// - `let_declaration` pattern binding (the bound `identifier`)
+/// - `parameter` pattern (`pattern:` field)
+/// - `use_declaration` / `use_list` / `scoped_use_list` descendants — already
+///   [`RefRole::Import`]
+/// - `scoped_identifier` child (path segment — only the final tail is a read,
+///   and only when the `scoped_identifier` itself is not a callee; deferred in
+///   v1: skip all children of `scoped_identifier` to avoid false positives)
+/// - Assignment LHS (`assignment_expression` / `compound_assignment_expr` `left:`)
+///   — handled by [`collect_write_references`]
+fn is_non_read_position(node: &Node) -> bool {
+    let parent = match node.parent() {
+        Some(p) => p,
+        None => return true, // root — not a read
+    };
+    match parent.kind() {
+        // Call callee: `helper()` — `function:` field of call_expression.
+        "call_expression" => parent.child_by_field_name("function").as_ref() == Some(node),
+        // Declaration names.
+        "function_item" | "struct_item" | "enum_item" | "const_item" | "static_item"
+        | "mod_item" | "trait_item" | "type_item" => {
+            parent.child_by_field_name("name").as_ref() == Some(node)
+        }
+        // let binding pattern — the bound identifier.
+        "let_declaration" => parent.child_by_field_name("pattern").as_ref() == Some(node),
+        // parameter pattern — the bound identifier.
+        "parameter" => parent.child_by_field_name("pattern").as_ref() == Some(node),
+        // Bare identifier directly inside closure_parameters: `|x| …` — a binding, not a read.
+        "closure_parameters" => true,
+        // Pattern wrappers inside let/param patterns — the identifier is a binding, not a read.
+        "mut_pattern" | "ref_pattern" => true,
+        // Path segments inside scoped_identifier — skip all children to avoid
+        // false positives from path qualifiers in v1.
+        "scoped_identifier" => true,
+        // Imports — already RefRole::Import.
+        "use_declaration" | "use_list" | "scoped_use_list" | "use_as_clause" => true,
+        // Assignment LHS — handled by collect_write_references.
+        "assignment_expression" | "compound_assignment_expr" => {
+            parent.child_by_field_name("left").as_ref() == Some(node)
+        }
+        _ => false,
+    }
+}
+
+/// Recursively walk `node` and emit [`RefRole::Read`] references for bare
+/// `identifier` nodes used in value/expression positions.
+///
+/// Skips identifiers that are:
+/// - Call callees (already [`RefRole::Call`])
+/// - Declaration names (function/struct/enum/const/static/mod/trait/type `name:` field)
+/// - `let_declaration` and `parameter` pattern bindings
+/// - Inside use-trees (already [`RefRole::Import`])
+/// - Children of `scoped_identifier` (path qualifiers — deferred in v1)
+/// - Assignment LHS (handled by [`collect_write_references`])
+///
+/// Note: `field_identifier` and `type_identifier` are distinct node kinds and
+/// are naturally excluded — this function only examines `identifier` nodes.
+/// Applies [`MIN_REF_LEN`].
+fn collect_read_references(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    // Skip macro bodies — their AST is unreliable.
+    if matches!(node.kind(), "macro_definition" | "macro_invocation") {
+        return;
+    }
+    if node.kind() == "identifier" {
+        let name = node_text(node, bytes);
+        if name.len() >= MIN_REF_LEN && !is_non_read_position(node) {
+            push_ref(out, name, node, file, RefRole::Read);
+        }
+        // `identifier` nodes have no meaningful children; return early.
+        return;
+    }
+    for child in node.children(&mut node.walk()) {
+        collect_read_references(&child, bytes, file, out);
+    }
+}
+
+/// Recursively walk `node` and emit [`RefRole::Write`] references for the
+/// bare-identifier LHS of `assignment_expression` and `compound_assignment_expr`
+/// nodes (e.g. `x = 5`, `x += 1`).
+///
+/// Member / index LHS (`obj.field = …`, `arr[i] = …`) are not covered in v1 —
+/// only bare `identifier` nodes. Applies [`MIN_REF_LEN`].
+///
+/// Note: `let_declaration` is a declaration, not an assignment; it is correctly
+/// excluded — only `assignment_expression` / `compound_assignment_expr` are handled.
+fn collect_write_references(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    // Skip macro bodies — their AST is unreliable.
+    if matches!(node.kind(), "macro_definition" | "macro_invocation") {
+        return;
+    }
+    if matches!(
+        node.kind(),
+        "assignment_expression" | "compound_assignment_expr"
+    ) {
+        if let Some(lhs) = node.child_by_field_name("left") {
+            if lhs.kind() == "identifier" {
+                let name = node_text(&lhs, bytes);
+                if name.len() >= MIN_REF_LEN {
+                    push_ref(out, name, &lhs, file, RefRole::Write);
+                }
+            }
+        }
+    }
+    for child in node.children(&mut node.walk()) {
+        collect_write_references(&child, bytes, file, out);
+    }
 }
 
 // ── Scope tree ───────────────────────────────────────────────────────────────
@@ -1745,6 +1863,133 @@ impl std::fmt::Display for Point {
             trefs.is_empty(),
             "fn with no types should produce no TypeRef refs, got {:?}",
             trefs.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+    }
+
+    // ── Read / Write reference tests ──────────────────────────────────────────
+
+    #[test]
+    fn read_ref_emitted_for_tail_use_not_declaration() {
+        // `fn f() -> i32 { let base = 1; base }` →
+        //   - a Read ref for the tail `base` expression
+        //   - the `let base` binding name is NOT a Read
+        let src = "fn f() -> i32 { let base = 1; base }";
+        let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
+        let read_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Read && r.name == "base")
+            .collect();
+        // There must be at least one Read ref (the tail `base` expression).
+        assert!(
+            !read_refs.is_empty(),
+            "expected at least one Read ref for 'base', got none"
+        );
+        // The `let base` token is at the first `base` in source ("let base = 1").
+        // The tail use `base` appears after the `=` and `;`.
+        let decl_offset = src.find("let base").unwrap() + "let ".len();
+        // All Read refs must be AFTER the declaration offset (not the let binding itself).
+        for r in &read_refs {
+            assert!(
+                r.occ.byte > decl_offset,
+                "Read ref for 'base' at byte {} should be after declaration offset {}",
+                r.occ.byte,
+                decl_offset
+            );
+        }
+    }
+
+    #[test]
+    fn write_ref_emitted_for_assignment_not_let() {
+        // `fn f() { let mut cnt = 0; cnt = 5; }` →
+        //   - a Write ref for the `cnt = 5` assignment LHS
+        //   - the `let mut cnt` declaration name is NOT a Write
+        let src = "fn f() { let mut cnt = 0; cnt = 5; }";
+        let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
+        let write_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Write && r.name == "cnt")
+            .collect();
+        assert!(
+            !write_refs.is_empty(),
+            "expected at least one Write ref for 'cnt', got none — all refs: {:?}",
+            facts
+                .references
+                .iter()
+                .map(|r| (&r.name, r.role))
+                .collect::<Vec<_>>()
+        );
+        // `cnt = 5` starts after the declaration — byte offset > the `let` start.
+        let assign_offset = src.find("cnt = 5").unwrap();
+        for r in &write_refs {
+            assert!(
+                r.occ.byte >= assign_offset,
+                "Write ref for 'cnt' at byte {} should be at/after the assignment at {}",
+                r.occ.byte,
+                assign_offset
+            );
+        }
+    }
+
+    #[test]
+    fn compound_assignment_emits_write_ref() {
+        // `fn f() { let mut num = 0; num += 1; }` → a Write ref "num" for `num += 1`.
+        let src = "fn f() { let mut num = 0; num += 1; }";
+        let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
+        let write_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Write && r.name == "num")
+            .collect();
+        assert!(
+            !write_refs.is_empty(),
+            "expected a Write ref for 'num' from compound assignment, got none — all refs: {:?}",
+            facts
+                .references
+                .iter()
+                .map(|r| (&r.name, r.role))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn call_not_also_read() {
+        // `fn f() { helper(); }` → a Call ref "helper", NOT also a Read for "helper".
+        let src = "fn f() { helper(); }";
+        let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
+        let call_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Call && r.name == "helper")
+            .collect();
+        assert!(!call_refs.is_empty(), "expected a Call ref for 'helper'");
+        let read_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Read && r.name == "helper")
+            .collect();
+        assert!(
+            read_refs.is_empty(),
+            "helper() must NOT produce a Read ref; got: {read_refs:?}"
+        );
+    }
+
+    #[test]
+    fn field_access_not_a_read_of_field() {
+        // `fn f(c: C) -> i32 { c.field }` →
+        //   - a Read ref "c" (the receiver) is acceptable
+        //   - NO Read ref "field" (field_identifier is a different node kind)
+        let src = "fn f(c: C) -> i32 { c.field }";
+        let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
+        let field_reads: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Read && r.name == "field")
+            .collect();
+        assert!(
+            field_reads.is_empty(),
+            "field 'field' in field_expression must NOT be a Read ref; got: {field_reads:?}"
         );
     }
 }
