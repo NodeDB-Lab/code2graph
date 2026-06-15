@@ -1,0 +1,6 @@
+# Same-file call: `authenticate` calls `helper`, both defined in auth.c.
+# Proves Tier-B same-file Scoped resolution: the `helper()` call on line 6
+# resolves to the `int helper` definition on line 1, not fanning out to any
+# external same-named symbol. C captures all non-static top-level funcs as
+# Definition bindings (no export-visibility filter like Go's uppercase rule).
+auth.c:6 Call auth.c:1
