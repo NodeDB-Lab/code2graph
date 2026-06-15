@@ -287,6 +287,7 @@ fn collect_references_recursive(node: &Node, bytes: &[u8], file: &str, out: &mut
                         from_path: None,
                         qualifier,
                         scope: None,
+                        type_ref_ctx: None,
                     });
                 }
             }

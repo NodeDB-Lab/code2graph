@@ -605,6 +605,7 @@ fn collect_type_references(
                     from_path: None,
                     qualifier,
                     scope: None, // filled in by attach_reference_scopes
+                    type_ref_ctx: None,
                 });
             }
         }

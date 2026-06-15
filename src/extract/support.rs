@@ -11,7 +11,7 @@ use tree_sitter::{Language as TsLanguage, Node, Query, QueryCursor, StreamingIte
 use crate::error::{CodegraphError, Result};
 use crate::graph::types::{
     Binding, BindingKind, BindingTarget, ByteSpan, Occurrence, RefRole, Reference, Scope, ScopeId,
-    ScopeKind, Symbol, SymbolKind,
+    ScopeKind, Symbol, SymbolKind, TypeRefContext,
 };
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
@@ -156,6 +156,7 @@ pub(crate) fn push_ref(
         from_path: None,
         qualifier: None,
         scope: None,
+        type_ref_ctx: None,
     });
 }
 
@@ -189,6 +190,35 @@ pub(crate) fn push_import_ref(
         },
         qualifier: None,
         scope: None,
+        type_ref_ctx: None,
+    });
+}
+
+/// Push a [`RefRole::TypeRef`] [`Reference`] for `name` at `node`'s position,
+/// carrying the sub-type position context `ctx` as [`TypeRefContext`].
+///
+/// Like [`push_ref`] with `role = RefRole::TypeRef`, but always sets
+/// `type_ref_ctx: Some(ctx)`. No minimum-length filter is applied — type names
+/// can be short (e.g. `IO`). Empty names are skipped.
+pub(crate) fn push_type_ref(
+    out: &mut Vec<Reference>,
+    name: &str,
+    node: &Node,
+    file: &str,
+    ctx: TypeRefContext,
+) {
+    if name.is_empty() {
+        return;
+    }
+    out.push(Reference {
+        name: name.to_owned(),
+        occ: node_occurrence(node, file),
+        role: RefRole::TypeRef,
+        source_module: None,
+        from_path: None,
+        qualifier: None,
+        scope: None,
+        type_ref_ctx: Some(ctx),
     });
 }
 
@@ -270,6 +300,7 @@ pub(crate) fn collect_call_references(
                 from_path: None,
                 qualifier: qualifier.clone(),
                 scope: None,
+                type_ref_ctx: None,
             });
         }
     }

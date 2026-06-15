@@ -319,6 +319,7 @@ mod tests {
             from_path: None,
             qualifier: None,
             scope: None,
+            type_ref_ctx: None,
         });
 
         let graph = SymbolTableResolver.resolve(&[a, b]);

@@ -49,8 +49,8 @@ pub use swift::SwiftExtractor;
 pub use typescript::TypeScriptExtractor;
 
 pub(crate) use support::{
-    attach_reference_scopes, child_text, collect_call_references, definition_bindings, field_text,
-    import_bindings, innermost_scope, is_static, module_symbol, node_occurrence, node_span,
-    node_text, one_line_signature, push_binding, push_import_ref, push_ref, push_scope,
-    simple_type_name, unquote,
+    MIN_REF_LEN, attach_reference_scopes, child_text, collect_call_references, definition_bindings,
+    field_text, import_bindings, innermost_scope, is_static, module_symbol, node_occurrence,
+    node_span, node_text, one_line_signature, push_binding, push_import_ref, push_ref, push_scope,
+    push_type_ref, simple_type_name, unquote,
 };

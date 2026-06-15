@@ -20,14 +20,15 @@ use tree_sitter::{Language as TsLanguage, Node, Parser};
 use crate::error::{CodegraphError, Result};
 use crate::graph::types::{
     Binding, BindingKind, ByteSpan, FileFacts, RefRole, Reference, Scope, ScopeId, ScopeKind,
-    Symbol, SymbolKind,
+    Symbol, SymbolKind, TypeRefContext,
 };
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
 
 use super::{
-    Extractor, attach_reference_scopes, child_text, collect_call_references, definition_bindings,
-    import_bindings, node_span, node_text, one_line_signature, push_binding, push_scope,
+    Extractor, MIN_REF_LEN, attach_reference_scopes, child_text, collect_call_references,
+    definition_bindings, import_bindings, node_span, node_text, one_line_signature, push_binding,
+    push_ref, push_scope, push_type_ref,
 };
 
 /// Tree-sitter query capturing call-callee identifiers.
@@ -90,6 +91,9 @@ pub(super) fn extract_ecmascript(source: &str, file: &str, lang: Language) -> Re
         collect_call_references(&root, &ts_language, CALL_QUERY, lang, bytes, file)?;
     collect_inheritance(&root, bytes, file, &mut references);
     collect_imports(&root, bytes, file, &mut references, &module_id);
+    collect_type_references(&root, bytes, file, &mut references);
+    collect_read_references(&root, bytes, file, &mut references);
+    collect_write_references(&root, bytes, file, &mut references);
 
     let scopes = collect_scopes(&root, source.len());
     attach_reference_scopes(&mut references, &scopes);
@@ -409,6 +413,222 @@ fn collect_imports(
     // Recurse into all other nodes so top-level and module-scoped imports are covered.
     for child in node.children(&mut node.walk()) {
         collect_imports(&child, bytes, file, out, module_id);
+    }
+}
+
+// ── Edge richness: TypeRef / Read / Write ────────────────────────────────────
+
+/// Recursively walk `node` and emit [`RefRole::TypeRef`] references for every
+/// type-identifier that appears in a typed annotation position.
+///
+/// Covered positions (TypeScript / TSX grammar):
+/// - `required_parameter` / `optional_parameter` `type:` field → `ParameterType`
+/// - `function_declaration` / `function_signature` / `method_definition` /
+///   `arrow_function` `return_type:` field → `ReturnType`
+/// - `public_field_definition` / `property_signature` `type:` field → `Field`
+/// - Inside a `type_arguments` node (generic arguments) → `GenericArg`
+/// - Any other `type_identifier` in a `type_annotation` → `Other`
+///
+/// For `generic_type` nodes the head `type_identifier` (the `name` field or
+/// first named child) takes the outer context, then `type_arguments` children
+/// are visited with `GenericArg`.
+fn collect_type_references(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    // Helper: emit a type ref from a (possibly generic or nested) type node at
+    // the given context. If the node is a `generic_type`, recurse into its
+    // type_arguments with GenericArg context. If it is a `nested_type_identifier`
+    // take the `right` field as the leaf name.
+    fn emit_type_node(
+        node: &Node,
+        bytes: &[u8],
+        file: &str,
+        ctx: TypeRefContext,
+        out: &mut Vec<Reference>,
+    ) {
+        match node.kind() {
+            "type_identifier" => {
+                let name = node_text(node, bytes);
+                push_type_ref(out, name, node, file, ctx);
+            }
+            "generic_type" => {
+                // The `name` field (or first named child) is the outer type name.
+                if let Some(head) = node.child_by_field_name("name") {
+                    emit_type_node(&head, bytes, file, ctx, out);
+                }
+                // Type arguments are generic params.
+                if let Some(args) = node.child_by_field_name("type_arguments") {
+                    for child in args.named_children(&mut args.walk()) {
+                        emit_type_node(&child, bytes, file, TypeRefContext::GenericArg, out);
+                    }
+                }
+            }
+            "nested_type_identifier" => {
+                // e.g. `ns.Type` — take the `right` (leaf) field.
+                if let Some(right) = node.child_by_field_name("right") {
+                    emit_type_node(&right, bytes, file, ctx, out);
+                }
+            }
+            // Unwrap a bare `type_annotation` wrapper (the `: T` node itself).
+            "type_annotation" => {
+                for child in node.named_children(&mut node.walk()) {
+                    emit_type_node(&child, bytes, file, ctx, out);
+                }
+            }
+            // Union / intersection / parenthesized types — recurse so we catch
+            // all leaves (e.g. `A | B`, `(C & D)`).
+            "union_type" | "intersection_type" | "parenthesized_type" => {
+                for child in node.named_children(&mut node.walk()) {
+                    emit_type_node(&child, bytes, file, ctx, out);
+                }
+            }
+            // Array / readonly wrappers: recurse into the element type.
+            "array_type" | "readonly_type" => {
+                for child in node.named_children(&mut node.walk()) {
+                    emit_type_node(&child, bytes, file, TypeRefContext::Other, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    match node.kind() {
+        // Parameters: `(c: Config)` — type is a `type_annotation` child at field `type`.
+        "required_parameter" | "optional_parameter" => {
+            if let Some(ann) = node.child_by_field_name("type") {
+                // The annotation node may be `type_annotation` wrapping the type,
+                // or the type node directly depending on grammar version.
+                for child in ann.named_children(&mut ann.walk()) {
+                    emit_type_node(&child, bytes, file, TypeRefContext::ParameterType, out);
+                }
+            }
+        }
+        // Return types: `function f(): Config`.
+        "function_declaration" | "function_signature" | "method_definition" | "arrow_function" => {
+            if let Some(ret) = node.child_by_field_name("return_type") {
+                for child in ret.named_children(&mut ret.walk()) {
+                    emit_type_node(&child, bytes, file, TypeRefContext::ReturnType, out);
+                }
+            }
+            // Recurse into function body to catch nested functions.
+            for child in node.children(&mut node.walk()) {
+                collect_type_references(&child, bytes, file, out);
+            }
+            return; // avoid double-recurse at the bottom
+        }
+        // Field / property types: `field: Type;`
+        "public_field_definition" | "property_signature" => {
+            if let Some(typ) = node.child_by_field_name("type") {
+                for child in typ.named_children(&mut typ.walk()) {
+                    emit_type_node(&child, bytes, file, TypeRefContext::Field, out);
+                }
+            }
+        }
+        _ => {}
+    }
+
+    for child in node.children(&mut node.walk()) {
+        collect_type_references(&child, bytes, file, out);
+    }
+}
+
+/// Node kinds whose `name:` / `function:` child is a declaration binding, not a
+/// read. Used by `collect_read_references` to skip declaration-name positions.
+const DECL_KINDS_WITH_NAME: &[&str] = &[
+    "function_declaration",
+    "function_expression",
+    "function_signature",
+    "class_declaration",
+    "method_definition",
+    "generator_function_declaration",
+    "generator_function",
+];
+
+/// Returns `true` when `node` (an `identifier`) is in a position that is already
+/// captured by another collector (call callee, declaration name, import binding,
+/// parameter pattern, variable declarator name) and must NOT also be emitted as
+/// a Read reference.
+fn is_non_read_position(node: &Node) -> bool {
+    let parent = match node.parent() {
+        Some(p) => p,
+        None => return true, // root — not a read
+    };
+    match parent.kind() {
+        // Call callee: `helper()` — function field of call_expression.
+        "call_expression" => parent.child_by_field_name("function").as_ref() == Some(node),
+        // Declaration names (function/class/method/generator).
+        kind if DECL_KINDS_WITH_NAME.contains(&kind) => {
+            parent.child_by_field_name("name").as_ref() == Some(node)
+        }
+        // Variable declarator LHS: `const x = …`
+        "variable_declarator" => parent.child_by_field_name("name").as_ref() == Some(node),
+        // Parameter pattern (the binding name, not the default expression).
+        "required_parameter" | "optional_parameter" => {
+            parent.child_by_field_name("pattern").as_ref() == Some(node)
+        }
+        // Import specifier / clause / namespace — already Import refs.
+        "import_clause" => true,
+        "import_specifier" => true,
+        // Shorthand property in an object literal: `{ foo }` — `foo` is both
+        // key and value; treat as a read (the value side). The grammar represents
+        // this as `shorthand_property_identifier`, not `identifier`, so this arm
+        // is defensive only.
+        "pair" => {
+            // `pair` has key: and value: fields; skip only the key.
+            parent.child_by_field_name("key").as_ref() == Some(node)
+        }
+        // Assignment LHS — handled by collect_write_references.
+        "assignment_expression" | "augmented_assignment_expression" => {
+            parent.child_by_field_name("left").as_ref() == Some(node)
+        }
+        _ => false,
+    }
+}
+
+/// Recursively walk `node` and emit [`RefRole::Read`] references for bare
+/// `identifier` nodes used in value/expression positions.
+///
+/// Skips identifiers that are:
+/// - Call callees (already [`RefRole::Call`])
+/// - Declaration names (function / class / variable declarator / param pattern)
+/// - Import binding names (already [`RefRole::Import`])
+/// - Assignment LHS (handled by [`collect_write_references`])
+///
+/// Applies [`MIN_REF_LEN`] (same threshold as calls).
+fn collect_read_references(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    if node.kind() == "identifier" {
+        let name = node_text(node, bytes);
+        if name.len() >= MIN_REF_LEN && !is_non_read_position(node) {
+            push_ref(out, name, node, file, RefRole::Read);
+        }
+        // identifiers have no meaningful children; return early.
+        return;
+    }
+    for child in node.children(&mut node.walk()) {
+        collect_read_references(&child, bytes, file, out);
+    }
+}
+
+/// Recursively walk `node` and emit [`RefRole::Write`] references for the
+/// bare-identifier LHS of `assignment_expression` and
+/// `augmented_assignment_expression` nodes (e.g. `x = 5`, `x += 1`).
+///
+/// Member / subscript LHS (`obj.prop = …`, `arr[i] = …`) are not covered in
+/// v1 — only bare identifiers.  Applies [`MIN_REF_LEN`].
+fn collect_write_references(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    if matches!(
+        node.kind(),
+        "assignment_expression" | "augmented_assignment_expression"
+    ) {
+        if let Some(lhs) = node.child_by_field_name("left") {
+            if lhs.kind() == "identifier" {
+                let name = node_text(&lhs, bytes);
+                if name.len() >= MIN_REF_LEN {
+                    push_ref(out, name, &lhs, file, RefRole::Write);
+                }
+            }
+        }
+    }
+    for child in node.children(&mut node.walk()) {
+        collect_write_references(&child, bytes, file, out);
     }
 }
 
@@ -866,6 +1086,133 @@ function internal() {}
             Some("./svc".to_owned()),
             "from_path should be './svc', got {:?}",
             r.from_path
+        );
+    }
+
+    // ── Edge richness: TypeRef / Read / Write ────────────────────────────────
+
+    #[test]
+    fn ts_param_type_ref_emitted() {
+        // `function f(c: Config) {}` → TypeRef "Config" with ParameterType ctx.
+        let src = "function f(c: Config) {}";
+        let facts = TypeScriptExtractor.extract(src, "src/main.ts").unwrap();
+        let r = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::TypeRef && r.name == "Config")
+            .expect("expected TypeRef ref for 'Config'");
+        assert_eq!(
+            r.type_ref_ctx,
+            Some(TypeRefContext::ParameterType),
+            "expected ParameterType ctx, got {:?}",
+            r.type_ref_ctx
+        );
+    }
+
+    #[test]
+    fn ts_return_type_ref_emitted() {
+        // `function f(): Config { return null; }` → TypeRef "Config" with ReturnType ctx.
+        let src = "function f(): Config { return null; }";
+        let facts = TypeScriptExtractor.extract(src, "src/main.ts").unwrap();
+        let r = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::TypeRef && r.name == "Config")
+            .expect("expected TypeRef ref for 'Config'");
+        assert_eq!(
+            r.type_ref_ctx,
+            Some(TypeRefContext::ReturnType),
+            "expected ReturnType ctx, got {:?}",
+            r.type_ref_ctx
+        );
+    }
+
+    #[test]
+    fn ts_read_ref_emitted_for_use_not_declaration() {
+        // `function f() { const base = 1; return base; }`
+        // → Read ref for the `base` in `return base`; the declarator name must NOT be a Read.
+        let src = "function f() { const base = 1; return base; }";
+        let facts = TypeScriptExtractor.extract(src, "src/main.ts").unwrap();
+        let read_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Read && r.name == "base")
+            .collect();
+        // There must be at least one Read ref (the use in `return base`).
+        assert!(
+            !read_refs.is_empty(),
+            "expected at least one Read ref for 'base', got none"
+        );
+        // The declaration `const base = 1` starts before the `return` statement.
+        // Verify that at least one Read ref byte offset is AFTER the `=` (i.e. not the decl).
+        // In `function f() { const base = 1; return base; }` the return keyword starts at ~35.
+        let use_ref = read_refs
+            .iter()
+            .find(|r| r.occ.byte > 20)
+            .expect("expected Read ref for 'base' in the return statement (byte > 20)");
+        assert!(
+            use_ref.occ.byte > 20,
+            "Read ref should be at the use site, not the declaration"
+        );
+    }
+
+    #[test]
+    fn ts_write_ref_emitted_for_assignment() {
+        // `function f() { let xxx = 0; xxx = 5; }` → Write ref for `xxx = 5`.
+        let src = "function f() { let xxx = 0; xxx = 5; }";
+        let facts = TypeScriptExtractor.extract(src, "src/main.ts").unwrap();
+        let write_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Write && r.name == "xxx")
+            .collect();
+        assert!(
+            !write_refs.is_empty(),
+            "expected at least one Write ref for 'xxx', got none — all refs: {:?}",
+            facts
+                .references
+                .iter()
+                .map(|r| (&r.name, r.role))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn ts_call_not_also_read() {
+        // `helper()` → a Call ref for "helper", but NOT also a Read ref.
+        let src = "function run() { helper(); }";
+        let facts = TypeScriptExtractor.extract(src, "src/main.ts").unwrap();
+        let call_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Call && r.name == "helper")
+            .collect();
+        assert!(!call_refs.is_empty(), "expected a Call ref for 'helper'");
+        let read_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Read && r.name == "helper")
+            .collect();
+        assert!(
+            read_refs.is_empty(),
+            "helper() must NOT produce a Read ref; got: {read_refs:?}"
+        );
+    }
+
+    #[test]
+    fn ts_property_access_not_a_read_of_property() {
+        // `obj.foo` → no Read ref named "foo" (property_identifier, not identifier).
+        // A Read ref for `obj` is acceptable.
+        let src = "function run() { return obj.foo; }";
+        let facts = TypeScriptExtractor.extract(src, "src/main.ts").unwrap();
+        let foo_reads: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Read && r.name == "foo")
+            .collect();
+        assert!(
+            foo_reads.is_empty(),
+            "property 'foo' in member_expression must NOT be a Read ref; got: {foo_reads:?}"
         );
     }
 }

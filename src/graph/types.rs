@@ -104,6 +104,28 @@ pub enum RefRole {
     /// structural type-usage fact. The resolver links it to the type's
     /// definition like any other name reference.
     TypeRef,
+    /// A plain name read in expression position (variable/param/const use).
+    Read,
+    /// An assignment write to a name (LHS of an assignment).
+    Write,
+}
+
+/// Sub-type position for a [`RefRole::TypeRef`] reference — lets consumers ask
+/// "what uses T as a return type" without splitting the `TypeRef` role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TypeRefContext {
+    /// The type appears as a function or method parameter type.
+    ParameterType,
+    /// The type appears as a function or method return type.
+    ReturnType,
+    /// The type appears as a struct/class/record field type.
+    Field,
+    /// The type appears as a generic type argument (e.g. `Vec<T>`).
+    GenericArg,
+    /// The type appears inside an attribute or annotation.
+    Attribute,
+    /// Any other type-reference position not covered by the above variants.
+    Other,
 }
 
 /// A reference (call site / usage) found in a source file. Pre-resolution it
@@ -132,6 +154,8 @@ pub struct Reference {
     /// The innermost scope enclosing this reference site; `None` until a
     /// scope-aware extractor populates it.
     pub scope: Option<ScopeId>,
+    /// Sub-type context for [`RefRole::TypeRef`] references; `None` for all other roles.
+    pub type_ref_ctx: Option<TypeRefContext>,
 }
 
 // ── Scope / binding data model ──────────────────────────────────────────────

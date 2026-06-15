@@ -367,6 +367,7 @@ fn collect_references_recursive(node: &Node, bytes: &[u8], file: &str, out: &mut
                                     source_module: None,
                                     from_path: None,
                                     scope: None,
+                                    type_ref_ctx: None,
                                 });
                             }
                         }
