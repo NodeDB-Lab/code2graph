@@ -124,33 +124,37 @@ fn scope_tier_beats_name_tier_on_precision_where_it_resolves() {
 }
 
 #[test]
-fn scip_oracle_c_scope_tier_resolves_more_without_faking() {
-    // C has no module/import system, so a build-free resolver cannot anchor a
-    // cross-file call (C's flat linker namespace vs our path-based identity).
-    // The honest, measurable C contribution is therefore *intra-file*: against an
-    // external scip-clang oracle, the scope tier resolves strictly more edges than
-    // name-only resolution — it scopes the in-function local/param reads that
-    // Tier-A cannot — while still inventing no edges (precision stays perfect).
+fn scip_oracle_clang_scope_tier_resolves_more_without_faking() {
+    // C and C++ have no import system a build-free resolver can lean on for
+    // cross-file calls (C's flat linker namespace / C++ ADL vs our path-based
+    // identity; scip-clang only links cross-TU when a prototype unifies the
+    // symbol, which we model as a same-file definition). So their honest,
+    // measurable contribution against an external scip-clang oracle is
+    // *intra-file*: the scope tier resolves strictly more edges than name-only
+    // resolution — it scopes the in-function local/param reads Tier-A cannot —
+    // while still inventing no edges (precision stays perfect on both tiers).
     let cases = corpus();
     let a = per_language(&cases, &SymbolTableResolver);
     let b = per_language(&cases, &ScopeGraphResolver);
-    let (Some(a_c), Some(b_c)) = (a.get("c_oracle"), b.get("c_oracle")) else {
-        panic!("corpus must include c_oracle cases");
-    };
-    assert!(
-        b_c.recall() > a_c.recall(),
-        "Tier-B recall ({:.2}) must beat Tier-A ({:.2}) on c_oracle",
-        b_c.recall(),
-        a_c.recall()
-    );
-    assert_eq!(
-        b_c.false_positives, 0,
-        "Tier-B emitted a false positive on c_oracle"
-    );
-    assert_eq!(
-        a_c.false_positives, 0,
-        "Tier-A emitted a false positive on c_oracle"
-    );
+    for lang in ["c_oracle", "cpp_oracle"] {
+        let (Some(a_l), Some(b_l)) = (a.get(lang), b.get(lang)) else {
+            panic!("corpus must include {lang} cases");
+        };
+        assert!(
+            b_l.recall() > a_l.recall(),
+            "Tier-B recall ({:.2}) must beat Tier-A ({:.2}) on {lang}",
+            b_l.recall(),
+            a_l.recall()
+        );
+        assert_eq!(
+            b_l.false_positives, 0,
+            "Tier-B emitted a false positive on {lang}"
+        );
+        assert_eq!(
+            a_l.false_positives, 0,
+            "Tier-A emitted a false positive on {lang}"
+        );
+    }
 }
 
 #[test]
