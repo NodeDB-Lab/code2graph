@@ -37,7 +37,7 @@ pub(crate) fn normalize_from_path(path: &str) -> Vec<&str> {
 }
 
 /// Returns `true` iff `segs` is non-empty and the candidate's namespace chain
-/// (as returned by [`SymbolId::namespaces`]) **ends with** `segs`.
+/// (as returned by [`SymbolId::namespaces_iter`]) **ends with** `segs`.
 ///
 /// Example: candidate namespaces `["com", "example"]` with `segs = ["example"]`
 /// → true. With `segs = ["com", "example"]` → true. With `segs = ["other"]` → false.
@@ -45,9 +45,13 @@ pub(crate) fn namespaces_end_with(candidate: &SymbolId, segs: &[&str]) -> bool {
     if segs.is_empty() {
         return false;
     }
-    let ns = candidate.namespaces();
-    if segs.len() > ns.len() {
+    let n = candidate.namespaces_iter().count();
+    if segs.len() > n {
         return false;
     }
-    ns[ns.len() - segs.len()..] == *segs
+    candidate
+        .namespaces_iter()
+        .skip(n - segs.len())
+        .zip(segs.iter())
+        .all(|(a, b)| a == *b)
 }

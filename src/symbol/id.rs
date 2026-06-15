@@ -36,13 +36,13 @@ impl Package {
         Self::default()
     }
 
-    fn render(&self, out: &mut String) {
+    fn render<W: fmt::Write>(&self, out: &mut W) -> fmt::Result {
         // SCIP space-joins the three fields; empty fields render as `.` per spec.
-        out.push_str(scip_field(&self.manager));
-        out.push(' ');
-        out.push_str(scip_field(&self.name));
-        out.push(' ');
-        out.push_str(scip_field(&self.version));
+        out.write_str(scip_field(&self.manager))?;
+        out.write_char(' ')?;
+        out.write_str(scip_field(&self.name))?;
+        out.write_char(' ')?;
+        out.write_str(scip_field(&self.version))
     }
 }
 
@@ -135,6 +135,25 @@ impl SymbolId {
         }
     }
 
+    /// Zero-allocation iterator over the names of all `Namespace` descriptors in
+    /// this symbol's path, in declaration order (outermost first). Non-namespace
+    /// descriptors are excluded. Yields nothing for `Local` symbols.
+    ///
+    /// Prefer this over [`namespaces`] in hot paths to avoid a heap allocation.
+    pub fn namespaces_iter(&self) -> impl Iterator<Item = &str> {
+        let descs: &[Descriptor] = match self {
+            SymbolId::Global { descriptors, .. } => descriptors,
+            SymbolId::Local { .. } => &[],
+        };
+        descs.iter().filter_map(|d| {
+            if let Descriptor::Namespace(n) = d {
+                Some(n.as_str())
+            } else {
+                None
+            }
+        })
+    }
+
     /// The bare name of the final descriptor — the key for name-only matching.
     pub fn leaf_name(&self) -> Option<&str> {
         match self {
@@ -143,9 +162,8 @@ impl SymbolId {
         }
     }
 
-    /// The SCIP-format symbol string. Equality of this string is symbol identity.
-    pub fn to_scip_string(&self) -> String {
-        let mut s = String::new();
+    /// Core rendering logic shared by [`to_scip_string`] and [`Display`].
+    fn write_scip<W: fmt::Write>(&self, w: &mut W) -> fmt::Result {
         match self {
             SymbolId::Global {
                 scheme,
@@ -153,19 +171,27 @@ impl SymbolId {
                 descriptors,
                 ..
             } => {
-                s.push_str(scheme);
-                s.push(' ');
-                package.render(&mut s);
-                s.push(' ');
+                w.write_str(scheme)?;
+                w.write_char(' ')?;
+                package.render(w)?;
+                w.write_char(' ')?;
                 for d in descriptors {
-                    d.render(&mut s);
+                    d.render(w)?;
                 }
+                Ok(())
             }
             SymbolId::Local { id, .. } => {
-                s.push_str("local ");
-                s.push_str(id);
+                w.write_str("local ")?;
+                w.write_str(id)
             }
         }
+    }
+
+    /// The SCIP-format symbol string. Equality of this string is symbol identity.
+    pub fn to_scip_string(&self) -> String {
+        let mut s = String::new();
+        self.write_scip(&mut s)
+            .expect("writing to a String is infallible");
         s
     }
 
@@ -241,7 +267,7 @@ impl std::str::FromStr for SymbolId {
 
 impl fmt::Display for SymbolId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.to_scip_string())
+        self.write_scip(f)
     }
 }
 

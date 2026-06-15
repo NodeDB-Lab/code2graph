@@ -56,46 +56,46 @@ impl Descriptor {
     }
 
     /// Append this descriptor's SCIP rendering to `out`.
-    pub fn render(&self, out: &mut String) {
+    pub fn render<W: core::fmt::Write>(&self, out: &mut W) -> core::fmt::Result {
         match self {
             Descriptor::Namespace(n) => {
-                push_ident(out, n);
-                out.push('/');
+                push_ident(out, n)?;
+                out.write_char('/')
             }
             Descriptor::Type(n) => {
-                push_ident(out, n);
-                out.push('#');
+                push_ident(out, n)?;
+                out.write_char('#')
             }
             Descriptor::Term(n) => {
-                push_ident(out, n);
-                out.push('.');
+                push_ident(out, n)?;
+                out.write_char('.')
             }
             Descriptor::Method {
                 name,
                 disambiguator,
             } => {
-                push_ident(out, name);
-                out.push('(');
-                out.push_str(disambiguator);
-                out.push_str(").");
+                push_ident(out, name)?;
+                out.write_char('(')?;
+                out.write_str(disambiguator)?;
+                out.write_str(").")
             }
             Descriptor::TypeParameter(n) => {
-                out.push('[');
-                push_ident(out, n);
-                out.push(']');
+                out.write_char('[')?;
+                push_ident(out, n)?;
+                out.write_char(']')
             }
             Descriptor::Parameter(n) => {
-                out.push('(');
-                push_ident(out, n);
-                out.push(')');
+                out.write_char('(')?;
+                push_ident(out, n)?;
+                out.write_char(')')
             }
             Descriptor::Meta(n) => {
-                push_ident(out, n);
-                out.push(':');
+                push_ident(out, n)?;
+                out.write_char(':')
             }
             Descriptor::Macro(n) => {
-                push_ident(out, n);
-                out.push('!');
+                push_ident(out, n)?;
+                out.write_char('!')
             }
         }
     }
@@ -103,19 +103,19 @@ impl Descriptor {
 
 /// Render an identifier per SCIP rules: bare if it is a simple identifier,
 /// otherwise backtick-escaped (backticks inside doubled).
-fn push_ident(out: &mut String, ident: &str) {
+fn push_ident<W: core::fmt::Write>(out: &mut W, ident: &str) -> core::fmt::Result {
     let simple = !ident.is_empty() && ident.chars().all(is_simple_ident_char);
     if simple {
-        out.push_str(ident);
+        out.write_str(ident)
     } else {
-        out.push('`');
+        out.write_char('`')?;
         for c in ident.chars() {
             if c == '`' {
-                out.push('`');
+                out.write_char('`')?;
             }
-            out.push(c);
+            out.write_char(c)?;
         }
-        out.push('`');
+        out.write_char('`')
     }
 }
 
@@ -233,19 +233,20 @@ mod tests {
     #[test]
     fn renders_scip_suffixes() {
         let mut s = String::new();
-        Descriptor::Namespace("auth".into()).render(&mut s);
+        Descriptor::Namespace("auth".into()).render(&mut s).unwrap();
         Descriptor::Method {
             name: "validate_token".into(),
             disambiguator: String::new(),
         }
-        .render(&mut s);
+        .render(&mut s)
+        .unwrap();
         assert_eq!(s, "auth/validate_token().");
     }
 
     #[test]
     fn escapes_non_simple_idents() {
         let mut s = String::new();
-        Descriptor::Type("Foo Bar".into()).render(&mut s);
+        Descriptor::Type("Foo Bar".into()).render(&mut s).unwrap();
         assert_eq!(s, "`Foo Bar`#");
     }
 }
