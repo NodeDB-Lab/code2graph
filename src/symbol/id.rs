@@ -185,6 +185,21 @@ impl SymbolId {
         })
     }
 
+    /// Zero-allocation iterator over the names of ALL descriptors in this
+    /// symbol's path, in declaration order (outermost first) — every kind
+    /// included (namespaces, types, methods, terms…), unlike
+    /// [`namespaces_iter`](SymbolId::namespaces_iter) which yields only
+    /// namespaces. Used to match an explicit call qualifier that may name an
+    /// enclosing *type* (a Ruby/Kotlin module, a class) rather than a namespace.
+    /// Yields nothing for `Local` symbols.
+    pub fn descriptor_names_iter(&self) -> impl Iterator<Item = &str> {
+        let descs: &[Descriptor] = match &*self.0 {
+            SymbolRepr::Global { descriptors, .. } => descriptors.as_slice(),
+            SymbolRepr::Local { .. } => &[],
+        };
+        descs.iter().map(|d| d.name())
+    }
+
     /// The bare name of the final descriptor — the key for name-only matching.
     pub fn leaf_name(&self) -> Option<&str> {
         match &*self.0 {

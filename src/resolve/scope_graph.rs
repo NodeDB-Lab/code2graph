@@ -10,10 +10,14 @@
 //! language's name-resolution rules would. It resolves four binding kinds:
 //!
 //! * **Path-qualified calls** — a reference with a written qualifier
-//!   (`mod_a::process()`, `a::b::f()`) is resolved as a **path lookup**, entirely
-//!   bypassing the lexical-scope walk. The qualifier segments are matched against
-//!   the namespace suffix of every globally known definition sharing the call's
-//!   leaf name. If exactly one definition matches, a [`Confidence::Exact`] edge is
+//!   (`mod_a::process()`, `Alpha.compute()`) is resolved as a **path lookup**,
+//!   entirely bypassing the lexical-scope walk. The qualifier segments are matched
+//!   against the **namespace suffix** of every globally known definition sharing
+//!   the call's leaf name, and also against the **enclosing-descriptor chain**
+//!   (all descriptor kinds — namespaces *and* types such as a Ruby `module` or
+//!   class) so a type-qualified call like `Alpha.compute` resolves to a method
+//!   nested inside a `Type` descriptor, not only to one inside a `Namespace`. If
+//!   exactly one definition matches either rule, a [`Confidence::Exact`] edge is
 //!   emitted. Zero matches or two-or-more matches yield **no** edge — Tier-B never
 //!   fakes precision.
 //! * **Local/param bindings** — a reference that resolves to a local variable or
@@ -48,7 +52,7 @@
 //! | Local variable / parameter                           | `Exact`         |
 //! | Same-file top-level definition                       | `Scoped`        |
 //! | Cross-file import (unique path-suffix match)         | `Exact`         |
-//! | Path-qualified call (unique namespace-suffix match)  | `Exact`         |
+//! | Path-qualified call (unique namespace- or type-suffix match) | `Exact`  |
 //! | Ambiguous or unresolved                              | no edge emitted |
 //!
 //! Tier-B never emits `NameOnly` edges; it either resolves with honest
@@ -695,6 +699,59 @@ mod tests {
     }
 
     #[test]
+    fn type_qualified_call_resolves_to_enclosing_type_member() {
+        // A qualifier may name an enclosing TYPE, not just a namespace. Ruby's
+        // `Alpha.compute` targets `…/Alpha#compute().` where `Alpha` is a `Type`
+        // descriptor (a module). Two modules define `compute`; the qualifier must
+        // disambiguate to `Alpha`'s, exactly as a namespace qualifier would — and
+        // Tier-B must invent no edge for the same-named decoy.
+        use crate::extract::RubyExtractor;
+        let alpha = RubyExtractor
+            .extract(
+                "module Alpha\n  def self.compute\n    1\n  end\nend\n",
+                "alpha.rb",
+            )
+            .unwrap();
+        let beta = RubyExtractor
+            .extract(
+                "module Beta\n  def self.compute\n    2\n  end\nend\n",
+                "beta.rb",
+            )
+            .unwrap();
+        let main = RubyExtractor
+            .extract("def run\n  Alpha.compute\nend\n", "main.rb")
+            .unwrap();
+
+        let graph = ScopeGraphResolver.resolve(&[alpha, beta, main]);
+        let call_edges: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| {
+                e.role == crate::graph::types::RefRole::Call
+                    && e.from.to_scip_string().ends_with("run().")
+            })
+            .collect();
+        assert_eq!(
+            call_edges.len(),
+            1,
+            "type qualifier must disambiguate to exactly one edge, got: {:?}",
+            call_edges
+                .iter()
+                .map(|e| e.to.to_scip_string())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            call_edges[0]
+                .to
+                .to_scip_string()
+                .ends_with("Alpha#compute()."),
+            "must target Alpha#compute, got: {}",
+            call_edges[0].to.to_scip_string()
+        );
+        assert_eq!(call_edges[0].confidence, Confidence::Exact);
+    }
+
+    #[test]
     fn qualified_call_unmatched_qualifier_yields_no_edge() {
         // `process` is defined in namespace ["conf"] but the caller writes
         // `missing::process()` → qualifier "missing" does not suffix-match ["conf"]
@@ -942,7 +999,7 @@ mod tests {
             );
         }
 
-        // ── 5. Path-qualified call (unique namespace-suffix match) → Exact ───
+        // ── 5. Path-qualified call (unique namespace- or type-suffix match) → Exact ───
         {
             let util = RustExtractor
                 .extract("pub fn validate() {}", "src/util.rs")

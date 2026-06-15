@@ -24,5 +24,7 @@ pub use ffi_bridge::FfiBridgeResolver;
 pub use incremental::IncrementalGraph;
 pub use resolver::Resolver;
 pub use scope_graph::ScopeGraphResolver;
-pub(crate) use support::{enclosing_symbol_index, namespaces_end_with, normalize_from_path};
+pub(crate) use support::{
+    enclosing_path_ends_with, enclosing_symbol_index, namespaces_end_with, normalize_from_path,
+};
 pub use symbol_table::SymbolTableResolver;

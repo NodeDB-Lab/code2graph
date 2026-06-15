@@ -59,3 +59,31 @@ pub(crate) fn namespaces_end_with<S: AsRef<str>>(candidate: &SymbolId, segs: &[S
         .zip(segs.iter())
         .all(|(a, b)| a == b.as_ref())
 }
+
+/// Whether `candidate`'s **enclosing descriptor chain** (every descriptor except
+/// the leaf, all kinds — namespaces *and* types) ends with `segs`.
+///
+/// This is the type-aware counterpart of [`namespaces_end_with`], used only for
+/// explicitly-qualified calls where the qualifier may name an enclosing *type*
+/// (a Ruby `module`/Kotlin `object`/class) rather than a namespace — e.g.
+/// `Alpha.compute` resolving to `…/Alpha#compute().` where `Alpha` is a `Type`
+/// descriptor. Callers OR this with [`namespaces_end_with`], so it only ever
+/// *adds* matches; the call site's uniqueness check preserves precision.
+pub(crate) fn enclosing_path_ends_with<S: AsRef<str>>(candidate: &SymbolId, segs: &[S]) -> bool {
+    if segs.is_empty() {
+        return false;
+    }
+    let names: Vec<&str> = candidate.descriptor_names_iter().collect();
+    // Drop the leaf: the qualifier names a *container*, never the called member.
+    let containers = match names.split_last() {
+        Some((_leaf, rest)) if !rest.is_empty() => rest,
+        _ => return false,
+    };
+    if segs.len() > containers.len() {
+        return false;
+    }
+    containers[containers.len() - segs.len()..]
+        .iter()
+        .zip(segs.iter())
+        .all(|(a, b)| *a == b.as_ref())
+}

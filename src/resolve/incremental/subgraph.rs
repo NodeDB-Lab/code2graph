@@ -39,6 +39,12 @@ pub(crate) struct PendingRef {
     /// same-namespace cross-file match (e.g. a Go same-package call) is
     /// [`Confidence::Scoped`] — consistent with same-file Definition resolution.
     pub confidence: Confidence,
+    /// True when `segs` came from an *explicit written qualifier* (`Recv.method()`
+    /// / `mod::fn()`). Such refs match against the enclosing descriptor chain
+    /// (namespaces *and* types) so a module/class qualifier resolves, not just a
+    /// namespace one. All other pending refs (imports, same-namespace deferrals,
+    /// cross-artifact `TypeRef`s) match on the namespace chain only.
+    pub qualified: bool,
 }
 
 /// The resolution facts for ONE file, isolated from all other files.
@@ -119,25 +125,26 @@ pub(crate) fn build_subgraph(f: &FileFacts) -> FileSubgraph {
                 role: RefRole::ModuleRef,
                 occ: r.occ.clone(),
                 confidence: Confidence::Scoped,
+                qualified: false,
             });
             continue;
         }
 
-        // QUALIFIED CALL: explicit written path → unique global namespace-suffix
-        // match. Bypasses scope_walk entirely (this is a path lookup, not
-        // lexical resolution). Deferred to the stitch phase as a PendingRef.
+        // QUALIFIED CALL: explicit written path → unique global match against the
+        // target's enclosing descriptor chain. Bypasses scope_walk entirely (this
+        // is a path lookup, not lexical resolution). Deferred to the stitch phase
+        // with `qualified: true`, so it matches the qualifier against BOTH
+        // namespace AND type descriptors — `mod_a::process` (namespace qualifier)
+        // and `Alpha.compute` / `Service.helper` (a module/class/object *type*
+        // qualifier) both resolve. The qualifier names a *container*, never the
+        // member, so matching drops the leaf descriptor and suffix-matches the rest.
         //
-        // KNOWN LIMITATION: only MODULE-qualified calls resolve
-        // (`mod_a::process` — where `mod_a` appears as a Namespace descriptor in
-        // the target's SCIP id path). `Type::assoc_fn()` does NOT resolve
-        // because:
-        //   (1) `namespaces_end_with` matches only `Namespace` descriptors, not
-        //       the `Type` descriptor used for structs/enums/traits; and
-        //   (2) associated functions inside `impl` blocks are not yet extracted
-        //       as top-level symbols.
-        // This is an intentional, documented gap — resolving it requires
-        // type-member extraction work that is out of scope for this unit. It is
-        // NOT a silent miss. Do NOT widen `namespaces_end_with` to paper over it.
+        // REMAINING LIMITATION: a type-qualified call resolves only when the
+        // member is extracted as a top-level symbol under that type (true for
+        // Ruby `module`/Kotlin `object` methods). Rust `Type::assoc_fn()` inside
+        // an `impl` block is still not extracted as a top-level symbol, so it does
+        // not resolve — an honest extraction gap, not a matching one. Precision is
+        // never faked: stitch only emits an edge on a UNIQUE match.
         if let Some(qual) = &r.qualifier {
             let segs = normalize_from_path(qual);
             if !segs.is_empty() {
@@ -148,6 +155,7 @@ pub(crate) fn build_subgraph(f: &FileFacts) -> FileSubgraph {
                     role: r.role,
                     occ: r.occ.clone(),
                     confidence: Confidence::Exact,
+                    qualified: true,
                 });
             }
             continue; // qualified ref handled (deferred or honest no-op)
@@ -177,6 +185,7 @@ pub(crate) fn build_subgraph(f: &FileFacts) -> FileSubgraph {
                     role: r.role,
                     occ: r.occ.clone(),
                     confidence: Confidence::Scoped,
+                    qualified: false,
                 });
                 continue;
             }
@@ -195,6 +204,7 @@ pub(crate) fn build_subgraph(f: &FileFacts) -> FileSubgraph {
                     role: r.role,
                     occ: r.occ.clone(),
                     confidence: Confidence::Scoped,
+                    qualified: false,
                 });
             }
             continue;
@@ -259,6 +269,7 @@ pub(crate) fn build_subgraph(f: &FileFacts) -> FileSubgraph {
                             role: r.role,
                             occ: r.occ.clone(),
                             confidence: Confidence::Exact,
+                            qualified: false,
                         });
                     }
                     // Empty segs → drop (Tier-B never fakes precision; Tier-A

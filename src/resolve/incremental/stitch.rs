@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use crate::graph::types::{Edge, Provenance, RefRole, Symbol, SymbolKind};
 use crate::symbol::SymbolId;
 
-use super::super::namespaces_end_with;
+use super::super::{enclosing_path_ends_with, namespaces_end_with};
 use super::subgraph::PendingRef;
 
 /// Global definition index: leaf name → the SymbolIds sharing that name.
@@ -132,6 +132,25 @@ impl GlobalIndex {
         })
     }
 
+    /// Like [`unique_match`](GlobalIndex::unique_match) but for an EXPLICITLY
+    /// qualified call: the qualifier may name an enclosing *type* (a Ruby
+    /// `module`, Kotlin `object`, or class — a `Type` descriptor) as well as a
+    /// namespace, so candidates match when their chain ends with `segs` by EITHER
+    /// the namespace-only rule OR the full enclosing-descriptor rule. The `||`
+    /// only widens the candidate set; uniqueness still decides, so a type-qualified
+    /// call to an ambiguous name yields no edge (precision is never faked).
+    fn unique_qualified_match(&self, name: &str, segs: &[String]) -> Option<&SymbolId> {
+        self.by_name.get(name).and_then(|cands| {
+            let mut it = cands
+                .iter()
+                .filter(|id| namespaces_end_with(id, segs) || enclosing_path_ends_with(id, segs));
+            match (it.next(), it.next()) {
+                (Some(only), None) => Some(only),
+                _ => None,
+            }
+        })
+    }
+
     /// Like [`unique_match`](GlobalIndex::unique_match) but over the module
     /// index: the UNIQUE [`SymbolKind::Module`] symbol named `name` whose
     /// namespace chain ends with `segs`. `None` if zero or two-or-more candidates
@@ -165,6 +184,7 @@ pub(crate) fn stitch(pending: &[PendingRef], index: &GlobalIndex) -> Vec<Edge> {
         // match disjoint — a ModuleRef can never bind a function, nor a Call a module.
         let matched = match p.role {
             RefRole::ModuleRef => index.unique_module_match(&p.name, &p.segs),
+            _ if p.qualified => index.unique_qualified_match(&p.name, &p.segs),
             _ => index.unique_match(&p.name, &p.segs),
         };
         if let Some(matched_id) = matched {
