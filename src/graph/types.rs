@@ -88,8 +88,8 @@ pub struct Symbol {
     pub signature: String,
 }
 
-/// The role a reference plays. `Call`, `IsImplementation`, `Import`, and `TypeRef` are live;
-/// `Read`/`Write` arrive with richer extractors.
+/// The role a reference plays. `Call`, `IsImplementation`, `Import`, `TypeRef`,
+/// and `ModuleRef` are live; `Read`/`Write` arrive with richer extractors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RefRole {
     /// The reference is a call or object-creation site.
@@ -99,6 +99,12 @@ pub enum RefRole {
     /// The enclosing module imports the referenced symbol (an `import`/`use`
     /// statement). Its source resolves to the file's module symbol.
     Import,
+    /// The reference names a *module* itself rather than an item within it — a
+    /// module-declaration site (`mod x;`) or an intermediate module segment of
+    /// an import path (the `alpha` in `use crate::alpha::helper`). It resolves
+    /// to the referenced module's [`SymbolKind::Module`] symbol, yielding a
+    /// file/module dependency graph distinct from item-level [`Import`](Self::Import)s.
+    ModuleRef,
     /// The enclosing symbol references the named type in a signature or
     /// declaration position (parameter type, return type, field type, …) — a
     /// structural type-usage fact. The resolver links it to the type's

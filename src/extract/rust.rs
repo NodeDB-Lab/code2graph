@@ -86,6 +86,7 @@ impl Extractor for RustExtractor {
         let mut references =
             collect_call_references(&root, &ts_language, CALL_QUERY, Language::Rust, bytes, file)?;
         collect_inheritance(&root, bytes, file, &mut references);
+        collect_module_decl_refs(&root, bytes, file, &mut references);
         collect_imports(&root, bytes, file, &mut references, &module_id);
         collect_type_references(&root, &ts_language, bytes, file, &mut references)?;
         collect_read_references(&root, bytes, file, &mut references);
@@ -425,6 +426,62 @@ fn collect_inheritance(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Refe
     }
 }
 
+/// Recursively walk `node` and emit a [`RefRole::ModuleRef`] reference for every
+/// `mod x;` / `pub mod x;` declaration (`mod_item`), regardless of visibility.
+///
+/// This is a *reference* (a module-dependency fact), distinct from the
+/// module-defining [`Symbol`] that `collect_symbols` emits for `pub mod` items —
+/// the resolver connects the two; the extractor only states the facts. The
+/// occurrence is positioned at the module-name identifier (the `name` field) so
+/// location-based oracle matching lines up with the `mod x;` site. Recurses into
+/// `mod` blocks so nested declarations are also captured.
+fn collect_module_decl_refs(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    if node.kind() == "mod_item" {
+        if let Some(name_node) = node.child_by_field_name("name") {
+            push_ref(
+                out,
+                node_text(&name_node, bytes),
+                &name_node,
+                file,
+                RefRole::ModuleRef,
+            );
+        }
+    }
+    for child in node.children(&mut node.walk()) {
+        collect_module_decl_refs(&child, bytes, file, out);
+    }
+}
+
+/// Emit a [`RefRole::ModuleRef`] for the immediate module segment that precedes
+/// the leaf of a use-path: the last segment of a `scoped_identifier`'s `path`
+/// field. For `crate::alpha::helper` this is `alpha`; the occurrence is the
+/// `alpha` identifier so its line/byte point at that segment.
+///
+/// Path *anchors* (`crate`, `self`, `super`, `Self`) are intentionally skipped
+/// in v1 — they never name a resolvable local module. (External roots like
+/// `std` are *not* anchors and are still emitted; the resolver simply finds no
+/// matching local module and emits no edge — an honest no-op.)
+fn push_use_module_ref(path: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    // The immediate module segment is the last identifier of `path`: the whole
+    // node when `path` is a bare `identifier`, or its `name` field when `path`
+    // is itself a `scoped_identifier`.
+    let seg = match path.kind() {
+        "identifier" => *path,
+        "scoped_identifier" => {
+            let Some(name_node) = path.child_by_field_name("name") else {
+                return;
+            };
+            name_node
+        }
+        _ => return, // keyword nodes (`crate`, `self`, `super`, …) and other unrecognised forms: skip
+    };
+    let name = node_text(&seg, bytes);
+    if matches!(name, "crate" | "self" | "super" | "Self") {
+        return;
+    }
+    push_ref(out, name, &seg, file, RefRole::ModuleRef);
+}
+
 /// Recursively collect leaf import names from a use-tree node and push an
 /// [`RefRole::Import`] reference for each one.
 ///
@@ -465,6 +522,11 @@ fn collect_use_leaves(
             let from_path = node
                 .child_by_field_name("path")
                 .map_or("", |n| super::node_text(&n, bytes));
+            // Emit a ModuleRef for the module segment immediately before the leaf
+            // (e.g. `alpha` in `crate::alpha::helper`); anchors are skipped inside.
+            if let Some(path_node) = node.child_by_field_name("path") {
+                push_use_module_ref(&path_node, bytes, file, out);
+            }
             if let Some(name_node) = node.child_by_field_name("name") {
                 super::push_import_ref(
                     out,
@@ -1234,6 +1296,88 @@ impl std::fmt::Display for Point {
                 r.from_path
             );
         }
+    }
+
+    // ── ModuleRef reference tests ─────────────────────────────────────────────
+
+    #[test]
+    fn mod_declaration_emits_module_ref() {
+        // `mod util;` → a ModuleRef named "util" (even though it is not `pub`).
+        let src = "mod util;\npub fn run() {}";
+        let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
+        let module_refs: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::ModuleRef)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert_eq!(
+            module_refs,
+            vec!["util"],
+            "expected ['util'], got {module_refs:?}"
+        );
+    }
+
+    #[test]
+    fn use_path_segment_emits_module_ref_and_keeps_import_leaf() {
+        // `use crate::alpha::helper;` → ModuleRef("alpha") + Import("helper").
+        let src = "use crate::alpha::helper;";
+        let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
+
+        let module_refs: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::ModuleRef)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert_eq!(
+            module_refs,
+            vec!["alpha"],
+            "expected ModuleRef ['alpha'], got {module_refs:?}"
+        );
+
+        let import_names: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Import)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert_eq!(
+            import_names,
+            vec!["helper"],
+            "expected Import ['helper'], got {import_names:?}"
+        );
+    }
+
+    #[test]
+    fn use_path_anchor_emits_no_module_ref() {
+        // `use crate::helper;` → only the Import for "helper"; the `crate`
+        // anchor produces NO ModuleRef.
+        let src = "use crate::helper;";
+        let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
+
+        let module_refs: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::ModuleRef)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(
+            module_refs.is_empty(),
+            "expected no ModuleRef for an anchor, got {module_refs:?}"
+        );
+
+        let import_names: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Import)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert_eq!(
+            import_names,
+            vec!["helper"],
+            "expected Import ['helper'], got {import_names:?}"
+        );
     }
 
     // ── Scope tree tests ──────────────────────────────────────────────────────
