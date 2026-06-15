@@ -1,0 +1,6 @@
+# Same-file call: `process` calls `helper`, both defined in net.cpp.
+# Proves Tier-B same-file Scoped resolution: the `helper()` call on line 6
+# resolves to the `int helper` definition on line 1, not fanning out to any
+# external same-named symbol. C++ captures all non-static top-level funcs as
+# Definition bindings.
+net.cpp:6 Call net.cpp:1

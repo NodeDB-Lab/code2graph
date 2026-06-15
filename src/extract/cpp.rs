@@ -17,12 +17,16 @@
 use tree_sitter::{Language as TsLanguage, Node, Parser};
 
 use crate::error::{CodegraphError, Result};
-use crate::graph::types::{ByteSpan, FileFacts, RefRole, Reference, Symbol, SymbolKind};
+use crate::graph::types::{
+    Binding, BindingKind, ByteSpan, FileFacts, RefRole, Reference, Scope, ScopeId, ScopeKind,
+    Symbol, SymbolKind,
+};
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
 
 use super::{
-    Extractor, collect_call_references, field_text, is_static, node_text, one_line_signature,
+    Extractor, attach_reference_scopes, collect_call_references, definition_bindings, field_text,
+    innermost_scope, is_static, node_span, node_text, one_line_signature, push_binding, push_scope,
 };
 
 // NOTE: SymbolKind has no Union variant; unions map to Struct. Preprocessor
@@ -65,8 +69,10 @@ impl Extractor for CppExtractor {
         let bytes = source.as_bytes();
         let namespaces = cpp_namespaces(file);
 
-        let mut symbols = Vec::new();
-        collect_defs(&root, &namespaces, bytes, file, &mut symbols);
+        let mut defs = Vec::new();
+        collect_defs(&root, &namespaces, bytes, file, &mut defs);
+        let def_bindings = definition_bindings(&defs);
+        let mut symbols = defs;
         symbols.push(super::module_symbol(
             Language::Cpp,
             &namespaces,
@@ -77,13 +83,18 @@ impl Extractor for CppExtractor {
             collect_call_references(&root, &ts_language, CALL_QUERY, Language::Cpp, bytes, file)?;
         collect_inheritance(&root, bytes, file, &mut references);
 
+        let scopes = collect_scopes(&root, source.len());
+        attach_reference_scopes(&mut references, &scopes);
+        let mut bindings = collect_bindings(&root, bytes, &scopes);
+        bindings.extend(def_bindings);
+
         Ok(FileFacts {
             file: file.to_owned(),
             lang: Language::Cpp.as_str().to_owned(),
             symbols,
             references,
-            scopes: Vec::new(),
-            bindings: Vec::new(),
+            scopes,
+            bindings,
             ffi_exports: Vec::new(),
         })
     }
@@ -535,6 +546,242 @@ fn collect_members(
     }
 }
 
+// ── Scope tree (Tier-B) ──────────────────────────────────────────────────────
+
+/// Walk a declarator subtree to find the innermost `function_declarator` node.
+///
+/// C++ allows pointer/reference wrapping around a `function_declarator`:
+/// `char *f(int a)` → `pointer_declarator` → `function_declarator`. This helper
+/// descends the same chain as [`declarator_name`] and returns the first
+/// `function_declarator` encountered, so `collect_bindings_dfs` can reliably
+/// reach its `parameters` field regardless of wrapping.
+fn find_function_declarator<'tree>(node: &Node<'tree>) -> Option<Node<'tree>> {
+    if node.kind() == "function_declarator" {
+        return Some(*node);
+    }
+    // pointer_declarator / reference_declarator / init_declarator / array_declarator
+    // all have a "declarator" field.
+    if let Some(inner) = node.child_by_field_name("declarator") {
+        return find_function_declarator(&inner);
+    }
+    // parenthesized_declarator — scan children.
+    for child in node.children(&mut node.walk()) {
+        if let Some(found) = find_function_declarator(&child) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// Build the lexical scope tree for one C++ file.
+///
+/// `scopes[0]` is always the file-root `Module` scope spanning `[0, source_len)`.
+/// C++ opens `Type` scopes for namespace/class/struct/union bodies, `Function`
+/// scopes for function definitions and lambdas, and `Block` scopes for bare
+/// `compound_statement` nodes not consumed as a function body.
+fn collect_scopes(root: &Node, source_len: usize) -> Vec<Scope> {
+    let mut scopes = Vec::new();
+    push_scope(
+        &mut scopes,
+        None,
+        ByteSpan {
+            start: 0,
+            end: source_len,
+        },
+        ScopeKind::Module,
+    );
+    for child in root.children(&mut root.walk()) {
+        scope_dfs(&child, 0, &mut scopes);
+    }
+    scopes
+}
+
+/// DFS opening scopes for the C++ AST.
+///
+/// - `namespace_definition` → `ScopeKind::Type`; children of the
+///   `declaration_list` body are peeled under the namespace scope.
+/// - `class_specifier` | `struct_specifier` | `union_specifier` →
+///   `ScopeKind::Type`; children of the `field_declaration_list` body are
+///   peeled under the type scope.
+/// - `function_definition` | `lambda_expression` → `ScopeKind::Function`; the
+///   `compound_statement` body is peeled to avoid a redundant Block scope.
+/// - `compound_statement` not already consumed as a body → `ScopeKind::Block`.
+fn scope_dfs(node: &Node, parent_id: ScopeId, scopes: &mut Vec<Scope>) {
+    match node.kind() {
+        "namespace_definition" => {
+            let ns_id = push_scope(scopes, Some(parent_id), node_span(node), ScopeKind::Type);
+            // Peel the declaration_list body.
+            if let Some(body) = node.child_by_field_name("body") {
+                for child in body.children(&mut body.walk()) {
+                    scope_dfs(&child, ns_id, scopes);
+                }
+            } else {
+                for child in node.children(&mut node.walk()) {
+                    scope_dfs(&child, ns_id, scopes);
+                }
+            }
+        }
+        "class_specifier" | "struct_specifier" | "union_specifier" => {
+            let type_id = push_scope(scopes, Some(parent_id), node_span(node), ScopeKind::Type);
+            // Peel the field_declaration_list body.
+            if let Some(body) = node.child_by_field_name("body") {
+                for child in body.children(&mut body.walk()) {
+                    scope_dfs(&child, type_id, scopes);
+                }
+            } else {
+                for child in node.children(&mut node.walk()) {
+                    scope_dfs(&child, type_id, scopes);
+                }
+            }
+        }
+        "function_definition" | "lambda_expression" => {
+            let fn_id = push_scope(
+                scopes,
+                Some(parent_id),
+                node_span(node),
+                ScopeKind::Function,
+            );
+            // Peel the body compound_statement to avoid a redundant Block scope.
+            if let Some(body) = node.child_by_field_name("body") {
+                for child in body.children(&mut body.walk()) {
+                    scope_dfs(&child, fn_id, scopes);
+                }
+            }
+        }
+        "compound_statement" => {
+            // A bare block NOT already consumed as a function/lambda body.
+            let block_id = push_scope(scopes, Some(parent_id), node_span(node), ScopeKind::Block);
+            for child in node.children(&mut node.walk()) {
+                scope_dfs(&child, block_id, scopes);
+            }
+        }
+        _ => {
+            for child in node.children(&mut node.walk()) {
+                scope_dfs(&child, parent_id, scopes);
+            }
+        }
+    }
+}
+
+// ── Bindings (Tier-B) ────────────────────────────────────────────────────────
+
+/// Collect parameter and local-variable [`Binding`]s for one C++ file.
+///
+/// Covers:
+/// - `function_definition` parameters → [`BindingKind::Param`].
+/// - `lambda_expression` parameters → [`BindingKind::Param`].
+/// - `declaration` nodes inside a `Function` or `Block` scope → [`BindingKind::Local`].
+/// - `for_range_loop` declarators inside a `Function` or `Block` scope → [`BindingKind::Local`].
+///
+/// Namespace bodies open a `Type` scope (not `Function`/`Block`), so namespace-level
+/// declarations and class members are excluded from `Local` via the scope-kind guard.
+fn collect_bindings(root: &Node, bytes: &[u8], scopes: &[Scope]) -> Vec<Binding> {
+    let mut out = Vec::new();
+    collect_bindings_dfs(root, bytes, scopes, &mut out);
+    out
+}
+
+fn collect_bindings_dfs(node: &Node, bytes: &[u8], scopes: &[Scope], out: &mut Vec<Binding>) {
+    match node.kind() {
+        "function_definition" => {
+            // Parameters live in function_declarator → parameters.
+            // Use find_function_declarator to handle pointer/reference-return types.
+            if let Some(decl) = node.child_by_field_name("declarator") {
+                if let Some(fn_decl) = find_function_declarator(&decl) {
+                    if let Some(params) = fn_decl.child_by_field_name("parameters") {
+                        collect_params(&params, bytes, scopes, out);
+                    }
+                }
+            }
+            // Recurse into all children to pick up body bindings.
+            for child in node.children(&mut node.walk()) {
+                collect_bindings_dfs(&child, bytes, scopes, out);
+            }
+        }
+        "lambda_expression" => {
+            // Lambda parameters live in: declarator (abstract_function_declarator) → parameters.
+            if let Some(fn_decl) = node.child_by_field_name("declarator") {
+                if let Some(params) = fn_decl.child_by_field_name("parameters") {
+                    collect_params(&params, bytes, scopes, out);
+                }
+            }
+            // Recurse into all children to pick up body bindings.
+            for child in node.children(&mut node.walk()) {
+                collect_bindings_dfs(&child, bytes, scopes, out);
+            }
+        }
+        "declaration" => {
+            // Emit Local bindings only when the innermost scope is Function or Block.
+            // This prevents namespace-level globals and class members from becoming Locals.
+            let mut cursor = node.walk();
+            for (i, child) in node.children(&mut cursor).enumerate() {
+                if node.field_name_for_child(i as u32) == Some("declarator") {
+                    if let Some((name, _)) = declarator_name(&child, bytes) {
+                        let intro = child.start_byte();
+                        if let Some(sid) = innermost_scope(intro, scopes) {
+                            if matches!(scopes[sid].kind, ScopeKind::Function | ScopeKind::Block) {
+                                push_binding(out, name, intro, BindingKind::Local, scopes);
+                            }
+                        }
+                    }
+                }
+                // Recurse into EVERY child, including the declarator: a C++ initializer
+                // (e.g. `auto f = [](int x){...};`) holds a lambda whose own parameters
+                // must be collected. Recursing the `init_declarator` re-emits no Local
+                // (it is not a `declaration` node), so there is no double-binding.
+                collect_bindings_dfs(&child, bytes, scopes, out);
+            }
+        }
+        "for_range_loop" => {
+            // Range-based for: `for (int v : container)` — the declarator field.
+            if let Some(decl) = node.child_by_field_name("declarator") {
+                if let Some((name, _)) = declarator_name(&decl, bytes) {
+                    let intro = decl.start_byte();
+                    if let Some(sid) = innermost_scope(intro, scopes) {
+                        if matches!(scopes[sid].kind, ScopeKind::Function | ScopeKind::Block) {
+                            push_binding(out, name, intro, BindingKind::Local, scopes);
+                        }
+                    }
+                }
+            }
+            // Recurse into children to catch nested bindings.
+            for child in node.children(&mut node.walk()) {
+                collect_bindings_dfs(&child, bytes, scopes, out);
+            }
+        }
+        _ => {
+            for child in node.children(&mut node.walk()) {
+                collect_bindings_dfs(&child, bytes, scopes, out);
+            }
+        }
+    }
+}
+
+/// Emit a [`BindingKind::Param`] for each named parameter in a C++
+/// `parameter_list` node. Handles `parameter_declaration`,
+/// `optional_parameter_declaration`, and `variadic_parameter_declaration`
+/// children; skips entries with no `declarator` field (unnamed or `void`).
+fn collect_params(params: &Node, bytes: &[u8], scopes: &[Scope], out: &mut Vec<Binding>) {
+    for child in params.children(&mut params.walk()) {
+        match child.kind() {
+            "parameter_declaration"
+            | "optional_parameter_declaration"
+            | "variadic_parameter_declaration" => {}
+            _ => continue,
+        }
+        let Some(decl) = child.child_by_field_name("declarator") else {
+            // Unnamed parameter or `(void)` — skip.
+            continue;
+        };
+        let Some((name, _)) = declarator_name(&decl, bytes) else {
+            continue;
+        };
+        let intro = decl.start_byte();
+        // Parameters are always inside a function scope — no kind guard needed.
+        push_binding(out, name, intro, BindingKind::Param, scopes);
+    }
+}
+
 /// Recursively walk `node` collecting `Inherit` references for every
 /// `class_specifier` and `struct_specifier` in the tree (including nested
 /// classes and those inside namespace blocks).
@@ -735,5 +982,287 @@ void run() {
             .map(|r| r.name.as_str())
             .collect();
         assert_eq!(inherit, vec!["Base"], "expected [Base], got {inherit:?}");
+    }
+
+    // ── Tier-B scope / binding tests ─────────────────────────────────────────
+
+    #[test]
+    fn params_emit_param_bindings() {
+        // `void add(int a, int b){}` → Param `a`, `b` in Function scope.
+        let src = "void add(int a, int b){}\n";
+        let facts = CppExtractor.extract(src, "src/math.cpp").unwrap();
+
+        let fn_scope_id = facts
+            .scopes
+            .iter()
+            .position(|s| s.kind == ScopeKind::Function)
+            .expect("expected a Function scope");
+
+        let mut param_names: Vec<(&str, ScopeId)> = facts
+            .bindings
+            .iter()
+            .filter(|b| b.kind == BindingKind::Param)
+            .map(|b| (b.name.as_str(), b.scope))
+            .collect();
+        param_names.sort_by_key(|(n, _)| *n);
+
+        assert_eq!(
+            param_names,
+            vec![("a", fn_scope_id), ("b", fn_scope_id)],
+            "expected Param bindings for a and b, got {param_names:?}"
+        );
+    }
+
+    #[test]
+    fn reference_param_emits_param_binding() {
+        // `void inc(int& r){}` → Param `r` (exercises reference_declarator unwrap).
+        let src = "void inc(int& r){}\n";
+        let facts = CppExtractor.extract(src, "src/inc.cpp").unwrap();
+
+        let r = facts
+            .bindings
+            .iter()
+            .find(|b| b.kind == BindingKind::Param && b.name == "r")
+            .expect("expected a Param binding for 'r'");
+        assert_eq!(
+            facts.scopes[r.scope].kind,
+            ScopeKind::Function,
+            "reference param 'r' should be in a Function scope"
+        );
+    }
+
+    #[test]
+    fn optional_param_emits_param_binding() {
+        // `void f(int x, int y = 0){}` → Param `x`, `y` (optional_parameter_declaration).
+        let src = "void f(int x, int y = 0){}\n";
+        let facts = CppExtractor.extract(src, "src/f.cpp").unwrap();
+
+        let mut param_names: Vec<&str> = facts
+            .bindings
+            .iter()
+            .filter(|b| b.kind == BindingKind::Param)
+            .map(|b| b.name.as_str())
+            .collect();
+        param_names.sort_unstable();
+        assert_eq!(
+            param_names,
+            vec!["x", "y"],
+            "expected Param bindings for x and y, got {param_names:?}"
+        );
+    }
+
+    #[test]
+    fn pointer_return_function_params_collected() {
+        // `char* dup(const char* s){return 0;}` — pointer_declarator wraps the
+        // function_declarator; find_function_declarator must reach the parameters.
+        let src = "char* dup(const char* s){return 0;}\n";
+        let facts = CppExtractor.extract(src, "src/dup.cpp").unwrap();
+
+        let s = facts
+            .bindings
+            .iter()
+            .find(|b| b.kind == BindingKind::Param && b.name == "s")
+            .expect("pointer-return function's param 's' should be collected");
+        assert_eq!(
+            facts.scopes[s.scope].kind,
+            ScopeKind::Function,
+            "param 's' should be in a Function scope"
+        );
+    }
+
+    #[test]
+    fn local_var_emits_local_binding() {
+        // `void f(){ int x = 0; }` → Local `x` in a Function or Block scope.
+        let src = "void f(){ int x = 0; }\n";
+        let facts = CppExtractor.extract(src, "src/f.cpp").unwrap();
+
+        let x = facts
+            .bindings
+            .iter()
+            .find(|b| b.kind == BindingKind::Local && b.name == "x")
+            .expect("expected a Local binding for 'x'");
+        assert_ne!(x.scope, 0, "local 'x' must NOT be in scope 0 (file root)");
+        assert!(
+            matches!(
+                facts.scopes[x.scope].kind,
+                ScopeKind::Function | ScopeKind::Block
+            ),
+            "local 'x' scope must be Function or Block, got {:?}",
+            facts.scopes[x.scope].kind
+        );
+    }
+
+    #[test]
+    fn range_for_emits_local_binding() {
+        // `void f(){ int a[3]={}; for (int v : a){} }` → Local `v`.
+        let src = "void f(){ int a[3]={}; for (int v : a){} }\n";
+        let facts = CppExtractor.extract(src, "src/f.cpp").unwrap();
+
+        let v = facts
+            .bindings
+            .iter()
+            .find(|b| b.kind == BindingKind::Local && b.name == "v")
+            .expect("expected a Local binding for 'v'");
+        assert_ne!(v.scope, 0, "range-for 'v' must NOT be in scope 0");
+    }
+
+    #[test]
+    fn namespace_global_not_a_local() {
+        // `namespace ns { int g; void f(){} }` → NO Local `g`; Definition `g` exists.
+        let src = "namespace ns { int g; void f(){} }\n";
+        let facts = CppExtractor.extract(src, "src/ns.cpp").unwrap();
+
+        assert!(
+            !facts
+                .bindings
+                .iter()
+                .any(|b| b.kind == BindingKind::Local && b.name == "g"),
+            "namespace global 'g' must NOT be a Local binding"
+        );
+        assert!(
+            facts
+                .bindings
+                .iter()
+                .any(|b| b.kind == BindingKind::Definition && b.name == "g"),
+            "namespace global 'g' must have a Definition binding"
+        );
+    }
+
+    #[test]
+    fn class_fields_not_locals() {
+        // `struct P { int x; int y; };` → NO Local x/y; Definition x/y exist.
+        let src = "struct P { int x; int y; };\n";
+        let facts = CppExtractor.extract(src, "src/p.cpp").unwrap();
+
+        assert!(
+            !facts
+                .bindings
+                .iter()
+                .any(|b| b.kind == BindingKind::Local && (b.name == "x" || b.name == "y")),
+            "class fields must NOT be Local bindings"
+        );
+        assert!(
+            facts
+                .bindings
+                .iter()
+                .any(|b| b.kind == BindingKind::Definition && b.name == "x"),
+            "struct field 'x' must have a Definition binding"
+        );
+        assert!(
+            facts
+                .bindings
+                .iter()
+                .any(|b| b.kind == BindingKind::Definition && b.name == "y"),
+            "struct field 'y' must have a Definition binding"
+        );
+    }
+
+    #[test]
+    fn nesting_produces_type_and_function_scopes() {
+        // `struct S { void m(){ int v=0; } };` → Module(0) + Type + Function; Local v in Function.
+        let src = "struct S { void m(){ int v=0; } };\n";
+        let facts = CppExtractor.extract(src, "src/s.cpp").unwrap();
+
+        let has_type = facts.scopes.iter().any(|s| s.kind == ScopeKind::Type);
+        let has_fn = facts.scopes.iter().any(|s| s.kind == ScopeKind::Function);
+        assert!(has_type, "expected a Type scope for struct body");
+        assert!(has_fn, "expected a Function scope for method body");
+
+        let v = facts
+            .bindings
+            .iter()
+            .find(|b| b.kind == BindingKind::Local && b.name == "v")
+            .expect("expected a Local binding for 'v'");
+        assert!(
+            matches!(
+                facts.scopes[v.scope].kind,
+                ScopeKind::Function | ScopeKind::Block
+            ),
+            "local 'v' must be in a Function or Block scope"
+        );
+    }
+
+    #[test]
+    fn namespace_body_opens_type_scope() {
+        // `namespace io { void f(){} }` → >=3 scopes incl a Type for the namespace body.
+        let src = "namespace io { void f(){} }\n";
+        let facts = CppExtractor.extract(src, "src/io.cpp").unwrap();
+
+        assert!(
+            facts.scopes.len() >= 3,
+            "expected at least 3 scopes (Module + Type for namespace + Function), got {}",
+            facts.scopes.len()
+        );
+        assert!(
+            facts.scopes.iter().any(|s| s.kind == ScopeKind::Type),
+            "expected a Type scope for namespace body"
+        );
+    }
+
+    #[test]
+    fn lambda_params_emit_param_bindings() {
+        // `void f(){ auto fn = [](int x, int y){}; }` → Param x, y.
+        let src = "void f(){ auto fn = [](int x, int y){}; }\n";
+        let facts = CppExtractor.extract(src, "src/f.cpp").unwrap();
+
+        let mut param_names: Vec<&str> = facts
+            .bindings
+            .iter()
+            .filter(|b| b.kind == BindingKind::Param)
+            .map(|b| b.name.as_str())
+            .collect();
+        param_names.sort_unstable();
+        assert_eq!(
+            param_names,
+            vec!["x", "y"],
+            "expected Param bindings for lambda params x and y, got {param_names:?}"
+        );
+    }
+
+    #[test]
+    fn same_file_call_ref_has_non_zero_scope_and_callee_has_definition() {
+        // Two non-static funcs where one calls the other.
+        // Assert: Definition binding for callee exists AND the call Reference has scope == Some(non-zero).
+        let src = "int helper(){return 0;}\nint caller(){return helper();}\n";
+        let facts = CppExtractor.extract(src, "src/pair.cpp").unwrap();
+
+        // Definition binding for `helper` must exist.
+        assert!(
+            facts
+                .bindings
+                .iter()
+                .any(|b| b.kind == BindingKind::Definition && b.name == "helper"),
+            "expected a Definition binding for 'helper'"
+        );
+
+        // The `helper()` call reference must have a non-zero (non-module) scope.
+        let call_ref = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Call && r.name == "helper")
+            .expect("expected a Call ref for 'helper'");
+        assert!(
+            call_ref.scope.is_some() && call_ref.scope != Some(0),
+            "helper() call ref must be in a non-zero scope, got {:?}",
+            call_ref.scope
+        );
+    }
+
+    #[test]
+    fn out_of_line_method_param_collected() {
+        // `class Foo {};\nvoid Foo::bar(int a){}\n` → Param `a` in a Function scope.
+        let src = "class Foo {};\nvoid Foo::bar(int a){}\n";
+        let facts = CppExtractor.extract(src, "src/foo.cpp").unwrap();
+
+        let a = facts
+            .bindings
+            .iter()
+            .find(|b| b.kind == BindingKind::Param && b.name == "a")
+            .expect("expected a Param binding for 'a' in out-of-line method");
+        assert_eq!(
+            facts.scopes[a.scope].kind,
+            ScopeKind::Function,
+            "param 'a' should be in a Function scope"
+        );
     }
 }
