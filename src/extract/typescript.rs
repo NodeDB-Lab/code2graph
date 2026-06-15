@@ -11,7 +11,7 @@
 //! `.tsx`/`.jsx` files are parsed with the TSX grammar, otherwise TypeScript.
 //! Emits neutral [`FileFacts`] — no storage entries, no source bodies.
 //!
-//! The extraction core ([`extract_ecmascript`]) is shared with the JavaScript
+//! The extraction core (`extract_ecmascript`) is shared with the JavaScript
 //! extractor, which reuses the TypeScript grammar (a superset of JavaScript);
 //! the two differ only in their language tag.
 

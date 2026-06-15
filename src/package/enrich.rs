@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Dep-free enrichment pass: stamps a [`Package`] onto every [`SymbolId`]-bearing
+//! Dep-free enrichment pass: stamps a [`Package`] onto every [`SymbolId`](crate::symbol::SymbolId)-bearing
 //! field in a [`FileFacts`]. Always compiled (no feature gate).
 
 use crate::graph::types::{BindingTarget, FileFacts};
 use crate::symbol::Package;
 
-/// Stamp `package` onto every [`SymbolId`] carried by `facts`.
+/// Stamp `package` onto every [`SymbolId`](crate::symbol::SymbolId) carried by `facts`.
 ///
 /// Affected fields:
 /// - `facts.symbols[*].id`

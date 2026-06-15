@@ -11,7 +11,7 @@
 //! Tier-B scope/binding extraction: CTE names introduced by `WITH … AS (…)` are
 //! emitted as [`BindingKind::Definition`] bindings in the enclosing statement scope
 //! (not scope 0 — the file root). A `FROM revenue` reference inside the same
-//! statement therefore resolves with [`Confidence::Scoped`].
+//! statement therefore resolves with [`Confidence::Scoped`](crate::graph::Confidence::Scoped).
 
 use std::collections::HashMap;
 

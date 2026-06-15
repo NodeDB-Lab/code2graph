@@ -54,6 +54,13 @@
 //! Tier-B never emits `NameOnly` edges; it either resolves with honest
 //! confidence or emits nothing (Tier-A still provides recall via fan-out for
 //! those cases).
+//!
+//! [`Confidence`]: crate::graph::Confidence
+//! [`Confidence::Exact`]: crate::graph::Confidence::Exact
+//! [`Confidence::Scoped`]: crate::graph::Confidence::Scoped
+//! [`SymbolId`]: crate::symbol::SymbolId
+//! [`BindingKind::Definition`]: crate::graph::types::BindingKind::Definition
+//! [`BindingKind::Import`]: crate::graph::types::BindingKind::Import
 
 use crate::graph::types::{CodeGraph, Edge, FileFacts, Symbol};
 

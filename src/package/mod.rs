@@ -2,7 +2,7 @@
 
 //! Optional package enrichment: stamp `Package` identity onto extracted facts.
 //!
-//! The dep-free [`enrich`] function and [`SymbolId::with_package`] are always
+//! The dep-free [`enrich()`] function and [`SymbolId::with_package`](crate::symbol::SymbolId::with_package) are always
 //! available. Manifest parsing (`from_manifest`) is behind the `manifest`
 //! cargo feature and pulls `toml`/`serde`/`serde_json`.
 //!

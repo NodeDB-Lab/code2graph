@@ -170,7 +170,7 @@ impl SymbolId {
     /// this symbol's path, in declaration order (outermost first). Non-namespace
     /// descriptors are excluded. Yields nothing for `Local` symbols.
     ///
-    /// Prefer this over [`namespaces`] in hot paths to avoid a heap allocation.
+    /// Prefer this over [`SymbolId::namespaces`] in hot paths to avoid a heap allocation.
     pub fn namespaces_iter(&self) -> impl Iterator<Item = &str> {
         let descs: &[Descriptor] = match &*self.0 {
             SymbolRepr::Global { descriptors, .. } => descriptors.as_slice(),

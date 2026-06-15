@@ -11,6 +11,7 @@
 //!
 //! [`Confidence`]: crate::graph::Confidence
 //! [`FileFacts`]: crate::graph::FileFacts
+//! [`CodeGraph`]: crate::graph::CodeGraph
 
 pub mod ffi_bridge;
 mod incremental;
