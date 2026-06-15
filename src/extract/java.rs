@@ -659,9 +659,26 @@ const DECL_KINDS_WITH_NAME: &[&str] = &[
 /// - Formal parameter name: `name:` of `formal_parameter`.
 /// - Field access member: the `field:` of `field_access` — that `identifier`
 ///   is a member name, not a read of a local/field. The `object:` side is kept.
-/// - Import declaration: top-level import identifiers (already Import refs).
+/// - Package / import declaration: every identifier in the qualified name path
+///   is part of a name, not a value read. A package clause declares the file's
+///   package; import paths are already captured as Import refs.
 /// - Assignment LHS: `left:` of `assignment_expression` / compound forms.
 fn is_non_read_position(node: &Node) -> bool {
+    // A qualified name nests as `scoped_identifier`s of arbitrary depth, so an
+    // immediate-parent check misses the leading segments (`com` in
+    // `com.example.Foo`). Walk up through the scoped-name chain: if it is rooted
+    // in a package or import declaration, no segment is a value read. The walk
+    // stops at the first non-name ancestor, so a `pkg.Class` used as a value
+    // (e.g. `new pkg.Class()`) still falls through to the normal read handling.
+    let mut ancestor = node.parent();
+    while let Some(p) = ancestor {
+        match p.kind() {
+            "package_declaration" | "import_declaration" => return true,
+            "scoped_identifier" | "scoped_type_identifier" => ancestor = p.parent(),
+            _ => break,
+        }
+    }
+
     let parent = match node.parent() {
         Some(p) => p,
         None => return true, // root — not a read
@@ -681,18 +698,8 @@ fn is_non_read_position(node: &Node) -> bool {
         // `field_access` member name (the `.field` part): skip it.
         // The `object:` child is not a `field:` child — it falls through as a read.
         "field_access" => parent.child_by_field_name("field").as_ref() == Some(node),
-        // Import declarations: any identifier directly inside `import_declaration`
-        // is already captured as an Import ref — skip it entirely.
-        "import_declaration" => true,
-        // Inside a `scoped_identifier` that is itself part of an import: also skip.
-        // Scoped identifiers appear elsewhere (e.g. `new pkg.Class()`) so we must
-        // verify the scoped_identifier's own parent is an import_declaration.
-        "scoped_identifier" => {
-            parent
-                .parent()
-                .is_some_and(|gp| gp.kind() == "import_declaration")
-                && parent.child_by_field_name("name").as_ref() == Some(node)
-        }
+        // Package / import declaration paths are handled by the scoped-name walk
+        // above, before this match.
         // Assignment LHS — handled by collect_write_references.
         "assignment_expression" => parent.child_by_field_name("left").as_ref() == Some(node),
         _ => false,
@@ -1225,6 +1232,44 @@ public class Client {
                 expected_module_id
             );
         }
+    }
+
+    #[test]
+    fn package_declaration_emits_no_read_refs() {
+        // `package com.example;` declares the file's package — it is NOT a value
+        // read of `com` or `example`. The qualified-name segments must not leak in
+        // as Read references (which would resolve back to the package/module symbol
+        // as a spurious self-edge). Deep import paths must likewise contribute no
+        // Read segments — they are already captured as Import refs.
+        let src = "package com.example;\n\
+                   import com.example.alpha.Service;\n\
+                   class Main { int run() { return Service.helper(); } }";
+        let facts = JavaExtractor
+            .extract(src, "src/com/example/Main.java")
+            .unwrap();
+
+        for seg in ["com", "example", "alpha"] {
+            assert!(
+                !facts
+                    .references
+                    .iter()
+                    .any(|r| r.role == RefRole::Read && r.name == seg),
+                "package/import path segment '{seg}' must not be a Read ref; refs: {:?}",
+                facts
+                    .references
+                    .iter()
+                    .map(|r| (&r.name, r.role))
+                    .collect::<Vec<_>>()
+            );
+        }
+        // The receiver of the call IS a genuine read and must be retained.
+        assert!(
+            facts
+                .references
+                .iter()
+                .any(|r| r.role == RefRole::Read && r.name == "Service"),
+            "the `Service` receiver in `Service.helper()` should remain a Read ref"
+        );
     }
 
     // --- from_path tests ---
