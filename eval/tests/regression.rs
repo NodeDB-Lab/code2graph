@@ -30,10 +30,17 @@ fn corpus_is_non_empty() {
 #[test]
 fn tier_a_is_recall_first() {
     // Tier-A is the recall-first tier: within its lane (intra-language name
-    // resolution) it must find every ground-truth edge. The `ffi` lane is a
-    // different resolver's job (cross-runtime boundaries), so it is excluded.
+    // resolution) it must find every ground-truth edge. Two lanes are excluded:
+    // the `ffi` lane is a different resolver's job (cross-runtime boundaries),
+    // and the `*_oracle` lanes are scored location-only against a SCIP index
+    // whose ground truth includes edges outside name resolution's lane (module
+    // references, imports), so full name-resolution recall is not the invariant
+    // there.
     let cases = corpus();
-    let in_lane: Vec<Case> = cases.into_iter().filter(|c| c.lang != "ffi").collect();
+    let in_lane: Vec<Case> = cases
+        .into_iter()
+        .filter(|c| c.lang != "ffi" && !c.lang.ends_with("_oracle"))
+        .collect();
     let total = corpus_total(&in_lane, &SymbolTableResolver);
     assert_eq!(
         total.recall(),
