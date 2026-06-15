@@ -15,12 +15,17 @@
 use tree_sitter::{Language as TsLanguage, Node, Parser};
 
 use crate::error::{CodegraphError, Result};
-use crate::graph::types::{ByteSpan, FileFacts, RefRole, Reference, Symbol, SymbolKind};
+use crate::graph::types::{
+    Binding, BindingKind, ByteSpan, FileFacts, RefRole, Reference, Scope, ScopeId, ScopeKind,
+    Symbol, SymbolKind,
+};
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
 
 use super::{
-    Extractor, collect_call_references, field_text, node_text, one_line_signature, push_ref,
+    Extractor, attach_reference_scopes, collect_call_references, definition_bindings, field_text,
+    import_bindings, innermost_scope, node_span, node_text, one_line_signature, push_binding,
+    push_ref, push_scope,
 };
 
 /// Tree-sitter query capturing call-callee identifiers.
@@ -57,7 +62,9 @@ impl Extractor for JavaExtractor {
         let bytes = source.as_bytes();
         let namespaces = java_namespaces(&root, bytes, file);
 
-        let mut symbols = collect_symbols(&root, bytes, file, &namespaces);
+        let defs = collect_symbols(&root, bytes, file, &namespaces);
+        let def_bindings = definition_bindings(&defs);
+        let mut symbols = defs;
         let mod_sym = super::module_symbol(Language::Java, &namespaces, file, source.len());
         let module_id = mod_sym.id.to_scip_string();
         symbols.push(mod_sym);
@@ -67,13 +74,19 @@ impl Extractor for JavaExtractor {
         collect_imports(&root, bytes, file, &mut references, &module_id);
         collect_jni_natives(&root, bytes, file, &namespaces, &mut references);
 
+        let scopes = collect_scopes(&root, source.len());
+        attach_reference_scopes(&mut references, &scopes);
+        let mut bindings = collect_bindings(&root, bytes, &scopes);
+        bindings.extend(def_bindings);
+        bindings.extend(import_bindings(&references, &scopes));
+
         Ok(FileFacts {
             file: file.to_owned(),
             lang: Language::Java.as_str().to_owned(),
             symbols,
             references,
-            scopes: Vec::new(),
-            bindings: Vec::new(),
+            scopes,
+            bindings,
             ffi_exports: Vec::new(),
         })
     }
@@ -375,40 +388,38 @@ fn collect_imports(
     module_id: &str,
 ) {
     if node.kind() == "import_declaration" {
-        // Skip wildcard imports — any child with kind "asterisk" means `.*`.
-        let has_wildcard = node
-            .children(&mut node.walk())
-            .any(|c| c.kind() == "asterisk");
+        // Single pass over the import's children. We must scan all of them: a
+        // wildcard `asterisk` can appear *after* the `scoped_identifier` sibling
+        // (e.g. `import com.x.*;`), so an early exit on the identifier would miss
+        // it. Record the first scoped/bare name and whether a wildcard is present.
+        let mut scoped: Option<Node> = None;
+        let mut bare: Option<Node> = None;
+        let mut has_wildcard = false;
+        for child in node.children(&mut node.walk()) {
+            match child.kind() {
+                "asterisk" => has_wildcard = true,
+                "scoped_identifier" if scoped.is_none() => scoped = Some(child),
+                "identifier" if bare.is_none() => bare = Some(child),
+                _ => {}
+            }
+        }
 
         if !has_wildcard {
-            // Prefer a `scoped_identifier` child; fall back to a bare `identifier`.
-            let mut found = false;
-            for child in node.children(&mut node.walk()) {
-                if child.kind() == "scoped_identifier" {
-                    // The `name` field is the final leaf (e.g. `Foo` in `com.x.Foo`).
-                    // The `path` field is the package prefix (e.g. `com.x`).
-                    if let Some(name_node) = child.child_by_field_name("name") {
-                        let name = super::node_text(&name_node, bytes);
-                        // tree-sitter-java's `scoped_identifier` names the prefix
-                        // field `scope` (Rust calls the analogous field `path`).
-                        let from_path = child
-                            .child_by_field_name("scope")
-                            .map_or("", |n| super::node_text(&n, bytes));
-                        super::push_import_ref(out, name, &name_node, file, module_id, from_path);
-                        found = true;
-                    }
-                    break;
+            // Prefer a `scoped_identifier`; fall back to a bare `identifier`.
+            if let Some(child) = scoped {
+                // The `name` field is the final leaf (e.g. `Foo` in `com.x.Foo`).
+                // tree-sitter-java names the prefix field `scope` (the package).
+                if let Some(name_node) = child.child_by_field_name("name") {
+                    let name = super::node_text(&name_node, bytes);
+                    let from_path = child
+                        .child_by_field_name("scope")
+                        .map_or("", |n| super::node_text(&n, bytes));
+                    super::push_import_ref(out, name, &name_node, file, module_id, from_path);
                 }
-            }
-            if !found {
+            } else if let Some(child) = bare {
                 // Bare identifier import: `import Foo;` — no package prefix.
-                for child in node.children(&mut node.walk()) {
-                    if child.kind() == "identifier" {
-                        let name = super::node_text(&child, bytes);
-                        super::push_import_ref(out, name, &child, file, module_id, "");
-                        break;
-                    }
-                }
+                let name = super::node_text(&child, bytes);
+                super::push_import_ref(out, name, &child, file, module_id, "");
             }
         }
     }
@@ -489,6 +500,248 @@ fn jni_mangle(namespaces: &[String], class: &str, method: &str) -> String {
         format!("Java_{class}_{method}")
     } else {
         format!("Java_{}_{}_{}", namespaces.join("_"), class, method)
+    }
+}
+
+// ── Scope tree (Tier-B) ──────────────────────────────────────────────────────
+
+/// Build the lexical scope tree for one Java file.
+///
+/// `scopes[0]` is always the file-root `Module` scope spanning `[0, source_len)`.
+/// Java opens scopes for type declarations (`class`, `interface`, `enum`, `record`,
+/// `@interface`) and method/constructor/lambda bodies.
+fn collect_scopes(root: &Node, source_len: usize) -> Vec<Scope> {
+    let mut scopes = Vec::new();
+    push_scope(
+        &mut scopes,
+        None,
+        ByteSpan {
+            start: 0,
+            end: source_len,
+        },
+        ScopeKind::Module,
+    );
+    for child in root.children(&mut root.walk()) {
+        scope_dfs(&child, 0, &mut scopes);
+    }
+    scopes
+}
+
+/// DFS opening scopes for Java declaration nodes.
+///
+/// Uses the "peel-the-body" pattern: the scope opens on the whole declaration
+/// node, then we recurse into the body's **children** directly (not the body
+/// itself), so the body block does not double-open an extra scope.
+fn scope_dfs(node: &Node, parent_id: ScopeId, scopes: &mut Vec<Scope>) {
+    match node.kind() {
+        "class_declaration"
+        | "interface_declaration"
+        | "enum_declaration"
+        | "record_declaration"
+        | "annotation_type_declaration" => {
+            let type_id = push_scope(scopes, Some(parent_id), node_span(node), ScopeKind::Type);
+            // Peel the body so the body-block itself does not re-open a scope.
+            if let Some(body) = node.child_by_field_name("body") {
+                for child in body.children(&mut body.walk()) {
+                    scope_dfs(&child, type_id, scopes);
+                }
+            }
+        }
+        "method_declaration" | "constructor_declaration" | "compact_constructor_declaration" => {
+            let fn_id = push_scope(
+                scopes,
+                Some(parent_id),
+                node_span(node),
+                ScopeKind::Function,
+            );
+            // Abstract / native methods have no body — handle `None`.
+            // Constructor bodies use kind `constructor_body` but the field name
+            // is still "body" in tree-sitter-java.
+            if let Some(body) = node.child_by_field_name("body") {
+                for child in body.children(&mut body.walk()) {
+                    scope_dfs(&child, fn_id, scopes);
+                }
+            }
+        }
+        "lambda_expression" => {
+            let fn_id = push_scope(
+                scopes,
+                Some(parent_id),
+                node_span(node),
+                ScopeKind::Function,
+            );
+            // If the lambda body is a block, peel it; otherwise recurse all children.
+            if let Some(body) = node.child_by_field_name("body") {
+                if body.kind() == "block" {
+                    for child in body.children(&mut body.walk()) {
+                        scope_dfs(&child, fn_id, scopes);
+                    }
+                } else {
+                    scope_dfs(&body, fn_id, scopes);
+                }
+            }
+        }
+        "block" => {
+            // A bare block NOT already consumed as a method/constructor body.
+            let block_id = push_scope(scopes, Some(parent_id), node_span(node), ScopeKind::Block);
+            for child in node.children(&mut node.walk()) {
+                scope_dfs(&child, block_id, scopes);
+            }
+        }
+        _ => {
+            for child in node.children(&mut node.walk()) {
+                scope_dfs(&child, parent_id, scopes);
+            }
+        }
+    }
+}
+
+// ── Bindings (Tier-B) ────────────────────────────────────────────────────────
+
+/// Collect parameter and local-variable [`Binding`]s for one Java file.
+///
+/// Covers:
+/// - `method_declaration` / `constructor_declaration` /
+///   `compact_constructor_declaration` parameters → [`BindingKind::Param`].
+/// - `lambda_expression` parameters (formal, inferred, or bare identifier)
+///   → [`BindingKind::Param`].
+/// - `local_variable_declaration` declarators → [`BindingKind::Local`]
+///   (scope-0 guard prevents field_declarations from leaking in).
+/// - `enhanced_for_statement` loop variable → [`BindingKind::Local`].
+/// - `catch_formal_parameter` → [`BindingKind::Param`].
+///
+/// Class fields (`field_declaration`) are excluded by the scope-0 guard; they are
+/// covered by [`definition_bindings`] as [`BindingKind::Definition`].
+fn collect_bindings(root: &Node, bytes: &[u8], scopes: &[Scope]) -> Vec<Binding> {
+    let mut out = Vec::new();
+    collect_bindings_dfs(root, bytes, scopes, &mut out);
+    out
+}
+
+fn collect_bindings_dfs(node: &Node, bytes: &[u8], scopes: &[Scope], out: &mut Vec<Binding>) {
+    match node.kind() {
+        "method_declaration" | "constructor_declaration" | "compact_constructor_declaration" => {
+            if let Some(params) = node.child_by_field_name("parameters") {
+                collect_params(&params, bytes, scopes, out);
+            }
+            for child in node.children(&mut node.walk()) {
+                collect_bindings_dfs(&child, bytes, scopes, out);
+            }
+        }
+        "lambda_expression" => {
+            if let Some(params_node) = node.child_by_field_name("parameters") {
+                match params_node.kind() {
+                    "formal_parameters" => {
+                        collect_params(&params_node, bytes, scopes, out);
+                    }
+                    "inferred_parameters" => {
+                        // `(a, b) -> …` — each named child is an `identifier`.
+                        for child in params_node.named_children(&mut params_node.walk()) {
+                            if child.kind() == "identifier" {
+                                let name = node_text(&child, bytes);
+                                let intro = child.start_byte();
+                                push_binding(
+                                    out,
+                                    name.to_owned(),
+                                    intro,
+                                    BindingKind::Param,
+                                    scopes,
+                                );
+                            }
+                        }
+                    }
+                    "identifier" => {
+                        // `x -> …` — single bare identifier parameter.
+                        let name = node_text(&params_node, bytes);
+                        let intro = params_node.start_byte();
+                        push_binding(out, name.to_owned(), intro, BindingKind::Param, scopes);
+                    }
+                    _ => {}
+                }
+            }
+            for child in node.children(&mut node.walk()) {
+                collect_bindings_dfs(&child, bytes, scopes, out);
+            }
+        }
+        "local_variable_declaration" => {
+            let mut cursor = node.walk();
+            for declarator in node.children_by_field_name("declarator", &mut cursor) {
+                if let Some(name_node) = declarator.child_by_field_name("name") {
+                    let name = node_text(&name_node, bytes);
+                    let intro = name_node.start_byte();
+                    // Scope-0 guard: field_declarations live at the Type scope;
+                    // local_variable_declarations inside a method body will never
+                    // be at scope 0 unless the parser emits something unusual.
+                    if innermost_scope(intro, scopes) != Some(0) {
+                        push_binding(out, name.to_owned(), intro, BindingKind::Local, scopes);
+                    }
+                }
+            }
+            for child in node.children(&mut node.walk()) {
+                collect_bindings_dfs(&child, bytes, scopes, out);
+            }
+        }
+        "enhanced_for_statement" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let name = node_text(&name_node, bytes);
+                let intro = name_node.start_byte();
+                if innermost_scope(intro, scopes) != Some(0) {
+                    push_binding(out, name.to_owned(), intro, BindingKind::Local, scopes);
+                }
+            }
+            for child in node.children(&mut node.walk()) {
+                collect_bindings_dfs(&child, bytes, scopes, out);
+            }
+        }
+        "catch_formal_parameter" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let name = node_text(&name_node, bytes);
+                let intro = name_node.start_byte();
+                push_binding(out, name.to_owned(), intro, BindingKind::Param, scopes);
+            }
+            for child in node.children(&mut node.walk()) {
+                collect_bindings_dfs(&child, bytes, scopes, out);
+            }
+        }
+        _ => {
+            for child in node.children(&mut node.walk()) {
+                collect_bindings_dfs(&child, bytes, scopes, out);
+            }
+        }
+    }
+}
+
+/// Emit a [`BindingKind::Param`] for each named parameter in a Java
+/// `formal_parameters` node.
+///
+/// Handles `formal_parameter` (typed param) and `spread_parameter` (varargs
+/// `int... xs`). The `name` field is exposed directly on each node via
+/// `child_by_field_name("name")`.
+fn collect_params(params: &Node, bytes: &[u8], scopes: &[Scope], out: &mut Vec<Binding>) {
+    for child in params.named_children(&mut params.walk()) {
+        match child.kind() {
+            "formal_parameter" => {
+                if let Some(name_node) = child.child_by_field_name("name") {
+                    let name = node_text(&name_node, bytes);
+                    let intro = name_node.start_byte();
+                    push_binding(out, name.to_owned(), intro, BindingKind::Param, scopes);
+                }
+            }
+            "spread_parameter" => {
+                // `int... xs` — the declarator is a `variable_declarator` child;
+                // the name is its `name` field.
+                for grandchild in child.named_children(&mut child.walk()) {
+                    if grandchild.kind() == "variable_declarator" {
+                        if let Some(name_node) = grandchild.child_by_field_name("name") {
+                            let name = node_text(&name_node, bytes);
+                            let intro = name_node.start_byte();
+                            push_binding(out, name.to_owned(), intro, BindingKind::Param, scopes);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -747,6 +1000,297 @@ public class Client {
             Some("com.example".to_owned()),
             "from_path should be 'com.example', got {:?}",
             r.from_path
+        );
+    }
+
+    // ── Tier-B scope / binding tests ─────────────────────────────────────────
+
+    #[test]
+    fn method_params_emit_param_bindings() {
+        // `public void f(int a, String b){}` → two Param bindings in a Function scope.
+        let src = "package p;\npublic class C { public void f(int a, String b){} }";
+        let facts = JavaExtractor.extract(src, "src/p/C.java").unwrap();
+
+        let fn_scope_id = facts
+            .scopes
+            .iter()
+            .position(|s| s.kind == ScopeKind::Function)
+            .expect("expected a Function scope");
+
+        let mut param_names: Vec<(&str, ScopeId)> = facts
+            .bindings
+            .iter()
+            .filter(|b| b.kind == BindingKind::Param)
+            .map(|b| (b.name.as_str(), b.scope))
+            .collect();
+        param_names.sort_by_key(|(n, _)| *n);
+
+        assert_eq!(
+            param_names,
+            vec![("a", fn_scope_id), ("b", fn_scope_id)],
+            "expected Param bindings for a and b, got {param_names:?}"
+        );
+    }
+
+    #[test]
+    fn constructor_param_emits_param_binding() {
+        // `public C(int x){}` → Param `x` in a Function scope.
+        let src = "package p;\npublic class C { public C(int x){} }";
+        let facts = JavaExtractor.extract(src, "src/p/C.java").unwrap();
+
+        let x = facts
+            .bindings
+            .iter()
+            .find(|b| b.kind == BindingKind::Param && b.name == "x")
+            .expect("expected Param binding for 'x'");
+        assert_eq!(
+            facts.scopes[x.scope].kind,
+            ScopeKind::Function,
+            "constructor param 'x' should be in a Function scope"
+        );
+    }
+
+    #[test]
+    fn local_var_inside_method_emits_local() {
+        // `int x = 1;` inside a method → Local `x`.
+        let src = "package p;\npublic class C { public void f() { int x = 1; } }";
+        let facts = JavaExtractor.extract(src, "src/p/C.java").unwrap();
+
+        let x = facts
+            .bindings
+            .iter()
+            .find(|b| b.kind == BindingKind::Local && b.name == "x")
+            .expect("expected Local binding for 'x'");
+        assert_ne!(x.scope, 0, "local 'x' must not be in scope 0");
+    }
+
+    #[test]
+    fn multi_declarator_emits_two_locals() {
+        // `int a, b;` inside a method → Locals `a` and `b`.
+        let src = "package p;\npublic class C { public void f() { int a = 1, b = 2; } }";
+        let facts = JavaExtractor.extract(src, "src/p/C.java").unwrap();
+
+        let locals: Vec<&str> = facts
+            .bindings
+            .iter()
+            .filter(|b| b.kind == BindingKind::Local)
+            .map(|b| b.name.as_str())
+            .collect();
+        assert!(
+            locals.contains(&"a"),
+            "expected Local for 'a', got {locals:?}"
+        );
+        assert!(
+            locals.contains(&"b"),
+            "expected Local for 'b', got {locals:?}"
+        );
+    }
+
+    #[test]
+    fn enhanced_for_loop_var_emits_local() {
+        // `for (int x : xs) {}` → Local `x`.
+        let src = "package p;\npublic class C { public void f(int[] xs) { for (int x : xs) {} } }";
+        let facts = JavaExtractor.extract(src, "src/p/C.java").unwrap();
+
+        let x = facts
+            .bindings
+            .iter()
+            .find(|b| b.kind == BindingKind::Local && b.name == "x")
+            .expect("expected Local binding for 'x'");
+        assert_ne!(x.scope, 0, "enhanced-for 'x' must not be in scope 0");
+    }
+
+    #[test]
+    fn class_field_is_definition_not_local() {
+        // `public int count;` at class level → Definition binding, NOT Local.
+        let src = "package p;\npublic class C { public int count; }";
+        let facts = JavaExtractor.extract(src, "src/p/C.java").unwrap();
+
+        assert!(
+            !facts
+                .bindings
+                .iter()
+                .any(|b| b.kind == BindingKind::Local && b.name == "count"),
+            "class field 'count' must NOT be a Local binding"
+        );
+        // The Definition binding for `count` comes from definition_bindings.
+        let def = facts
+            .bindings
+            .iter()
+            .find(|b| b.kind == BindingKind::Definition && b.name == "count")
+            .expect("expected a Definition binding for 'count'");
+        assert_eq!(
+            def.scope, 0,
+            "Definition binding for 'count' must be at scope 0"
+        );
+    }
+
+    #[test]
+    fn nesting_produces_correct_scope_hierarchy() {
+        // `public class C { public void f() {} }` → Module → Type → Function.
+        let src = "package p;\npublic class C { public void f() {} }";
+        let facts = JavaExtractor.extract(src, "src/p/C.java").unwrap();
+
+        assert_eq!(
+            facts.scopes[0].kind,
+            ScopeKind::Module,
+            "scopes[0] must be Module"
+        );
+
+        let type_scopes: Vec<ScopeId> = facts
+            .scopes
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.kind == ScopeKind::Type)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(type_scopes.len(), 1, "expected exactly one Type scope");
+
+        let type_scope_id = type_scopes[0];
+        assert_eq!(
+            facts.scopes[type_scope_id].parent,
+            Some(0),
+            "Type scope parent must be Module (0)"
+        );
+
+        let fn_scopes: Vec<ScopeId> = facts
+            .scopes
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.kind == ScopeKind::Function)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(fn_scopes.len(), 1, "expected exactly one Function scope");
+
+        let fn_scope_id = fn_scopes[0];
+        assert_eq!(
+            facts.scopes[fn_scope_id].parent,
+            Some(type_scope_id),
+            "Function scope parent must be the Type scope"
+        );
+    }
+
+    #[test]
+    fn catch_param_emits_param_binding() {
+        // `catch (Exception e) {}` → Param `e`.
+        let src = r#"package p;
+public class C {
+    public void f() {
+        try {} catch (Exception e) {}
+    }
+}"#;
+        let facts = JavaExtractor.extract(src, "src/p/C.java").unwrap();
+
+        let e = facts
+            .bindings
+            .iter()
+            .find(|b| b.kind == BindingKind::Param && b.name == "e")
+            .expect("expected Param binding for 'e'");
+        assert_ne!(e.scope, 0, "catch param 'e' must not be in scope 0");
+    }
+
+    #[test]
+    fn lambda_inferred_params_emit_param_bindings() {
+        // `(a, b) -> a + b` → Params `a` and `b`.
+        let src = r#"package p;
+public class C {
+    public void f() {
+        java.util.function.BiFunction<Integer,Integer,Integer> fn = (a, b) -> a + b;
+    }
+}"#;
+        let facts = JavaExtractor.extract(src, "src/p/C.java").unwrap();
+
+        let params: Vec<&str> = facts
+            .bindings
+            .iter()
+            .filter(|b| b.kind == BindingKind::Param)
+            .map(|b| b.name.as_str())
+            .collect();
+        assert!(params.contains(&"a"), "expected Param 'a', got {params:?}");
+        assert!(params.contains(&"b"), "expected Param 'b', got {params:?}");
+        for p in facts
+            .bindings
+            .iter()
+            .filter(|b| b.kind == BindingKind::Param)
+        {
+            assert_ne!(
+                p.scope, 0,
+                "lambda param '{}' must not be in scope 0",
+                p.name
+            );
+        }
+    }
+
+    #[test]
+    fn varargs_param_emits_param_binding() {
+        // `public void f(int... xs){}` → Param `xs`.
+        let src = "package p;\npublic class C { public void f(int... xs){} }";
+        let facts = JavaExtractor.extract(src, "src/p/C.java").unwrap();
+
+        let xs = facts
+            .bindings
+            .iter()
+            .find(|b| b.kind == BindingKind::Param && b.name == "xs")
+            .expect("expected Param binding for 'xs'");
+        assert_ne!(xs.scope, 0, "varargs param 'xs' must not be in scope 0");
+    }
+
+    #[test]
+    fn import_binding_emits_import_kind() {
+        // `import com.example.Service;` → an Import binding named `Service`.
+        let src = "import com.example.Service;\nclass A {}";
+        let facts = JavaExtractor.extract(src, "src/A.java").unwrap();
+
+        let svc = facts
+            .bindings
+            .iter()
+            .find(|b| b.kind == BindingKind::Import && b.name == "Service")
+            .expect("expected Import binding for 'Service'");
+        // Import bindings land in the module scope.
+        assert_eq!(
+            svc.scope, 0,
+            "Import binding 'Service' should be in scope 0"
+        );
+    }
+
+    #[test]
+    fn same_file_call_ref_has_non_zero_scope() {
+        // Calc.java-style test: `add` is defined in the class and called from `doubleAdd`.
+        // The call ref for `add` should be attached to a non-zero scope.
+        let src = r#"package com.example;
+public class Calc {
+    public int add(int a, int b) {
+        return a + b;
+    }
+    public int doubleAdd(int x) {
+        return add(x, x);
+    }
+}"#;
+        let facts = JavaExtractor
+            .extract(src, "src/com/example/Calc.java")
+            .unwrap();
+
+        // There must be a Definition binding for `add`.
+        assert!(
+            facts
+                .bindings
+                .iter()
+                .any(|b| b.kind == BindingKind::Definition && b.name == "add"),
+            "expected a Definition binding for 'add'"
+        );
+
+        // The `add` Call ref must have a non-None, non-zero scope.
+        let add_ref = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Call && r.name == "add")
+            .expect("expected a Call ref for 'add'");
+        let scope_id = add_ref
+            .scope
+            .expect("add() Call ref must have a scope attached");
+        assert_ne!(
+            scope_id, 0,
+            "add() Call ref scope must not be the module root"
         );
     }
 }

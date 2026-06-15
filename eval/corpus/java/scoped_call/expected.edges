@@ -1,0 +1,5 @@
+# Same-file call: `doubleAdd` calls `add`, both defined in Calc.java.
+# Proves Tier-B same-file Scoped resolution: the `add(x, x)` call on line 7
+# resolves to the `public int add` definition on line 3, not fanning out to any
+# external same-named symbol. Both methods are public so the extractor emits them.
+Calc.java:7 Call Calc.java:3
