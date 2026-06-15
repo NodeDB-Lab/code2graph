@@ -54,14 +54,11 @@ pub struct FfiBridgeResolver;
 
 impl Resolver for FfiBridgeResolver {
     fn resolve(&self, files: &[FileFacts]) -> CodeGraph {
-        let mut symbols: Vec<Symbol> = Vec::new();
-        for f in files {
-            symbols.extend(f.symbols.iter().cloned());
-        }
-
         // export name → exports declared under it, each tagged with its language.
+        let mut symbols: Vec<Symbol> = Vec::new();
         let mut exports: HashMap<&str, Vec<ExportRec>> = HashMap::new();
         for f in files {
+            symbols.extend(f.symbols.iter().cloned());
             for e in &f.ffi_exports {
                 exports
                     .entry(e.export_name.as_str())

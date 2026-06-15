@@ -81,15 +81,12 @@ impl Resolver for ScopeGraphResolver {
             .collect();
 
         // file path → indices into `symbols`, for caller attribution.
-        let mut syms_by_file: HashMap<&str, Vec<usize>> = HashMap::new();
-        for (i, s) in symbols.iter().enumerate() {
-            syms_by_file.entry(s.file.as_str()).or_default().push(i);
-        }
-
         // Global leaf-name → indices into `symbols`, for cross-file import
         // resolution (mirrors Tier-A's `by_name`).
+        let mut syms_by_file: HashMap<&str, Vec<usize>> = HashMap::new();
         let mut by_name: HashMap<&str, Vec<usize>> = HashMap::new();
         for (i, s) in symbols.iter().enumerate() {
+            syms_by_file.entry(s.file.as_str()).or_default().push(i);
             if let Some(n) = s.id.leaf_name() {
                 by_name.entry(n).or_default().push(i);
             }

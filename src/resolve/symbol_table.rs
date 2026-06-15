@@ -31,21 +31,18 @@ pub struct SymbolTableResolver;
 impl Resolver for SymbolTableResolver {
     fn resolve(&self, files: &[FileFacts]) -> CodeGraph {
         // leaf name → indices into the flattened symbol list
-        let mut symbols: Vec<Symbol> = Vec::new();
-        for f in files {
-            symbols.extend(f.symbols.iter().cloned());
-        }
+        let symbols: Vec<Symbol> = files
+            .iter()
+            .flat_map(|f| f.symbols.iter().cloned())
+            .collect();
 
         let mut by_name: HashMap<&str, Vec<usize>> = HashMap::new();
+        // Per-file symbol index for caller attribution (span containment).
+        let mut by_file: HashMap<&str, Vec<usize>> = HashMap::new();
         for (i, s) in symbols.iter().enumerate() {
             if let Some(name) = s.id.leaf_name() {
                 by_name.entry(name).or_default().push(i);
             }
-        }
-
-        // Per-file symbol index for caller attribution (span containment).
-        let mut by_file: HashMap<&str, Vec<usize>> = HashMap::new();
-        for (i, s) in symbols.iter().enumerate() {
             by_file.entry(s.file.as_str()).or_default().push(i);
         }
 
@@ -64,34 +61,36 @@ impl Resolver for SymbolTableResolver {
                     continue; // unresolved: no definition with this name
                 };
 
-                // Count non-self candidates first to determine confidence,
-                // then iterate the same filtered set to emit edges — no
-                // intermediate Vec needed.
-                let non_self_count = targets.iter().filter(|&&i| i != from_idx).count();
-
-                // Import-path disambiguation (Win-2): when this is an Import
-                // reference with a non-empty `from_path`, find the single
-                // non-self candidate whose namespace chain ends with the
-                // normalised path segments.  If exactly one matches, that
-                // candidate's edge is promoted to Scoped; all others remain
-                // NameOnly.  Recall is preserved — no edges are dropped.
-                let import_bound: Option<usize> = if r.role == RefRole::Import {
-                    r.from_path.as_deref().and_then(|p| {
-                        let segs = normalize_from_path(p);
-                        if segs.is_empty() {
-                            return None;
-                        }
-                        let mut matched = targets.iter().copied().filter(|&i| {
-                            i != from_idx && namespaces_end_with(&symbols[i].id, &segs)
-                        });
-                        let first = matched.next()?;
-                        // Promote only when exactly one candidate matches.
-                        if matched.next().is_none() {
-                            Some(first)
+                // Count non-self candidates and compute import-path
+                // disambiguation (Win-2) in a single pass over `targets`.
+                // `import_segs` is precomputed so the inner loop stays cheap.
+                let import_segs: Vec<&str> = if r.role == RefRole::Import {
+                    r.from_path
+                        .as_deref()
+                        .map_or_else(Vec::new, normalize_from_path)
+                } else {
+                    Vec::new()
+                };
+                let mut non_self_count: usize = 0;
+                let mut import_match_first: Option<usize> = None;
+                let mut import_match_second: Option<usize> = None;
+                for &i in targets.iter() {
+                    if i == from_idx {
+                        continue;
+                    }
+                    non_self_count += 1;
+                    if !import_segs.is_empty() && namespaces_end_with(&symbols[i].id, &import_segs)
+                    {
+                        if import_match_first.is_none() {
+                            import_match_first = Some(i);
                         } else {
-                            None
+                            import_match_second = Some(i);
                         }
-                    })
+                    }
+                }
+                // Promote only when exactly one candidate matched the import path.
+                let import_bound: Option<usize> = if import_match_second.is_none() {
+                    import_match_first
                 } else {
                     None
                 };
