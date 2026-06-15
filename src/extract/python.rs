@@ -253,9 +253,14 @@ fn collect_imports(
     match node.kind() {
         "import_from_statement" => {
             // Extract the from-path once from the `module_name` field.
-            let from_path = node
-                .child_by_field_name("module_name")
-                .map_or("", |n| node_text(&n, bytes));
+            let module_name = node.child_by_field_name("module_name");
+            let from_path = module_name.map_or("", |n| node_text(&n, bytes));
+            // Every segment of the from-path is a module → emit a ModuleRef each,
+            // positioned at that segment's own identifier node. Relative imports
+            // (`from . import x`) have no `dotted_name` module_name → skip.
+            if let Some(mn) = module_name {
+                emit_module_path_refs(&mn, false, bytes, file, out);
+            }
             for child in node.children_by_field_name("name", &mut node.walk()) {
                 match child.kind() {
                     "dotted_name" => {
@@ -288,6 +293,9 @@ fn collect_imports(
                     "dotted_name" => {
                         let text = node_text(&child, bytes);
                         let leaf = super::simple_type_name(text, ".");
+                        // Every segment EXCEPT the last is a module → ModuleRef each
+                        // (the last segment stays the existing leaf Import below).
+                        emit_module_path_refs(&child, true, bytes, file, out);
                         // from_path = the full dotted text (e.g. "foo.bar")
                         super::push_import_ref(out, leaf, &child, file, module_id, text);
                     }
@@ -313,6 +321,46 @@ fn collect_imports(
     // Recurse into all children to cover nested/local imports.
     for child in node.children(&mut node.walk()) {
         collect_imports(&child, bytes, file, out, module_id);
+    }
+}
+
+/// Emit a [`RefRole::ModuleRef`] reference for module-path segments of a
+/// `dotted_name` node, each positioned at its own child `identifier` node.
+///
+/// `skip_last` controls which segments count as modules:
+/// - `false` — every segment is a module (the `from <module> import …` case,
+///   where the entire `module_name` path is modules).
+/// - `true` — every segment EXCEPT the trailing leaf is a module (the
+///   `import a.b.c` case, where the last segment is the imported leaf and stays
+///   an `Import`).
+///
+/// Empty / non-identifier segments are skipped gracefully (`push_ref` also drops
+/// empty names), so relative-import dot parts emit nothing.
+fn emit_module_path_refs(
+    dotted: &Node,
+    skip_last: bool,
+    bytes: &[u8],
+    file: &str,
+    out: &mut Vec<Reference>,
+) {
+    if skip_last {
+        // Collect so we can drop the final identifier (the imported leaf).
+        let idents: Vec<Node> = dotted
+            .children(&mut dotted.walk())
+            .filter(|c| c.kind() == "identifier")
+            .collect();
+        let module_count = idents.len().saturating_sub(1);
+        for id in idents.iter().take(module_count) {
+            push_ref(out, node_text(id, bytes), id, file, RefRole::ModuleRef);
+        }
+    } else {
+        // Every identifier is a module segment; no need to allocate.
+        for id in dotted
+            .children(&mut dotted.walk())
+            .filter(|c| c.kind() == "identifier")
+        {
+            push_ref(out, node_text(&id, bytes), &id, file, RefRole::ModuleRef);
+        }
     }
 }
 
@@ -1125,6 +1173,85 @@ MAX_RETRIES = 3
         assert!(
             foo_reads.is_empty(),
             "attribute 'foo' must NOT be a Read ref; got: {foo_reads:?}"
+        );
+    }
+
+    // --- module-path ModuleRef tests ---
+
+    fn module_ref_names(facts: &FileFacts) -> Vec<String> {
+        let mut names: Vec<String> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::ModuleRef)
+            .map(|r| r.name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn from_import_emits_module_refs_for_path_segments() {
+        let src = "from a.b import c\n";
+        let facts = PythonExtractor.extract(src, "src/app.py").unwrap();
+        assert_eq!(
+            module_ref_names(&facts),
+            vec!["a".to_owned(), "b".to_owned()],
+        );
+        assert!(
+            facts
+                .references
+                .iter()
+                .any(|r| r.role == RefRole::Import && r.name == "c"),
+            "expected Import ref 'c'"
+        );
+    }
+
+    #[test]
+    fn from_single_module_import() {
+        let src = "from a import c\n";
+        let facts = PythonExtractor.extract(src, "src/app.py").unwrap();
+        assert_eq!(module_ref_names(&facts), vec!["a".to_owned()]);
+        assert!(
+            facts
+                .references
+                .iter()
+                .any(|r| r.role == RefRole::Import && r.name == "c"),
+            "expected Import ref 'c'"
+        );
+    }
+
+    #[test]
+    fn import_dotted_emits_module_refs_except_leaf() {
+        let src = "import a.b.c\n";
+        let facts = PythonExtractor.extract(src, "src/app.py").unwrap();
+        assert_eq!(
+            module_ref_names(&facts),
+            vec!["a".to_owned(), "b".to_owned()],
+        );
+        assert!(
+            facts
+                .references
+                .iter()
+                .any(|r| r.role == RefRole::Import && r.name == "c"),
+            "expected Import ref 'c' (the leaf segment) to still be present"
+        );
+    }
+
+    #[test]
+    fn relative_import_no_crash() {
+        let src = "from . import x\n";
+        let facts = PythonExtractor.extract(src, "src/app.py").unwrap();
+        // The lone dot has no module identifier → no ModuleRef at all.
+        let module_refs = module_ref_names(&facts);
+        assert!(
+            module_refs.is_empty(),
+            "relative `from . import x` must emit no ModuleRef, got {:?}",
+            module_refs
+        );
+        // And no empty-named ref leaked through anywhere.
+        assert!(
+            facts.references.iter().all(|r| !r.name.is_empty()),
+            "no reference should have an empty name"
         );
     }
 
