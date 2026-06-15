@@ -22,7 +22,7 @@
 //!
 //! References: callee identifiers captured by two call patterns:
 //! - free call `foo()` → `(call_expression (identifier) @callee)`
-//! - member call `x.foo()` → `(call_expression (navigation_expression (identifier) @callee))`
+//! - member call `x.foo()` → `(call_expression (navigation_expression (_) @qualifier (identifier) @callee))`
 //!
 //! Emits neutral [`FileFacts`] — no storage entries, no source bodies.
 
@@ -45,12 +45,17 @@ use super::{
 /// Tree-sitter query capturing call-callee identifiers.
 ///
 /// Pattern 1: free call `foo()` — identifier is a direct child of call_expression.
-/// Pattern 2: member call `x.foo()` — navigation_expression inside call_expression
-///            has an identifier child that is the callee.
+/// Pattern 2: member call `recv.foo()` — the `navigation_expression` holds the
+///            receiver first and the member identifier last. The receiver is
+///            captured as `@qualifier` and the member as `@callee`, so a qualified
+///            call resolves through its receiver (e.g. an `import`-bound type) at
+///            resolution time instead of fanning out across every same-named
+///            member. `(_) @qualifier` admits a chained receiver (`a.b.foo()`),
+///            still binding `@callee` to the final member identifier.
 const CALL_QUERY: &str = r#"
 [
   (call_expression (identifier) @callee)
-  (call_expression (navigation_expression (identifier) @callee))
+  (call_expression (navigation_expression (_) @qualifier (identifier) @callee))
 ]
 "#;
 
@@ -89,12 +94,9 @@ impl Extractor for KotlinExtractor {
         collect_decls(root, &ns_descriptors, false, bytes, file, &mut defs);
         let def_bindings = definition_bindings(&defs);
         let mut symbols = defs;
-        symbols.push(super::module_symbol(
-            Language::Kotlin,
-            &ns_strings,
-            file,
-            source.len(),
-        ));
+        let mod_sym = super::module_symbol(Language::Kotlin, &ns_strings, file, source.len());
+        let module_id = mod_sym.id.to_scip_string();
+        symbols.push(mod_sym);
 
         let mut references = collect_call_references(
             &root,
@@ -105,7 +107,7 @@ impl Extractor for KotlinExtractor {
             file,
         )?;
         collect_inheritance(&root, bytes, file, &mut references);
-        collect_imports(&root, bytes, file, &mut references);
+        collect_imports(&root, bytes, file, &mut references, &module_id);
         collect_type_references(&root, bytes, file, &mut references);
         collect_read_references(&root, bytes, file, &mut references);
         collect_write_references(&root, bytes, file, &mut references);
@@ -1178,18 +1180,28 @@ fn collect_inheritance(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Refe
 /// `import` node that is not a wildcard (`import com.x.*`).
 ///
 /// For each qualifying `import` node the first child of kind
-/// `qualified_identifier` or `identifier` provides the full import path;
-/// [`super::simple_type_name`] extracts the leaf name (e.g. `com.x.Foo` → `Foo`).
+/// `qualified_identifier` or `identifier` provides the full import path.
+/// The path is split on the last `.` to yield the leaf name and the package
+/// prefix (`from_path`), which are forwarded to [`super::push_import_ref`].
 /// Wildcards are detected by a `*` in the raw node text and silently dropped.
-fn collect_imports(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+fn collect_imports(
+    node: &Node,
+    bytes: &[u8],
+    file: &str,
+    out: &mut Vec<Reference>,
+    module_id: &str,
+) {
     if node.kind() == "import" {
         let raw = node_text(node, bytes);
         if !raw.contains('*') {
             // Find the first child that carries the import path.
             for child in node.children(&mut node.walk()) {
                 if matches!(child.kind(), "qualified_identifier" | "identifier") {
-                    let leaf = super::simple_type_name(node_text(&child, bytes), ".");
-                    super::push_ref(out, leaf, &child, file, RefRole::Import);
+                    let path = node_text(&child, bytes);
+                    // `com.example.alpha.Service` → name `Service`, from_path
+                    // `com.example.alpha`. A bare `import Foo` has no prefix.
+                    let (from_path, name) = path.rsplit_once('.').unwrap_or(("", path));
+                    super::push_import_ref(out, name, &child, file, module_id, from_path);
                     break;
                 }
             }
@@ -1199,7 +1211,7 @@ fn collect_imports(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Referenc
     }
 
     for child in node.children(&mut node.walk()) {
-        collect_imports(&child, bytes, file, out);
+        collect_imports(&child, bytes, file, out, module_id);
     }
 }
 
@@ -1924,5 +1936,62 @@ fun main() {
             !obj_reads.is_empty(),
             "receiver 'obj' should be a Read ref; got none"
         );
+    }
+
+    #[test]
+    fn qualified_call_captures_receiver_as_qualifier() {
+        // `Service.helper()` is ONE call to `helper` qualified by its receiver
+        // `Service`, not two bare calls. The receiver must NOT also be emitted as
+        // a Call (it is not invoked); the member must carry the qualifier so the
+        // resolver can follow it to the receiver's type.
+        let src = "fun run(): Int { return Service.helper() }\n";
+        let facts = extract(src, "src/com/ex/Main.kt");
+
+        let call_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Call)
+            .collect();
+        let helper = call_refs
+            .iter()
+            .find(|r| r.name == "helper")
+            .expect("expected a Call ref for 'helper'");
+        assert_eq!(
+            helper.qualifier.as_deref(),
+            Some("Service"),
+            "the `helper` call must be qualified by `Service`"
+        );
+        assert!(
+            !call_refs.iter().any(|r| r.name == "Service"),
+            "receiver `Service` must NOT be a Call ref; got: {:?}",
+            call_refs.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn import_carries_from_path_and_source_module() {
+        // `import com.example.alpha.Service` → an Import ref named `Service` that
+        // carries from_path `com.example.alpha` and the file's module id, so the
+        // scope tier can disambiguate a same-named symbol to the imported package.
+        let src = "package com.example\nimport com.example.alpha.Service\nfun run() {}\n";
+        let file = "src/com/example/Main.kt";
+        let facts = extract(src, file);
+
+        let import = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Import && r.name == "Service")
+            .expect("expected an Import ref for 'Service'");
+        assert_eq!(import.from_path.as_deref(), Some("com.example.alpha"));
+
+        let expected_module_id = crate::extract::module_symbol(
+            Language::Kotlin,
+            &["com".into(), "example".into()],
+            file,
+            src.len(),
+        )
+        .id
+        .to_scip_string();
+        assert_eq!(import.source_module, Some(expected_module_id));
     }
 }
