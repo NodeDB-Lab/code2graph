@@ -33,9 +33,9 @@ use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
 
 use super::{
-    Extractor, attach_reference_scopes, child_text, collect_call_references, definition_bindings,
-    field_text, import_bindings, innermost_scope, node_span, node_text, one_line_signature,
-    push_binding, push_scope,
+    Extractor, MIN_REF_LEN, attach_reference_scopes, child_text, collect_call_references,
+    definition_bindings, field_text, import_bindings, innermost_scope, node_span, node_text,
+    one_line_signature, push_binding, push_ref, push_scope,
 };
 
 /// Tree-sitter query capturing call-callee identifiers.
@@ -89,6 +89,8 @@ impl Extractor for PhpExtractor {
             collect_call_references(&root, &ts_language, CALL_QUERY, Language::Php, bytes, file)?;
         collect_inheritance(&root, bytes, file, &mut references);
         collect_imports(&root, bytes, file, &mut references);
+        collect_read_references(&root, bytes, file, &mut references);
+        collect_write_references(&root, bytes, file, &mut references);
 
         let scopes = collect_scopes(&root, source.len());
         attach_reference_scopes(&mut references, &scopes);
@@ -405,6 +407,101 @@ fn collect_inheritance(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Refe
     // Recurse into all children so nested classes are covered.
     for child in node.children(&mut node.walk()) {
         collect_inheritance(&child, bytes, file, out);
+    }
+}
+
+// ── Edge richness: Read / Write ─────────────────────────────────────────────
+
+/// Extract the bare variable name (without `$`) from a `variable_name` node.
+///
+/// Tries `child_text(node, "name", bytes)` first (matches the grammar's `name`
+/// child kind). Falls back to stripping the leading `$` from the full text,
+/// mirroring `collect_bindings_dfs` and `collect_foreach_var`.
+fn var_bare_name(node: &Node, bytes: &[u8]) -> String {
+    child_text(node, "name", bytes)
+        .unwrap_or_else(|| node_text(node, bytes).trim_start_matches('$').to_owned())
+}
+
+/// Returns `true` when a `variable_name` node is in a position that must NOT
+/// be emitted as a [`RefRole::Read`]:
+///
+/// - LHS of an `assignment_expression` (field `left`) — Write, not Read.
+/// - `name:` field of `simple_parameter`, `variadic_parameter`, or
+///   `property_promotion_parameter` — that is a binding declaration.
+/// - Direct `variable_name` child that is the loop-var binding inside a
+///   `foreach_statement` — those are bindings; they will be reached via
+///   `collect_foreach_var`. Detection: the node is a direct named child of
+///   `foreach_statement` AND is not the first named child (the iterable).
+fn is_non_read_var_position(node: &Node) -> bool {
+    let parent = match node.parent() {
+        Some(p) => p,
+        None => return true,
+    };
+    match parent.kind() {
+        // Assignment LHS → Write, not Read.
+        "assignment_expression" => parent.child_by_field_name("left").as_ref() == Some(node),
+        // Parameter binding declarations.
+        "simple_parameter" | "variadic_parameter" | "property_promotion_parameter" => {
+            parent.child_by_field_name("name").as_ref() == Some(node)
+        }
+        // foreach loop-var: the first named child is the iterable (a Read); any
+        // subsequent non-body named child is a loop-var binding — skip as Read.
+        "foreach_statement" => {
+            let first = parent.named_children(&mut parent.walk()).next();
+            let body = parent.child_by_field_name("body");
+            // It's a binding if it's NOT the iterable (first named child) and NOT the body.
+            first.as_ref() != Some(node) && body.as_ref() != Some(node)
+        }
+        _ => false,
+    }
+}
+
+/// Recursively walk `node` and emit [`RefRole::Read`] for every `variable_name`
+/// node that appears in a value/expression position.
+///
+/// The bare name (without `$`) is extracted via [`var_bare_name`] and checked
+/// against [`MIN_REF_LEN`]. Positions skipped:
+/// - Assignment LHS (field `left` of `assignment_expression`) — emitted as Write.
+/// - Parameter declaration names (`simple_parameter` / `variadic_parameter` /
+///   `property_promotion_parameter` `name:` field).
+/// - foreach loop-variable bindings (the non-iterable named children of
+///   `foreach_statement`).
+///
+/// `$this`, superglobals, and other special variables are emitted; they will
+/// simply not resolve to any definition, which is correct and honest.
+fn collect_read_references(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    if node.kind() == "variable_name" {
+        let name = var_bare_name(node, bytes);
+        if name.len() >= MIN_REF_LEN && !is_non_read_var_position(node) {
+            push_ref(out, &name, node, file, RefRole::Read);
+        }
+        // variable_name has no meaningful children; return early.
+        return;
+    }
+    for child in node.children(&mut node.walk()) {
+        collect_read_references(&child, bytes, file, out);
+    }
+}
+
+/// Recursively walk `node` and emit [`RefRole::Write`] for the `variable_name`
+/// on the left side of an `assignment_expression`.
+///
+/// Member / subscript LHS (`$obj->prop = …`, `$arr[$i] = …`) are not covered
+/// in v1 — only bare `variable_name` nodes. Applies [`MIN_REF_LEN`] to the
+/// bare name (without `$`).
+fn collect_write_references(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    if node.kind() == "assignment_expression" {
+        if let Some(lhs) = node.child_by_field_name("left") {
+            if lhs.kind() == "variable_name" {
+                let name = var_bare_name(&lhs, bytes);
+                if name.len() >= MIN_REF_LEN {
+                    push_ref(out, &name, &lhs, file, RefRole::Write);
+                }
+            }
+        }
+    }
+    for child in node.children(&mut node.walk()) {
+        collect_write_references(&child, bytes, file, out);
     }
 }
 
@@ -1165,6 +1262,125 @@ function run() {
         assert_ne!(
             scope_id, 0,
             "helper() Call ref scope must not be the module root"
+        );
+    }
+
+    // ── Edge richness: Read / Write ──────────────────────────────────────────
+
+    #[test]
+    fn php_read_ref_at_use_not_at_declaration() {
+        // `function f() { $base = 1; return $base; }`
+        // The assignment LHS `$base` is a Write (not a Read).
+        // The `$base` in `return $base` is a Read.
+        // Bare name must be "base" (no `$`), length >= MIN_REF_LEN (3).
+        let src = "<?php\nfunction f() { $base = 1; return $base; }\n";
+        let facts = PhpExtractor.extract(src, "src/f.php").unwrap();
+
+        let read_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Read && r.name == "base")
+            .collect();
+        assert!(
+            !read_refs.is_empty(),
+            "expected at least one Read ref for 'base', got none; all refs: {:?}",
+            facts
+                .references
+                .iter()
+                .map(|r| (&r.name, r.role))
+                .collect::<Vec<_>>()
+        );
+        // At least one Read ref must be at the use site (after the assignment).
+        // In the source "<?php\nfunction f() { $base = 1; return $base; }\n"
+        // the assignment ends at roughly byte 30; the return use is after that.
+        let use_ref = read_refs.iter().find(|r| r.occ.byte > 20);
+        assert!(
+            use_ref.is_some(),
+            "expected a Read ref for 'base' at the return site (byte > 20); refs: {read_refs:?}"
+        );
+    }
+
+    #[test]
+    fn php_write_ref_for_assignment() {
+        // `function f() { $cnt = 0; $cnt = 5; }` → at least one Write ref "cnt".
+        let src = "<?php\nfunction f() { $cnt = 0; $cnt = 5; }\n";
+        let facts = PhpExtractor.extract(src, "src/f.php").unwrap();
+
+        let write_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Write && r.name == "cnt")
+            .collect();
+        assert!(
+            !write_refs.is_empty(),
+            "expected at least one Write ref for 'cnt', got none; all refs: {:?}",
+            facts
+                .references
+                .iter()
+                .map(|r| (&r.name, r.role))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn php_function_call_not_a_read() {
+        // `helper()` is a bare function call — its name node is `name` kind, NOT
+        // `variable_name`, so collect_read_references must not emit a Read for it.
+        let src = "<?php\nfunction f() { helper(); }\n";
+        let facts = PhpExtractor.extract(src, "src/f.php").unwrap();
+
+        let read_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Read && r.name == "helper")
+            .collect();
+        assert!(
+            read_refs.is_empty(),
+            "helper() must NOT produce a Read ref; got: {read_refs:?}"
+        );
+        // The Call ref should exist.
+        let call_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Call && r.name == "helper")
+            .collect();
+        assert!(
+            !call_refs.is_empty(),
+            "expected a Call ref for 'helper'; all refs: {:?}",
+            facts
+                .references
+                .iter()
+                .map(|r| (&r.name, r.role))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn php_param_decl_not_a_read_but_use_is() {
+        // `function f(int $val) { return $val; }`
+        // The `$val` in the parameter list is a binding, NOT a Read.
+        // The `$val` in `return $val` IS a Read.
+        let src = "<?php\nfunction f(int $val) { return $val; }\n";
+        let facts = PhpExtractor.extract(src, "src/f.php").unwrap();
+
+        let read_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Read && r.name == "val")
+            .collect();
+        // At least one Read ref must exist (the use in the return).
+        assert!(
+            !read_refs.is_empty(),
+            "expected at least one Read ref for 'val' at the return site"
+        );
+        // None of the Read refs should be at the parameter declaration byte.
+        // The `$val` parameter appears early in the source (roughly bytes 20–24).
+        // The return use is further along (after the `{`).
+        let decl_read = read_refs.iter().find(|r| r.occ.byte < 25);
+        assert!(
+            decl_read.is_none(),
+            "param declaration '$val' must NOT be a Read ref; found one at byte {:?}",
+            decl_read.map(|r| r.occ.byte)
         );
     }
 }

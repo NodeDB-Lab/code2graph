@@ -37,9 +37,9 @@ use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
 
 use super::{
-    Extractor, attach_reference_scopes, child_text, collect_call_references, definition_bindings,
-    field_text, import_bindings, innermost_scope, node_span, node_text, one_line_signature,
-    push_binding, push_scope,
+    Extractor, MIN_REF_LEN, attach_reference_scopes, child_text, collect_call_references,
+    definition_bindings, field_text, import_bindings, innermost_scope, node_span, node_text,
+    one_line_signature, push_binding, push_ref, push_scope,
 };
 
 /// Tree-sitter query capturing call-callee identifiers.
@@ -106,6 +106,8 @@ impl Extractor for KotlinExtractor {
         )?;
         collect_inheritance(&root, bytes, file, &mut references);
         collect_imports(&root, bytes, file, &mut references);
+        collect_read_references(&root, bytes, file, &mut references);
+        collect_write_references(&root, bytes, file, &mut references);
 
         let scopes = collect_scopes(&root, source.len());
         attach_reference_scopes(&mut references, &scopes);
@@ -537,6 +539,153 @@ fn handle_secondary_constructor(
         bytes,
         file,
     );
+}
+
+// ── Edge richness: Read / Write ──────────────────────────────────────────────
+
+/// Returns `true` when `node` (an `identifier`) is in a Kotlin position that is
+/// already captured by another collector and must NOT also be emitted as a Read.
+///
+/// Skipped positions:
+/// - Free call callee: an `identifier` that is a direct child of `call_expression`
+///   before the `value_arguments` node — already [`RefRole::Call`].
+/// - Member call callee: an `identifier` that is the last named child of a
+///   `navigation_expression` inside a `call_expression` — already [`RefRole::Call`].
+///   The receiver identifier (the first in the pair) is NOT skipped.
+/// - Member access name (non-call): the last `identifier` child of
+///   `navigation_expression` — it is the member name (`foo` in `obj.foo`), not a
+///   local variable read. The receiver is kept as a Read.
+/// - Declaration names: `function_declaration`, `class_declaration`,
+///   `object_declaration`, `companion_object` → their `name:` field identifier.
+/// - Variable binding: `variable_declaration` child identifier (the bound name in
+///   `val x`, `var x`, loop variable, lambda param).
+/// - Parameter name: `identifier` child of `parameter` (the first child).
+/// - Import path: inside an `import` node — already [`RefRole::Import`].
+/// - Type positions: `user_type` / `type` node descendants are distinct
+///   `identifier` nodes inside type syntax; skip all children of `user_type`.
+/// - Type alias name: `type_alias` `type:` field.
+/// - Qualified identifier in `import` or `package_header`.
+/// - Assignment LHS: handled by [`collect_write_references`].
+fn is_non_read_position(node: &Node) -> bool {
+    let parent = match node.parent() {
+        Some(p) => p,
+        None => return true, // root — not a read
+    };
+    match parent.kind() {
+        // Free call callee: `foo()` — identifier is a direct child of call_expression.
+        // The CALL_QUERY already captures it as Call; skip here.
+        "call_expression" => {
+            // The callee is the first child of call_expression (before value_arguments).
+            // It is always the identifier we want to skip.
+            parent.named_children(&mut parent.walk()).next().as_ref() == Some(node)
+        }
+        // Navigation expression: `a.foo` or `a.foo()`.
+        // The member name is the LAST identifier among the direct children.
+        // The receiver (`a`) may also be a direct identifier child — it IS a Read.
+        "navigation_expression" => {
+            let last_ident = parent
+                .named_children(&mut parent.walk())
+                .filter(|c| c.kind() == "identifier")
+                .last();
+            last_ident.as_ref() == Some(node)
+        }
+        // Declaration names.
+        "function_declaration"
+        | "class_declaration"
+        | "object_declaration"
+        | "companion_object" => parent.child_by_field_name("name").as_ref() == Some(node),
+        // Type alias name (the `type:` field is the alias name, e.g. `typealias Foo = ...`).
+        "type_alias" => parent.child_by_field_name("type").as_ref() == Some(node),
+        // Variable binding: the bound identifier in `val x` / `var x` / loop var /
+        // lambda param. variable_declaration's first identifier child is the name.
+        "variable_declaration" => {
+            // The first identifier child is the bound name; the second (if any) is
+            // inside the type annotation and would be kind "type" → not identifier.
+            parent
+                .named_children(&mut parent.walk())
+                .find(|c| c.kind() == "identifier")
+                .as_ref()
+                == Some(node)
+        }
+        // Parameter name: first identifier in `parameter` (name comes before the type).
+        "parameter" | "class_parameter" => {
+            parent
+                .named_children(&mut parent.walk())
+                .find(|c| c.kind() == "identifier")
+                .as_ref()
+                == Some(node)
+        }
+        // Import path — already Import refs.
+        "import" | "qualified_identifier" => true,
+        // Package header — not a reference.
+        "package_header" => true,
+        // Inside `user_type` (type reference like `List<String>`, `MyClass`) —
+        // type identifiers are a distinct position, not value reads.
+        "user_type" => true,
+        // Inside `type` node descendants.
+        "type_identifier" => true,
+        // Assignment LHS — handled by collect_write_references.
+        "assignment" => parent.child_by_field_name("left").as_ref() == Some(node),
+        _ => false,
+    }
+}
+
+/// Recursively walk `node` and emit [`RefRole::Read`] references for bare
+/// `identifier` nodes used in value/expression positions.
+///
+/// Skips identifiers that are:
+/// - Call callees (already [`RefRole::Call`]).
+/// - Navigation member names (`foo` in `a.foo` — member position).
+/// - Declaration names (`function_declaration` / `class_declaration` /
+///   `object_declaration` / `companion_object` `name:` field).
+/// - Variable binding names (`variable_declaration` first identifier).
+/// - Parameter names (`parameter` first identifier).
+/// - Import path identifiers (already [`RefRole::Import`]).
+/// - Type positions (inside `user_type`).
+/// - Assignment LHS (handled by [`collect_write_references`]).
+///
+/// Applies [`MIN_REF_LEN`] (same threshold as calls).
+fn collect_read_references(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    if node.kind() == "identifier" {
+        let name = node_text(node, bytes);
+        if name.len() >= MIN_REF_LEN && !is_non_read_position(node) {
+            push_ref(out, name, node, file, RefRole::Read);
+        }
+        // identifiers have no meaningful children; return early.
+        return;
+    }
+    for child in node.children(&mut node.walk()) {
+        collect_read_references(&child, bytes, file, out);
+    }
+}
+
+/// Recursively walk `node` and emit [`RefRole::Write`] references for the
+/// bare-identifier LHS of `assignment` nodes (e.g. `x = 5`, `x += 1`).
+///
+/// In the Kotlin grammar, both simple assignment (`x = 5`) and compound
+/// assignment (`x += 1`, `x -= 1`, `x *= 1`, `x /= 1`, `x %= 1`) share the
+/// same `assignment` node kind — the operator field distinguishes them.
+///
+/// Property declarations (`val x = 5` / `var x = 5`) are
+/// `property_declaration` nodes, not `assignment` nodes; they are correctly
+/// excluded — only `assignment` nodes with a bare-identifier LHS are handled.
+///
+/// Member / subscript LHS (`obj.prop = …`, `arr[i] = …`) are not covered in
+/// v1 — only bare `identifier` LHS nodes. Applies [`MIN_REF_LEN`].
+fn collect_write_references(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    if node.kind() == "assignment" {
+        if let Some(lhs) = node.child_by_field_name("left") {
+            if lhs.kind() == "identifier" {
+                let name = node_text(&lhs, bytes);
+                if name.len() >= MIN_REF_LEN {
+                    push_ref(out, name, &lhs, file, RefRole::Write);
+                }
+            }
+        }
+    }
+    for child in node.children(&mut node.walk()) {
+        collect_write_references(&child, bytes, file, out);
+    }
 }
 
 // ── Scope tree (Tier-B) ──────────────────────────────────────────────────────
@@ -1415,6 +1564,105 @@ fun main() {
                 .filter(|b| b.kind == BindingKind::Import)
                 .map(|b| b.name.as_str())
                 .collect::<Vec<_>>()
+        );
+    }
+
+    // ── Edge richness: Read / Write tests ────────────────────────────────────
+
+    // Test R1: read at use site — `return base` emits Read for "base"; the
+    // declaration `val base = 1` must NOT emit a Read for "base".
+    #[test]
+    fn read_at_use_not_declaration() {
+        let src = "fun f(): Int { val base = 1; return base }";
+        let facts = extract(src, "src/F.kt");
+        let read_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Read && r.name == "base")
+            .collect();
+        assert!(
+            !read_refs.is_empty(),
+            "expected at least one Read ref for 'base', got none"
+        );
+        // The use in `return base` is at a higher byte offset than the `val base` decl.
+        // In "fun f(): Int { val base = 1; return base }" the `return` starts after byte 30.
+        let use_ref = read_refs
+            .iter()
+            .find(|r| r.occ.byte > 30)
+            .expect("Read ref for 'base' should be at the return site (byte > 30)");
+        assert!(
+            use_ref.occ.byte > 30,
+            "Read ref should be at the use site, not the declaration"
+        );
+    }
+
+    // Test R2: write — `cnt = 5` emits Write "cnt"; the declaration `var cnt = 0` must not.
+    #[test]
+    fn write_emitted_for_assignment() {
+        let src = "fun f() { var cnt = 0; cnt = 5 }";
+        let facts = extract(src, "src/F.kt");
+        let write_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Write && r.name == "cnt")
+            .collect();
+        assert!(
+            !write_refs.is_empty(),
+            "expected at least one Write ref for 'cnt', got none — all refs: {:?}",
+            facts
+                .references
+                .iter()
+                .map(|r| (&r.name, r.role))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // Test R3: call callee must NOT also be a Read.
+    #[test]
+    fn call_not_also_read() {
+        let src = "fun f() { helper() }";
+        let facts = extract(src, "src/F.kt");
+        let call_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Call && r.name == "helper")
+            .collect();
+        assert!(!call_refs.is_empty(), "expected a Call ref for 'helper'");
+        let read_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Read && r.name == "helper")
+            .collect();
+        assert!(
+            read_refs.is_empty(),
+            "helper() must NOT produce a Read ref; got: {read_refs:?}"
+        );
+    }
+
+    // Test R4: navigation member must NOT be a Read; receiver must be a Read.
+    #[test]
+    fn navigation_member_not_read_receiver_is_read() {
+        // `use(obj.field)` — `obj` is a Read (receiver), `field` is NOT a Read.
+        let src = "fun f(obj: C) { use(obj.field) }";
+        let facts = extract(src, "src/F.kt");
+        let field_reads: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Read && r.name == "field")
+            .collect();
+        assert!(
+            field_reads.is_empty(),
+            "member 'field' in navigation expression must NOT be a Read ref; got: {field_reads:?}"
+        );
+        // `obj` is the receiver — it should be a Read.
+        let obj_reads: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Read && r.name == "obj")
+            .collect();
+        assert!(
+            !obj_reads.is_empty(),
+            "receiver 'obj' should be a Read ref; got none"
         );
     }
 }

@@ -33,9 +33,9 @@ use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
 
 use super::{
-    Extractor, attach_reference_scopes, collect_call_references, definition_bindings, field_text,
-    import_bindings, innermost_scope, node_span, node_text, one_line_signature, push_binding,
-    push_scope,
+    Extractor, MIN_REF_LEN, attach_reference_scopes, collect_call_references, definition_bindings,
+    field_text, import_bindings, innermost_scope, node_span, node_text, one_line_signature,
+    push_binding, push_ref, push_scope,
 };
 
 /// Tree-sitter query capturing call-callee identifiers.
@@ -102,6 +102,8 @@ impl Extractor for SwiftExtractor {
         )?;
         collect_inheritance(&root, bytes, file, &mut references);
         collect_imports(&root, bytes, file, &mut references);
+        collect_read_references(&root, bytes, file, &mut references);
+        collect_write_references(&root, bytes, file, &mut references);
 
         let scopes = collect_scopes(&root, source.len());
         attach_reference_scopes(&mut references, &scopes);
@@ -632,6 +634,137 @@ fn handle_enum_entry(
         bytes,
         file,
     );
+}
+
+// ── Edge richness: Read / Write ─────────────────────────────────────────────
+
+/// Returns `true` when `node` (a `simple_identifier`) is in a position already
+/// captured by another collector and must NOT also be emitted as a
+/// [`RefRole::Read`] reference.
+///
+/// Skipped positions:
+/// - Call callee: `simple_identifier` that is a direct child of `call_expression`
+///   (pattern 1 of CALL_QUERY). Because `call_expression` exposes no named
+///   `function:` field (its children are unnamed), any `simple_identifier` that
+///   is an immediate child of `call_expression` is the callee — call arguments
+///   are wrapped in a `call_suffix` node, not placed directly.
+/// - Navigation member: parent is `navigation_suffix` — the `.foo` in `x.foo`
+///   (pattern 2 of CALL_QUERY captures these as member callees; the base `x` IS
+///   emitted as a Read because its parent is `navigation_expression`, not
+///   `navigation_suffix`).
+/// - Declaration name: `function_declaration`, `protocol_function_declaration`,
+///   or `enum_entry` whose `name:` field is this node.
+/// - Property binding: parent is `pattern` and this node is the `bound_identifier`
+///   field — the name introduced by `let x` / `var x`.
+/// - Parameter names: parent is `parameter` and this node is either the `name:`
+///   field (internal name) or the `external_name:` field (the call-site label
+///   in `func f(label name: T)`) — both are binding positions, not reads.
+/// - Argument label: parent is `value_argument_label` — the label in `f(label: v)`.
+/// - Assignment LHS: parent is `directly_assignable_expression` — handled by
+///   [`collect_write_references`].
+fn is_non_read_position(node: &Node) -> bool {
+    let parent = match node.parent() {
+        Some(p) => p,
+        None => return true, // root — not a read
+    };
+    match parent.kind() {
+        // Call callee (pattern 1 of CALL_QUERY): simple_identifier direct child
+        // of call_expression. Call arguments live in call_suffix, not here.
+        "call_expression" => true,
+        // Navigation member (pattern 2 of CALL_QUERY): the .foo part.
+        // The base (parent = navigation_expression) is NOT skipped — it IS a read.
+        "navigation_suffix" => true,
+        // Function / protocol-function declaration name.
+        "function_declaration" | "protocol_function_declaration" => {
+            parent.child_by_field_name("name").as_ref() == Some(node)
+        }
+        // Enum case name: `case north` — name field is a simple_identifier.
+        "enum_entry" => parent.child_by_field_name("name").as_ref() == Some(node),
+        // Property binding: `let x = …` — pattern's bound_identifier field.
+        "pattern" => parent.child_by_field_name("bound_identifier").as_ref() == Some(node),
+        // Parameter names: `func f(label name: T)` — both the external label
+        // (`external_name` field) and the internal name (`name` field) are
+        // parameter binding positions, not reads.
+        "parameter" => {
+            parent.child_by_field_name("name").as_ref() == Some(node)
+                || parent.child_by_field_name("external_name").as_ref() == Some(node)
+        }
+        // Argument label in a function call: `f(label: value)`.
+        "value_argument_label" => true,
+        // Assignment LHS wrapper — handled by collect_write_references.
+        "directly_assignable_expression" => true,
+        _ => false,
+    }
+}
+
+/// Recursively walk `node` and emit [`RefRole::Read`] references for bare
+/// `simple_identifier` nodes used in value/expression positions.
+///
+/// Skips positions handled by other collectors:
+/// - Call callees (CALL_QUERY pattern 1/2 — [`RefRole::Call`])
+/// - Navigation member (`.foo` in `x.foo`) — the base `x` is emitted
+/// - Declaration names (`function_declaration`, `protocol_function_declaration`,
+///   `enum_entry` name fields)
+/// - Property binding names (`pattern` → `bound_identifier`)
+/// - Parameter names (`parameter.name` and `parameter.external_name`)
+/// - Argument labels (`value_argument_label`)
+/// - Assignment LHS (`directly_assignable_expression`)
+///
+/// `type_identifier` (used for type names) is a distinct node kind and is
+/// naturally excluded — this function matches only `simple_identifier` nodes.
+/// Applies [`MIN_REF_LEN`].
+fn collect_read_references(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    if node.kind() == "simple_identifier" {
+        let name = node_text(node, bytes);
+        if name.len() >= MIN_REF_LEN && !is_non_read_position(node) {
+            push_ref(out, name, node, file, RefRole::Read);
+        }
+        // simple_identifier nodes have no meaningful named children; return early.
+        return;
+    }
+    for child in node.children(&mut node.walk()) {
+        collect_read_references(&child, bytes, file, out);
+    }
+}
+
+/// Recursively walk `node` and emit [`RefRole::Write`] references for the
+/// bare-identifier LHS of Swift `assignment` nodes (e.g. `cnt = 5`, `cnt += 1`).
+///
+/// Swift assignment node shape (tree-sitter-swift grammar):
+/// ```text
+/// assignment
+///   target: directly_assignable_expression
+///     simple_identifier   ← bare LHS; emit Write if len >= MIN_REF_LEN
+///   operator: =  (or +=, -=, …)
+///   result: <rhs expression>
+/// ```
+///
+/// `property_declaration` (`let`/`var x = 5`) is a *definition*, not an
+/// assignment — it is correctly excluded because it produces a `property_declaration`
+/// node, not an `assignment` node. Member/subscript LHS (`obj.prop = …`,
+/// `arr[i] = …`) are not covered in v1 — only bare `simple_identifier` targets.
+/// Applies [`MIN_REF_LEN`].
+fn collect_write_references(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    if node.kind() == "assignment" {
+        // The `target` field is a `directly_assignable_expression` whose sole
+        // unnamed child is the LHS expression. For a bare identifier LHS the
+        // inner node is a `simple_identifier`.
+        if let Some(target) = node.child_by_field_name("target") {
+            // target.kind() == "directly_assignable_expression"
+            // Its first (and only) named child is the actual expression.
+            if let Some(lhs) = target.named_child(0) {
+                if lhs.kind() == "simple_identifier" {
+                    let name = node_text(&lhs, bytes);
+                    if name.len() >= MIN_REF_LEN {
+                        push_ref(out, name, &lhs, file, RefRole::Write);
+                    }
+                }
+            }
+        }
+    }
+    for child in node.children(&mut node.walk()) {
+        collect_write_references(&child, bytes, file, out);
+    }
 }
 
 // ── Scope tree (Tier-B) ──────────────────────────────────────────────────────
@@ -1437,6 +1570,127 @@ func main() {
                 .iter()
                 .any(|b| b.kind == BindingKind::Definition && b.name == "count"),
             "struct property 'count' must have a Definition binding"
+        );
+    }
+
+    // ── Edge richness: Read / Write ──────────────────────────────────────────
+
+    // Test RW1: Read at use site, NOT at the let binding.
+    #[test]
+    fn read_ref_emitted_at_use_not_declaration() {
+        // `func f() -> Int { let base = 1; return base }`
+        // → Read ref for `base` in `return base`, not at the `let base`.
+        let src = "func f() -> Int { let base = 1; return base }";
+        let facts = extract(src, "Sources/F.swift");
+
+        let read_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Read && r.name == "base")
+            .collect();
+        assert!(
+            !read_refs.is_empty(),
+            "expected at least one Read ref for 'base', got none; refs = {:?}",
+            facts
+                .references
+                .iter()
+                .map(|r| (&r.name, r.role))
+                .collect::<Vec<_>>()
+        );
+        // The `let base` keyword is near the start; the `return base` use appears later.
+        // Verify the Read ref byte offset is after the `=` sign (byte > 20).
+        let use_ref = read_refs
+            .iter()
+            .find(|r| r.occ.byte > 20)
+            .expect("expected Read ref for 'base' in the return expression (byte > 20)");
+        assert!(
+            use_ref.occ.byte > 20,
+            "Read ref should be at the use site, not the declaration"
+        );
+    }
+
+    // Test RW2: Write ref emitted for assignment (not for the let/var declaration).
+    #[test]
+    fn write_ref_emitted_for_assignment() {
+        // `func f() { var cnt = 0; cnt = 5 }`
+        // → Write ref for the `cnt = 5` assignment; the `var cnt` declaration is NOT a Write.
+        let src = "func f() { var cnt = 0; cnt = 5 }";
+        let facts = extract(src, "Sources/F.swift");
+
+        let write_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Write && r.name == "cnt")
+            .collect();
+        assert!(
+            !write_refs.is_empty(),
+            "expected at least one Write ref for 'cnt', got none; refs = {:?}",
+            facts
+                .references
+                .iter()
+                .map(|r| (&r.name, r.role))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // Test RW3: Call callee is NOT also emitted as a Read.
+    #[test]
+    fn call_not_also_read() {
+        // `func f() { helper() }` → Call ref for "helper", but NOT a Read ref.
+        let src = "func f() { helper() }";
+        let facts = extract(src, "Sources/F.swift");
+
+        let call_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Call && r.name == "helper")
+            .collect();
+        assert!(!call_refs.is_empty(), "expected a Call ref for 'helper'");
+
+        let read_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Read && r.name == "helper")
+            .collect();
+        assert!(
+            read_refs.is_empty(),
+            "helper() must NOT produce a Read ref; got: {read_refs:?}"
+        );
+    }
+
+    // Test RW4: Navigation member is NOT a Read; the base IS a Read.
+    #[test]
+    fn navigation_member_not_a_read() {
+        // `func f(obj: C) { use(obj.field) }` → Read "obj" (the base), no Read "field".
+        // "use" is a call; "obj" is read (base of navigation); "field" is a nav member — skip.
+        let src = "func f(obj: Cls) { use(obj.field) }";
+        let facts = extract(src, "Sources/F.swift");
+
+        // Navigation member "field" must NOT be a Read.
+        let field_reads: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Read && r.name == "field")
+            .collect();
+        assert!(
+            field_reads.is_empty(),
+            "navigation member 'field' must NOT be a Read ref; got: {field_reads:?}"
+        );
+
+        // The base "obj" (≥3 chars) must be a Read.
+        let obj_reads: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Read && r.name == "obj")
+            .collect();
+        assert!(
+            !obj_reads.is_empty(),
+            "base 'obj' of navigation expression must be a Read ref; refs = {:?}",
+            facts
+                .references
+                .iter()
+                .map(|r| (&r.name, r.role))
+                .collect::<Vec<_>>()
         );
     }
 }

@@ -29,8 +29,9 @@ use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
 
 use super::{
-    Extractor, attach_reference_scopes, collect_call_references, definition_bindings, field_text,
-    innermost_scope, node_span, node_text, one_line_signature, push_binding, push_scope,
+    Extractor, MIN_REF_LEN, attach_reference_scopes, collect_call_references, definition_bindings,
+    field_text, innermost_scope, node_span, node_text, one_line_signature, push_binding, push_ref,
+    push_scope,
 };
 
 /// Tree-sitter query capturing explicit call-callee identifiers.
@@ -85,6 +86,8 @@ impl Extractor for RubyExtractor {
         let mut references =
             collect_call_references(&root, &ts_language, CALL_QUERY, Language::Ruby, bytes, file)?;
         collect_inheritance(&root, bytes, file, &mut references);
+        collect_read_references(&root, bytes, file, &mut references);
+        collect_write_references(&root, bytes, file, &mut references);
 
         let scopes = collect_scopes(&root, source.len());
         attach_reference_scopes(&mut references, &scopes);
@@ -246,6 +249,102 @@ fn collect_inheritance(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Refe
     // Recurse into all children so nested classes are covered.
     for child in node.children(&mut node.walk()) {
         collect_inheritance(&child, bytes, file, out);
+    }
+}
+
+// ── Edge richness: Read / Write ──────────────────────────────────────────────
+
+/// Returns `true` when `node` (an `identifier`) is in a position already handled
+/// by another collector and must NOT also be emitted as a [`RefRole::Read`].
+///
+/// Skipped positions:
+/// - `call` node's `method:` field — the callee identifier captured by `CALL_QUERY`
+///   as a [`RefRole::Call`] reference.
+/// - `method` / `singleton_method` `name:` field — the declaration name.
+/// - Any `identifier` directly inside `method_parameters` or `block_parameters`
+///   (positional params), or the `name:` field of `optional_parameter`,
+///   `keyword_parameter`, `splat_parameter`, `block_parameter`,
+///   `hash_splat_parameter` — all are parameter bindings, not reads.
+/// - `assignment` `left:` field when the left node is an `identifier` — handled
+///   by [`collect_write_references`].
+///
+/// Note: `instance_variable`, `class_variable`, `global_variable`, and `constant`
+/// are different node kinds from `identifier`; they are excluded naturally before
+/// this guard is reached.
+fn is_non_read_position(node: &Node) -> bool {
+    let parent = match node.parent() {
+        Some(p) => p,
+        None => return true, // root — not a read
+    };
+    match parent.kind() {
+        // Call callee: `obj.method(...)` — the `method:` field of a `call` node.
+        // (Paren-less calls like `helper` produce a bare `identifier`, NOT a `call`
+        // node; those are emitted as Read, and the resolver distinguishes them.)
+        "call" => parent.child_by_field_name("method").as_ref() == Some(node),
+        // Declaration names: `def foo` / `def self.foo`.
+        "method" | "singleton_method" => parent.child_by_field_name("name").as_ref() == Some(node),
+        // Positional parameter: bare `identifier` directly in method/block params.
+        "method_parameters" | "block_parameters" => true,
+        // Named parameter forms: skip the `name:` field identifier.
+        "optional_parameter"
+        | "keyword_parameter"
+        | "splat_parameter"
+        | "block_parameter"
+        | "hash_splat_parameter" => parent.child_by_field_name("name").as_ref() == Some(node),
+        // Assignment LHS — handled by collect_write_references.
+        "assignment" => parent.child_by_field_name("left").as_ref() == Some(node),
+        _ => false,
+    }
+}
+
+/// Recursively walk `node` and emit [`RefRole::Read`] references for bare
+/// `identifier` nodes used in value/expression positions.
+///
+/// In Ruby a bare `identifier` that is NOT a paren-less call (`call` with a
+/// `method:` field) is syntactically indistinguishable from a local-variable read.
+/// We emit a `Read` for every such identifier and let the Tier-B scope-walk
+/// resolver decide: if a binding is visible the edge resolves to that local; if
+/// no binding is visible the resolver falls back to `NameOnly` fan-out (treating
+/// it as a method call). This is the correct honest approach for a dynamically
+/// typed language.
+///
+/// Applies [`MIN_REF_LEN`]. Does not recurse into `identifier` children (there are
+/// none meaningful).
+fn collect_read_references(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    if node.kind() == "identifier" {
+        let name = node_text(node, bytes);
+        if name.len() >= MIN_REF_LEN && !is_non_read_position(node) {
+            push_ref(out, name, node, file, RefRole::Read);
+        }
+        // `identifier` leaves have no meaningful sub-nodes; return early.
+        return;
+    }
+    for child in node.children(&mut node.walk()) {
+        collect_read_references(&child, bytes, file, out);
+    }
+}
+
+/// Recursively walk `node` and emit [`RefRole::Write`] references for the
+/// bare-identifier LHS of `assignment` nodes (e.g. `x = 5`, `cnt = 0`).
+///
+/// Only bare local-name `identifier` LHS targets are covered in v1. Skipped:
+/// `instance_variable` / `class_variable` / `global_variable` / `constant` LHS
+/// (different node kinds), call-result LHS (`obj.prop = …` — `call` node),
+/// and element-reference LHS (`arr[i] = …` — `element_reference`). Applies
+/// [`MIN_REF_LEN`].
+fn collect_write_references(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    if node.kind() == "assignment" {
+        if let Some(lhs) = node.child_by_field_name("left") {
+            if lhs.kind() == "identifier" {
+                let name = node_text(&lhs, bytes);
+                if name.len() >= MIN_REF_LEN {
+                    push_ref(out, name, &lhs, file, RefRole::Write);
+                }
+            }
+        }
+    }
+    for child in node.children(&mut node.walk()) {
+        collect_write_references(&child, bytes, file, out);
     }
 }
 
@@ -814,6 +913,120 @@ end
         assert_ne!(
             scope_id, 0,
             "helper() Call ref scope must not be the module root"
+        );
+    }
+
+    // ── Edge richness: Read / Write ──────────────────────────────────────────
+
+    #[test]
+    fn ruby_read_ref_at_use_not_declaration() {
+        // `def f\n  base = 1\n  base\nend\n`
+        // The `base = 1` LHS is a Write; the bare `base` expression is a Read.
+        let src = "def f\n  base = 1\n  base\nend\n";
+        let facts = RubyExtractor.extract(src, "lib/f.rb").unwrap();
+
+        let read_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Read && r.name == "base")
+            .collect();
+        assert!(
+            !read_refs.is_empty(),
+            "expected at least one Read ref for 'base'; refs: {:?}",
+            facts
+                .references
+                .iter()
+                .map(|r| (&r.name, r.role))
+                .collect::<Vec<_>>()
+        );
+        // The bare `base` expression starts after the assignment line (byte > 15).
+        let use_ref = read_refs
+            .iter()
+            .find(|r| r.occ.byte > 15)
+            .expect("expected a Read ref for 'base' at the use site (byte > 15)");
+        assert!(
+            use_ref.occ.byte > 15,
+            "Read ref should be at the use site, not the declaration"
+        );
+    }
+
+    #[test]
+    fn ruby_write_ref_for_assignment() {
+        // `def f\n  cnt = 0\n  cnt = 5\nend\n` → at least one Write ref for "cnt".
+        let src = "def f\n  cnt = 0\n  cnt = 5\nend\n";
+        let facts = RubyExtractor.extract(src, "lib/f.rb").unwrap();
+
+        let write_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Write && r.name == "cnt")
+            .collect();
+        assert!(
+            !write_refs.is_empty(),
+            "expected at least one Write ref for 'cnt'; refs: {:?}",
+            facts
+                .references
+                .iter()
+                .map(|r| (&r.name, r.role))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn ruby_explicit_call_method_not_also_read() {
+        // `def f\n  obj.helper\nend\n`
+        // `helper` is the `method:` field of a `call` node → Call ref only, no Read.
+        // `obj` is a bare identifier in value position → Read ref.
+        let src = "def f\n  obj.helper\nend\n";
+        let facts = RubyExtractor.extract(src, "lib/f.rb").unwrap();
+
+        // `helper` must NOT appear as a Read ref (it's the call method name).
+        let helper_reads: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Read && r.name == "helper")
+            .collect();
+        assert!(
+            helper_reads.is_empty(),
+            "call method name 'helper' must NOT be a Read ref; got: {helper_reads:?}"
+        );
+
+        // `obj` IS a bare identifier in value position → must be a Read.
+        let obj_reads: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Read && r.name == "obj")
+            .collect();
+        assert!(
+            !obj_reads.is_empty(),
+            "receiver 'obj' should be a Read ref; refs: {:?}",
+            facts
+                .references
+                .iter()
+                .map(|r| (&r.name, r.role))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn ruby_ivar_not_a_local_read_or_write() {
+        // `def f\n  @val = 1\nend\n`
+        // The LHS is an `instance_variable` node, not `identifier` → no Read/Write
+        // ref named "val" (and no ref named "@val" either).
+        let src = "def f\n  @val = 1\nend\n";
+        let facts = RubyExtractor.extract(src, "lib/f.rb").unwrap();
+
+        let val_rw: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| {
+                matches!(r.role, RefRole::Read | RefRole::Write)
+                    && (r.name == "val" || r.name == "@val")
+            })
+            .collect();
+        assert!(
+            val_rw.is_empty(),
+            "instance variable '@val' must NOT produce a Read/Write identifier ref; got: {val_rw:?}"
         );
     }
 }
