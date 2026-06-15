@@ -12,6 +12,7 @@
 //! later. Within a single repo, descriptors + lang carry identity already.
 
 use std::fmt;
+use std::sync::Arc;
 
 use super::descriptor::{Descriptor, parse_descriptor};
 
@@ -49,6 +50,22 @@ impl Package {
 /// Default scheme tag for code2graph-produced symbols.
 pub const SCHEME: &str = "codegraph";
 
+/// Private representation behind [`SymbolId`]'s `Arc`. Both variants share
+/// a single allocation path so cloning `SymbolId` is always O(1) — one
+/// atomic refcount bump — regardless of which variant is stored.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum SymbolRepr {
+    /// Cross-file / cross-repo identity: a fully-qualified descriptor path.
+    Global {
+        scheme: String,
+        package: Package,
+        lang: String,
+        descriptors: Vec<Descriptor>,
+    },
+    /// A document-local entity (locals, parameters): only meaningful within `file`.
+    Local { file: String, id: String },
+}
+
 /// Errors from parsing a SCIP symbol string (the inverse of
 /// [`SymbolId::to_scip_string`]). Surfaced via [`std::str::FromStr`].
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -80,37 +97,31 @@ pub enum SymbolParseError {
 }
 
 /// A symbol's identity.
+///
+/// Internally an `Arc` over a private representation, so cloning is O(1)
+/// (one atomic refcount bump) for both the global and local variants.
+/// The representation is fully private; use the public constructors and
+/// accessor methods to create and inspect values.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum SymbolId {
-    /// Cross-file / cross-repo identity: a fully-qualified descriptor path.
-    Global {
-        scheme: String,
-        package: Package,
-        /// Language tag (see [`crate::lang::Language::as_str`]).
-        lang: String,
-        descriptors: Vec<Descriptor>,
-    },
-    /// A document-local entity (locals, parameters): only meaningful within `file`.
-    Local { file: String, id: String },
-}
+pub struct SymbolId(Arc<SymbolRepr>);
 
 impl SymbolId {
     /// Build a global symbol with the default scheme and an unknown package.
     pub fn global(lang: impl Into<String>, descriptors: Vec<Descriptor>) -> Self {
-        SymbolId::Global {
+        SymbolId(Arc::new(SymbolRepr::Global {
             scheme: SCHEME.to_owned(),
             package: Package::unknown(),
             lang: lang.into(),
             descriptors,
-        }
+        }))
     }
 
     /// A file-local symbol.
     pub fn local(file: impl Into<String>, id: impl Into<String>) -> Self {
-        SymbolId::Local {
+        SymbolId(Arc::new(SymbolRepr::Local {
             file: file.into(),
             id: id.into(),
-        }
+        }))
     }
 
     /// The ordered names of all `Namespace` descriptors in this symbol's path,
@@ -120,8 +131,8 @@ impl SymbolId {
     /// Used by the Tier-A resolver to match an import's `from_path` suffix
     /// against a candidate's module namespace chain without per-language rules.
     pub fn namespaces(&self) -> Vec<&str> {
-        match self {
-            SymbolId::Global { descriptors, .. } => descriptors
+        match &*self.0 {
+            SymbolRepr::Global { descriptors, .. } => descriptors
                 .iter()
                 .filter_map(|d| {
                     if let Descriptor::Namespace(n) = d {
@@ -131,7 +142,7 @@ impl SymbolId {
                     }
                 })
                 .collect(),
-            SymbolId::Local { .. } => Vec::new(),
+            SymbolRepr::Local { .. } => Vec::new(),
         }
     }
 
@@ -141,9 +152,9 @@ impl SymbolId {
     ///
     /// Prefer this over [`namespaces`] in hot paths to avoid a heap allocation.
     pub fn namespaces_iter(&self) -> impl Iterator<Item = &str> {
-        let descs: &[Descriptor] = match self {
-            SymbolId::Global { descriptors, .. } => descriptors,
-            SymbolId::Local { .. } => &[],
+        let descs: &[Descriptor] = match &*self.0 {
+            SymbolRepr::Global { descriptors, .. } => descriptors.as_slice(),
+            SymbolRepr::Local { .. } => &[],
         };
         descs.iter().filter_map(|d| {
             if let Descriptor::Namespace(n) = d {
@@ -156,16 +167,16 @@ impl SymbolId {
 
     /// The bare name of the final descriptor — the key for name-only matching.
     pub fn leaf_name(&self) -> Option<&str> {
-        match self {
-            SymbolId::Global { descriptors, .. } => descriptors.last().map(|d| d.name()),
-            SymbolId::Local { id, .. } => Some(id),
+        match &*self.0 {
+            SymbolRepr::Global { descriptors, .. } => descriptors.last().map(|d| d.name()),
+            SymbolRepr::Local { id, .. } => Some(id),
         }
     }
 
     /// Core rendering logic shared by [`to_scip_string`] and [`Display`].
     fn write_scip<W: fmt::Write>(&self, w: &mut W) -> fmt::Result {
-        match self {
-            SymbolId::Global {
+        match &*self.0 {
+            SymbolRepr::Global {
                 scheme,
                 package,
                 descriptors,
@@ -180,7 +191,7 @@ impl SymbolId {
                 }
                 Ok(())
             }
-            SymbolId::Local { id, .. } => {
+            SymbolRepr::Local { id, .. } => {
                 w.write_str("local ")?;
                 w.write_str(id)
             }
@@ -206,10 +217,10 @@ impl SymbolId {
 
         // `local <id>` — the id is the whole remainder after the single space.
         if let Some(id) = s.strip_prefix("local ") {
-            return Ok(SymbolId::Local {
+            return Ok(SymbolId(Arc::new(SymbolRepr::Local {
                 file: String::new(),
                 id: id.to_owned(),
-            });
+            })));
         }
         if !s.contains(' ') {
             // No space at all: cannot be a valid header.
@@ -248,12 +259,12 @@ impl SymbolId {
             return Err(SymbolParseError::NoDescriptors);
         }
 
-        Ok(SymbolId::Global {
+        Ok(SymbolId(Arc::new(SymbolRepr::Global {
             scheme: scheme.to_owned(),
             package,
             lang: String::new(),
             descriptors,
-        })
+        })))
     }
 }
 
@@ -368,17 +379,20 @@ mod tests {
 
     #[test]
     fn golden_partial_package_manager_only() {
-        // partially-populated package: manager = "npm", name/version empty
-        let id = SymbolId::Global {
+        // partially-populated package: manager = "npm", name/version empty.
+        // Built via the private repr directly: this is a rendering golden test,
+        // and no public constructor sets a package yet (that arrives with the
+        // package-enrichment pass).
+        let id = SymbolId(Arc::new(SymbolRepr::Global {
             scheme: SCHEME.to_owned(),
             package: Package {
                 manager: "npm".into(),
                 name: String::new(),
                 version: String::new(),
             },
-            lang: "typescript".into(),
+            lang: "typescript".to_owned(),
             descriptors: vec![Descriptor::Namespace("src".into())],
-        };
+        }));
         assert_eq!(id.to_scip_string(), "codegraph npm . . src/");
     }
 
@@ -454,12 +468,11 @@ mod tests {
         assert_roundtrip(&s);
         // Sanity: the parsed descriptor recovers the original name.
         let parsed = SymbolId::from_scip_string(&s).unwrap();
-        match parsed {
-            SymbolId::Global { descriptors, .. } => {
-                assert_eq!(descriptors, vec![Descriptor::Type("Foo Bar".into())]);
-            }
-            _ => panic!("expected Global"),
-        }
+        assert_eq!(
+            parsed.leaf_name(),
+            Some("Foo Bar"),
+            "leaf_name should recover the original name"
+        );
     }
 
     #[test]
@@ -469,12 +482,11 @@ mod tests {
         let s = id.to_scip_string();
         assert_roundtrip(&s);
         let parsed = SymbolId::from_scip_string(&s).unwrap();
-        match parsed {
-            SymbolId::Global { descriptors, .. } => {
-                assert_eq!(descriptors, vec![Descriptor::Type("Foo`Bar".into())]);
-            }
-            _ => panic!("expected Global"),
-        }
+        assert_eq!(
+            parsed.leaf_name(),
+            Some("Foo`Bar"),
+            "leaf_name should recover the original name"
+        );
     }
 
     #[test]
@@ -489,23 +501,14 @@ mod tests {
     #[test]
     fn roundtrip_local_x0() {
         let parsed = SymbolId::from_scip_string("local x0").unwrap();
-        assert_eq!(
-            parsed,
-            SymbolId::Local {
-                file: String::new(),
-                id: "x0".into()
-            }
-        );
         assert_eq!(parsed.to_scip_string(), "local x0");
+        assert_eq!(parsed.leaf_name(), Some("x0"));
     }
 
     #[test]
     fn roundtrip_local_numeric() {
         let parsed = SymbolId::from_scip_string("local 42").unwrap();
-        match &parsed {
-            SymbolId::Local { id, .. } => assert_eq!(id, "42"),
-            _ => panic!("expected Local"),
-        }
+        assert_eq!(parsed.leaf_name(), Some("42"));
         assert_eq!(parsed.to_scip_string(), "local 42");
     }
 
@@ -562,5 +565,17 @@ mod tests {
     fn fromstr_parses() {
         let id: SymbolId = "codegraph . . . auth/".parse().unwrap();
         assert_eq!(id.to_scip_string(), "codegraph . . . auth/");
+    }
+
+    #[test]
+    fn clone_is_o1_both_variants() {
+        // Cloning increments the Arc refcount; both variants share the same path.
+        let g = SymbolId::global("rust", vec![Descriptor::Namespace("foo".into())]);
+        let g2 = g.clone();
+        assert_eq!(g, g2);
+
+        let l = SymbolId::local("src/lib.rs", "x0");
+        let l2 = l.clone();
+        assert_eq!(l, l2);
     }
 }

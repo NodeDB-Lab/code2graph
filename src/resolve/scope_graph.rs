@@ -18,7 +18,7 @@
 //!   fakes precision.
 //! * **Local/param bindings** — a reference that resolves to a local variable or
 //!   parameter within the file's scopes produces a [`Confidence::Exact`] edge
-//!   whose target is a synthesized [`SymbolId::Local`]. Local/param resolution is
+//!   whose target is a synthesized local [`SymbolId`]. Local/param resolution is
 //!   the most certain kind: the inner-first scope walk guarantees the binding is
 //!   lexically pinned with no confounders (a local always shadows any same-name
 //!   import or definition in an outer scope).
