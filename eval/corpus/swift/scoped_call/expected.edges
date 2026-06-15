@@ -1,0 +1,6 @@
+# Same-file call: `main` calls `greet`, both defined in Greet.swift.
+# Proves Tier-B same-file Scoped resolution: the `greet()` call on line 6
+# resolves to the `func greet` definition on line 1, not fanning out to any
+# external same-named symbol. Swift captures non-private top-level functions
+# as Definition bindings (visibility gate in is_visible: no `private`/`fileprivate` modifier).
+Greet.swift:6 Call Greet.swift:1
