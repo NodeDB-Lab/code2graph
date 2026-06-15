@@ -25,15 +25,61 @@ pub(crate) struct GlobalIndex {
 }
 
 impl GlobalIndex {
+    /// An empty index (incremental path: grown by [`insert_symbols`]).
+    ///
+    /// [`insert_symbols`]: GlobalIndex::insert_symbols
+    pub(crate) fn new() -> Self {
+        Self {
+            by_name: HashMap::new(),
+        }
+    }
+
     /// Build from the full symbol set (batch path).
     pub(crate) fn from_symbols(symbols: &[Symbol]) -> Self {
-        let mut by_name: HashMap<String, Vec<SymbolId>> = HashMap::new();
+        let mut idx = Self::new();
+        idx.insert_symbols(symbols);
+        idx
+    }
+
+    /// Add `symbols` to the index: each symbol with a leaf name is pushed under
+    /// that name. The incremental store calls this whenever a file's subgraph is
+    /// (re)built — same mapping [`from_symbols`] uses, applied incrementally.
+    ///
+    /// [`from_symbols`]: GlobalIndex::from_symbols
+    pub(crate) fn insert_symbols(&mut self, symbols: &[Symbol]) {
         for s in symbols {
             if let Some(n) = s.id.leaf_name() {
-                by_name.entry(n.to_string()).or_default().push(s.id.clone());
+                self.by_name
+                    .entry(n.to_string())
+                    .or_default()
+                    .push(s.id.clone());
             }
         }
-        Self { by_name }
+    }
+
+    /// Remove `symbols` from the index: for each symbol with a leaf name, drop
+    /// ONE entry equal to its id from that name's bucket. The incremental store
+    /// calls this before re-building a changed file's subgraph, so the index
+    /// reflects only the current file set.
+    ///
+    /// Order within a bucket is irrelevant — [`unique_match`] is order-independent
+    /// and returns `None` on ambiguity — so removal uses `swap_remove`. A bucket
+    /// that empties is dropped so the map never leaks empty keys.
+    ///
+    /// [`unique_match`]: GlobalIndex::unique_match
+    pub(crate) fn remove_symbols(&mut self, symbols: &[Symbol]) {
+        for s in symbols {
+            if let Some(n) = s.id.leaf_name() {
+                if let Some(bucket) = self.by_name.get_mut(n) {
+                    if let Some(pos) = bucket.iter().position(|id| id == &s.id) {
+                        bucket.swap_remove(pos);
+                    }
+                    if bucket.is_empty() {
+                        self.by_name.remove(n);
+                    }
+                }
+            }
+        }
     }
 
     /// The UNIQUE SymbolId whose leaf name is `name` and whose namespace chain
@@ -47,6 +93,12 @@ impl GlobalIndex {
                 _ => None,                        // zero or ambiguous → no edge
             }
         })
+    }
+}
+
+impl Default for GlobalIndex {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -67,4 +119,47 @@ pub(crate) fn stitch(pending: &[PendingRef], index: &GlobalIndex) -> Vec<Edge> {
         }
     }
     edges
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::subgraph::build_subgraph;
+    use super::*;
+    use crate::extract::{Extractor, RustExtractor};
+
+    /// Insert-then-remove returns the index to a not-matching state: a name that
+    /// resolved uniquely before insertion no longer does after the matching
+    /// symbol is removed. This guards the incremental-maintenance contract the
+    /// store relies on.
+    #[test]
+    fn insert_then_remove_restores_no_match() {
+        // `conf::Config` defines the only `Config`; `app` imports it.
+        let conf = RustExtractor
+            .extract("pub struct Config {}", "src/conf.rs")
+            .unwrap();
+        let app = RustExtractor
+            .extract("use conf::Config;\npub fn run() {}", "src/app.rs")
+            .unwrap();
+
+        let conf_sub = build_subgraph(&conf);
+        let app_sub = build_subgraph(&app);
+
+        // With conf indexed, the import resolves to exactly one edge.
+        let mut index = GlobalIndex::new();
+        index.insert_symbols(&conf_sub.symbols);
+        let edges = stitch(&app_sub.pending, &index);
+        assert_eq!(
+            edges.len(),
+            1,
+            "import must resolve while conf::Config is indexed"
+        );
+
+        // Remove conf's symbols → the name no longer matches anything.
+        index.remove_symbols(&conf_sub.symbols);
+        let edges = stitch(&app_sub.pending, &index);
+        assert!(
+            edges.is_empty(),
+            "after removing conf::Config the import must resolve to no edge"
+        );
+    }
 }

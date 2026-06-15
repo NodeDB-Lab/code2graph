@@ -23,6 +23,7 @@ use super::super::{enclosing_symbol_index, normalize_from_path};
 /// A cross-file reference whose resolution is deferred to the stitch phase.
 /// Both qualified calls and imports reduce to "match `name` whose namespace
 /// chain ends with `segs`, uniquely" — they differ only in `role`.
+#[derive(Clone)]
 pub(crate) struct PendingRef {
     /// Caller (resolved intra-file).
     pub from: SymbolId,
@@ -35,6 +36,7 @@ pub(crate) struct PendingRef {
 }
 
 /// The resolution facts for ONE file, isolated from all other files.
+#[derive(Clone)]
 pub(crate) struct FileSubgraph {
     /// This file's symbols (a clone of `f.symbols`).
     pub symbols: Vec<Symbol>,

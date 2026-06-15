@@ -20,6 +20,7 @@ mod support;
 pub mod symbol_table;
 
 pub use ffi_bridge::FfiBridgeResolver;
+pub use incremental::IncrementalGraph;
 pub use resolver::Resolver;
 pub use scope_graph::ScopeGraphResolver;
 pub(crate) use support::{enclosing_symbol_index, namespaces_end_with, normalize_from_path};
