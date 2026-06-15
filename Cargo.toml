@@ -12,8 +12,14 @@ repository = "https://github.com/nodedb-lab/code2graph"
 keywords = ["code-graph", "tree-sitter", "static-analysis", "symbols", "cpg"]
 categories = ["development-tools", "parsing"]
 
+[features]
+manifest = ["dep:toml", "dep:serde", "dep:serde_json"]
+
 [dependencies]
 thiserror = "2"
+toml = { version = "0.8", optional = true }
+serde = { version = "1", optional = true, features = ["derive"] }
+serde_json = { version = "1", optional = true }
 tree-sitter = ">=0.24, <0.27"
 # Per-language grammars are added one at a time as extractors land.
 tree-sitter-rust = "0.23"

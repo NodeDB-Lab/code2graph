@@ -50,6 +50,7 @@ pub mod error;
 pub mod extract;
 pub mod graph;
 pub mod lang;
+pub mod package;
 pub mod resolve;
 pub mod symbol;
 

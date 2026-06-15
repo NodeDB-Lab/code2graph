@@ -124,6 +124,26 @@ impl SymbolId {
         }))
     }
 
+    /// Return a new `SymbolId` with `package` stamped in. `Global` variants get
+    /// the new package (scheme/lang/descriptors unchanged); `Local` variants are
+    /// returned unchanged (locals have no package coordinate).
+    pub fn with_package(&self, package: Package) -> SymbolId {
+        match &*self.0 {
+            SymbolRepr::Global {
+                scheme,
+                lang,
+                descriptors,
+                ..
+            } => SymbolId(Arc::new(SymbolRepr::Global {
+                scheme: scheme.clone(),
+                package,
+                lang: lang.clone(),
+                descriptors: descriptors.clone(),
+            })),
+            SymbolRepr::Local { .. } => self.clone(),
+        }
+    }
+
     /// The ordered names of all `Namespace` descriptors in this symbol's path,
     /// in declaration order (outermost first). Non-namespace descriptors (Type,
     /// Term, Method, …) are excluded. Returns an empty vec for `Local` symbols.
