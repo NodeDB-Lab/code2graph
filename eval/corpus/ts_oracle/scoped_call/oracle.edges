@@ -1,4 +1,4 @@
-# oracle: scip-typescript — location pairs (ref -> def), role-agnostic
+# oracle: SCIP index — location pairs (ref -> def), role-agnostic
 main.ts:1 alpha.ts:1
 main.ts:1 alpha.ts:5
 main.ts:3 alpha.ts:5

@@ -10,7 +10,7 @@
 //! SCIP reader, and writes `<case_dir>/oracle.edges` in the locked format:
 //!
 //! ```text
-//! # oracle: scip-typescript — location pairs (ref -> def), role-agnostic
+//! # oracle: SCIP index — location pairs (ref -> def), role-agnostic
 //! alpha.ts:1 main.ts:4
 //! ```
 
@@ -46,7 +46,7 @@ fn main() {
     };
 
     let mut out = String::from(
-        "# oracle: scip-typescript \u{2014} location pairs (ref -> def), role-agnostic\n",
+        "# oracle: SCIP index \u{2014} location pairs (ref -> def), role-agnostic\n",
     );
     for (ref_file, ref_line, def_file, def_line) in &edges {
         out.push_str(&format!("{ref_file}:{ref_line} {def_file}:{def_line}\n"));
