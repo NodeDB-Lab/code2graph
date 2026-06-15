@@ -1,0 +1,6 @@
+# Same-file call: `process` calls `helper`, both defined in main.php.
+# Proves Tier-B same-file Scoped resolution: the `helper()` call on line 3
+# resolves to the `function helper` definition on line 2, not fanning out to
+# any external same-named symbol. PHP captures all top-level functions as
+# Definition bindings.
+main.php:3 Call main.php:2

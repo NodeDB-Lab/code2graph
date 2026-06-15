@@ -25,12 +25,17 @@
 use tree_sitter::{Language as TsLanguage, Node, Parser};
 
 use crate::error::{CodegraphError, Result};
-use crate::graph::types::{ByteSpan, FileFacts, RefRole, Reference, Symbol, SymbolKind};
+use crate::graph::types::{
+    Binding, BindingKind, ByteSpan, FileFacts, RefRole, Reference, Scope, ScopeId, ScopeKind,
+    Symbol, SymbolKind,
+};
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
 
 use super::{
-    Extractor, child_text, collect_call_references, field_text, node_text, one_line_signature,
+    Extractor, attach_reference_scopes, child_text, collect_call_references, definition_bindings,
+    field_text, import_bindings, innermost_scope, node_span, node_text, one_line_signature,
+    push_binding, push_scope,
 };
 
 /// Tree-sitter query capturing call-callee identifiers.
@@ -69,8 +74,10 @@ impl Extractor for PhpExtractor {
         let bytes = source.as_bytes();
         let namespaces = php_namespaces(&root, bytes, file);
 
-        let mut symbols = Vec::new();
-        collect_defs(&root, &namespaces, bytes, file, &mut symbols);
+        let mut defs = Vec::new();
+        collect_defs(&root, &namespaces, bytes, file, &mut defs);
+        let def_bindings = definition_bindings(&defs);
+        let mut symbols = defs;
         symbols.push(super::module_symbol(
             Language::Php,
             &namespaces,
@@ -83,13 +90,19 @@ impl Extractor for PhpExtractor {
         collect_inheritance(&root, bytes, file, &mut references);
         collect_imports(&root, bytes, file, &mut references);
 
+        let scopes = collect_scopes(&root, source.len());
+        attach_reference_scopes(&mut references, &scopes);
+        let mut bindings = collect_bindings(&root, bytes, &scopes);
+        bindings.extend(def_bindings);
+        bindings.extend(import_bindings(&references, &scopes));
+
         Ok(FileFacts {
             file: file.to_owned(),
             lang: Language::Php.as_str().to_owned(),
             symbols,
             references,
-            scopes: Vec::new(),
-            bindings: Vec::new(),
+            scopes,
+            bindings,
             ffi_exports: Vec::new(),
         })
     }
@@ -395,6 +408,261 @@ fn collect_inheritance(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Refe
     }
 }
 
+// ── Scope tree (Tier-B) ──────────────────────────────────────────────────────
+
+/// Build the lexical scope tree for one PHP file.
+///
+/// `scopes[0]` is always the file-root `Module` scope spanning `[0, source_len)`.
+/// PHP opens scopes for:
+/// - `namespace_definition` (block form) → `Type` scope
+/// - Type declarations (`class_declaration`, `interface_declaration`,
+///   `trait_declaration`, `enum_declaration`) → `Type` scope
+/// - Function / method / closure / arrow-function definitions → `Function` scope
+/// - Bare `compound_statement` not already peeled as a function body → `Block`
+fn collect_scopes(root: &Node, source_len: usize) -> Vec<Scope> {
+    let mut scopes = Vec::new();
+    push_scope(
+        &mut scopes,
+        None,
+        ByteSpan {
+            start: 0,
+            end: source_len,
+        },
+        ScopeKind::Module,
+    );
+    for child in root.children(&mut root.walk()) {
+        scope_dfs(&child, 0, &mut scopes);
+    }
+    scopes
+}
+
+/// DFS opening scopes for PHP declaration nodes.
+///
+/// Uses the "peel-the-body" pattern so the body block does not double-open
+/// an extra scope.  Arrow functions are an exception: their body is a bare
+/// expression, so we recurse the whole node's children under the new scope.
+fn scope_dfs(node: &Node, parent_id: ScopeId, scopes: &mut Vec<Scope>) {
+    match node.kind() {
+        "namespace_definition" => {
+            // Block-form namespace: `namespace App { ... }` — open a Type scope
+            // and recurse the compound_statement body's CHILDREN.
+            // Statement-form namespace has no `body` field; recurse children
+            // under the same parent (no new scope).
+            if let Some(body) = node.child_by_field_name("body") {
+                let ns_id = push_scope(scopes, Some(parent_id), node_span(node), ScopeKind::Type);
+                for child in body.children(&mut body.walk()) {
+                    scope_dfs(&child, ns_id, scopes);
+                }
+            } else {
+                for child in node.children(&mut node.walk()) {
+                    scope_dfs(&child, parent_id, scopes);
+                }
+            }
+        }
+        "class_declaration"
+        | "interface_declaration"
+        | "trait_declaration"
+        | "enum_declaration" => {
+            let type_id = push_scope(scopes, Some(parent_id), node_span(node), ScopeKind::Type);
+            // Peel the body (declaration_list / enum_declaration_list).
+            if let Some(body) = node.child_by_field_name("body") {
+                for child in body.children(&mut body.walk()) {
+                    scope_dfs(&child, type_id, scopes);
+                }
+            }
+        }
+        "function_definition" | "method_declaration" | "anonymous_function" => {
+            let fn_id = push_scope(
+                scopes,
+                Some(parent_id),
+                node_span(node),
+                ScopeKind::Function,
+            );
+            // Abstract methods have no body — handle None.
+            if let Some(body) = node.child_by_field_name("body") {
+                for child in body.children(&mut body.walk()) {
+                    scope_dfs(&child, fn_id, scopes);
+                }
+            }
+        }
+        "arrow_function" => {
+            // Arrow function body is an `expression`, not a compound_statement.
+            // Recurse the whole node's children under the new Function scope.
+            let fn_id = push_scope(
+                scopes,
+                Some(parent_id),
+                node_span(node),
+                ScopeKind::Function,
+            );
+            for child in node.children(&mut node.walk()) {
+                scope_dfs(&child, fn_id, scopes);
+            }
+        }
+        "compound_statement" => {
+            // A bare block NOT already consumed as a function/method body.
+            let block_id = push_scope(scopes, Some(parent_id), node_span(node), ScopeKind::Block);
+            for child in node.children(&mut node.walk()) {
+                scope_dfs(&child, block_id, scopes);
+            }
+        }
+        _ => {
+            for child in node.children(&mut node.walk()) {
+                scope_dfs(&child, parent_id, scopes);
+            }
+        }
+    }
+}
+
+// ── Bindings (Tier-B) ────────────────────────────────────────────────────────
+
+/// Collect parameter and local-variable [`Binding`]s for one PHP file.
+///
+/// Covers:
+/// - `function_definition` / `method_declaration` / `anonymous_function` /
+///   `arrow_function` parameters → [`BindingKind::Param`].
+/// - `assignment_expression` with a `variable_name` on the left → [`BindingKind::Local`]
+///   (only when the innermost scope is `Function` or `Block`).
+/// - `foreach_statement` loop variables → [`BindingKind::Local`] (same guard).
+///
+/// Class properties (which live in a `Type` scope) are intentionally excluded
+/// from `Local` — they are covered by `definition_bindings` as `Definition`.
+fn collect_bindings(root: &Node, bytes: &[u8], scopes: &[Scope]) -> Vec<Binding> {
+    let mut out = Vec::new();
+    collect_bindings_dfs(root, bytes, scopes, &mut out);
+    out
+}
+
+fn collect_bindings_dfs(node: &Node, bytes: &[u8], scopes: &[Scope], out: &mut Vec<Binding>) {
+    match node.kind() {
+        "function_definition" | "method_declaration" | "anonymous_function" | "arrow_function" => {
+            if let Some(params) = node.child_by_field_name("parameters") {
+                collect_params(&params, bytes, scopes, out);
+            }
+            for child in node.children(&mut node.walk()) {
+                collect_bindings_dfs(&child, bytes, scopes, out);
+            }
+        }
+        "assignment_expression" => {
+            if let Some(left) = node.child_by_field_name("left") {
+                if left.kind() == "variable_name" {
+                    let name = child_text(&left, "name", bytes).unwrap_or_else(|| {
+                        node_text(&left, bytes).trim_start_matches('$').to_owned()
+                    });
+                    if !name.is_empty() {
+                        let intro = left.start_byte();
+                        if let Some(sid) = innermost_scope(intro, scopes) {
+                            if matches!(scopes[sid].kind, ScopeKind::Function | ScopeKind::Block) {
+                                push_binding(out, name, intro, BindingKind::Local, scopes);
+                            }
+                        }
+                    }
+                }
+            }
+            for child in node.children(&mut node.walk()) {
+                collect_bindings_dfs(&child, bytes, scopes, out);
+            }
+        }
+        "foreach_statement" => {
+            let body = node.child_by_field_name("body");
+            // named_children: the iterable is always the FIRST named child;
+            // remaining non-body children are the loop variable(s).
+            // `expression`, `pair`, `list_literal`, and `by_ref` are the grammar
+            // child types, but concrete kinds may be `variable_name`, `pair`, etc.
+            let mut first_seen = false;
+            for child in node.named_children(&mut node.walk()) {
+                // Skip the body node.
+                if let Some(ref b) = body {
+                    if child == *b {
+                        continue;
+                    }
+                }
+                // Skip the first named child (the iterable expression).
+                if !first_seen {
+                    first_seen = true;
+                    continue;
+                }
+                // Remaining children are the value (and optionally key) vars.
+                collect_foreach_var(&child, bytes, scopes, out);
+            }
+            // Recurse children for nested bindings inside the body.
+            for child in node.children(&mut node.walk()) {
+                collect_bindings_dfs(&child, bytes, scopes, out);
+            }
+        }
+        _ => {
+            for child in node.children(&mut node.walk()) {
+                collect_bindings_dfs(&child, bytes, scopes, out);
+            }
+        }
+    }
+}
+
+/// Recursively find `variable_name` leaves in a foreach loop-var node and emit
+/// `Local` bindings for each (applying the Function|Block scope guard).
+///
+/// Handles simple vars (`$item`), `by_ref` (`&$item`), `pair` (`$k => $v`),
+/// and `list_literal` destructuring.
+fn collect_foreach_var(node: &Node, bytes: &[u8], scopes: &[Scope], out: &mut Vec<Binding>) {
+    if node.kind() == "variable_name" {
+        let name = child_text(node, "name", bytes)
+            .unwrap_or_else(|| node_text(node, bytes).trim_start_matches('$').to_owned());
+        if !name.is_empty() {
+            let intro = node.start_byte();
+            if let Some(sid) = innermost_scope(intro, scopes) {
+                if matches!(scopes[sid].kind, ScopeKind::Function | ScopeKind::Block) {
+                    push_binding(out, name, intro, BindingKind::Local, scopes);
+                }
+            }
+        }
+        return;
+    }
+    for child in node.named_children(&mut node.walk()) {
+        collect_foreach_var(&child, bytes, scopes, out);
+    }
+}
+
+/// Emit a [`BindingKind::Param`] for each named parameter in a PHP
+/// `formal_parameters` node.
+///
+/// Handles `simple_parameter`, `variadic_parameter`, and
+/// `property_promotion_parameter` (constructor promotion). For
+/// `property_promotion_parameter`, the `name` field may be a `by_ref` node
+/// wrapping the `variable_name` — we descend one level in that case.
+/// Binding names are stored WITHOUT the leading `$`.
+fn collect_params(params: &Node, bytes: &[u8], scopes: &[Scope], out: &mut Vec<Binding>) {
+    for child in params.named_children(&mut params.walk()) {
+        match child.kind() {
+            "simple_parameter" | "variadic_parameter" | "property_promotion_parameter" => {
+                let Some(name_node) = child.child_by_field_name("name") else {
+                    continue;
+                };
+                // For property_promotion_parameter, `name` may be `by_ref` (e.g.
+                // `public int &$x`) which wraps the actual `variable_name`.
+                let var_node = if name_node.kind() == "by_ref" {
+                    name_node
+                        .named_children(&mut name_node.walk())
+                        .find(|c| c.kind() == "variable_name")
+                } else if name_node.kind() == "variable_name" {
+                    Some(name_node)
+                } else {
+                    None
+                };
+                let Some(var) = var_node else {
+                    continue;
+                };
+                let name = child_text(&var, "name", bytes)
+                    .unwrap_or_else(|| node_text(&var, bytes).trim_start_matches('$').to_owned());
+                if name.is_empty() {
+                    continue;
+                }
+                let intro = var.start_byte();
+                push_binding(out, name, intro, BindingKind::Param, scopes);
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Build a [`Symbol`] and push it onto `out`.
 fn push_symbol(
     out: &mut Vec<Symbol>,
@@ -663,6 +931,240 @@ function run() {
         assert!(
             names.contains(&"process"),
             "expected 'process' in {names:?}"
+        );
+    }
+
+    // ── Tier-B scope / binding tests ─────────────────────────────────────────
+
+    #[test]
+    fn func_params_emit_param_bindings() {
+        // `function greet(string $name, int $age) {}` → Param `name`, `age`.
+        let src = "<?php\nfunction greet(string $name, int $age) {}\n";
+        let facts = PhpExtractor.extract(src, "src/greet.php").unwrap();
+
+        let fn_scope_id = facts
+            .scopes
+            .iter()
+            .position(|s| s.kind == ScopeKind::Function)
+            .expect("expected a Function scope");
+
+        let mut param_names: Vec<(&str, ScopeId)> = facts
+            .bindings
+            .iter()
+            .filter(|b| b.kind == BindingKind::Param)
+            .map(|b| (b.name.as_str(), b.scope))
+            .collect();
+        param_names.sort_by_key(|(n, _)| *n);
+
+        assert_eq!(
+            param_names,
+            vec![("age", fn_scope_id), ("name", fn_scope_id)],
+            "expected Param bindings for age and name, got {param_names:?}"
+        );
+    }
+
+    #[test]
+    fn assignment_local_in_function() {
+        // `function f(): int { $r = 42; return $r; }` → Local `r` (not a Param).
+        let src = "<?php\nfunction f(): int { $r = 42; return $r; }\n";
+        let facts = PhpExtractor.extract(src, "src/f.php").unwrap();
+
+        let r = facts
+            .bindings
+            .iter()
+            .find(|b| b.kind == BindingKind::Local && b.name == "r")
+            .expect("expected a Local binding for 'r'");
+        assert_eq!(
+            facts.scopes[r.scope].kind,
+            ScopeKind::Function,
+            "Local 'r' should be in a Function scope"
+        );
+        assert!(
+            !facts
+                .bindings
+                .iter()
+                .any(|b| b.kind == BindingKind::Param && b.name == "r"),
+            "'r' must not be a Param binding"
+        );
+    }
+
+    #[test]
+    fn foreach_value_is_local() {
+        // `function run(array $items) { foreach ($items as $item) {} }`
+        // → Param `items`, Local `item`.
+        let src = "<?php\nfunction run(array $items) { foreach ($items as $item) {} }\n";
+        let facts = PhpExtractor.extract(src, "src/run.php").unwrap();
+
+        assert!(
+            facts
+                .bindings
+                .iter()
+                .any(|b| b.kind == BindingKind::Param && b.name == "items"),
+            "expected Param binding for 'items'"
+        );
+        assert!(
+            facts
+                .bindings
+                .iter()
+                .any(|b| b.kind == BindingKind::Local && b.name == "item"),
+            "expected Local binding for 'item'"
+        );
+    }
+
+    #[test]
+    fn class_property_is_definition_not_local() {
+        // `class Foo { public string $bar; }` → NO Local `bar`; Definition `bar` exists.
+        let src = "<?php\nclass Foo { public string $bar; }\n";
+        let facts = PhpExtractor.extract(src, "src/Foo.php").unwrap();
+
+        assert!(
+            !facts
+                .bindings
+                .iter()
+                .any(|b| b.kind == BindingKind::Local && b.name == "bar"),
+            "class property 'bar' must NOT be a Local binding"
+        );
+        assert!(
+            facts
+                .bindings
+                .iter()
+                .any(|b| b.kind == BindingKind::Definition && b.name == "bar"),
+            "expected a Definition binding for 'bar'"
+        );
+    }
+
+    #[test]
+    fn nesting_class_method_produces_correct_scopes() {
+        // `class S { public function h() { $x = 1; } }`
+        // → Type scope (class body) + Function scope (method); Local `x` in Function.
+        let src = "<?php\nclass S { public function h() { $x = 1; } }\n";
+        let facts = PhpExtractor.extract(src, "src/S.php").unwrap();
+
+        assert_eq!(
+            facts.scopes[0].kind,
+            ScopeKind::Module,
+            "scopes[0] must be Module"
+        );
+
+        let type_scope_id = facts
+            .scopes
+            .iter()
+            .position(|s| s.kind == ScopeKind::Type)
+            .expect("expected a Type scope for the class");
+        let fn_scope_id = facts
+            .scopes
+            .iter()
+            .position(|s| s.kind == ScopeKind::Function)
+            .expect("expected a Function scope for the method");
+
+        assert_eq!(
+            facts.scopes[type_scope_id].parent,
+            Some(0),
+            "Type scope parent must be Module (0)"
+        );
+        assert_eq!(
+            facts.scopes[fn_scope_id].parent,
+            Some(type_scope_id),
+            "Function scope parent must be the Type scope"
+        );
+
+        let x = facts
+            .bindings
+            .iter()
+            .find(|b| b.kind == BindingKind::Local && b.name == "x")
+            .expect("expected a Local binding for 'x'");
+        assert_eq!(
+            facts.scopes[x.scope].kind,
+            ScopeKind::Function,
+            "Local 'x' must be in a Function scope"
+        );
+    }
+
+    #[test]
+    fn namespace_body_type_scope_local_in_function() {
+        // `namespace App { function init() { $v = 1; } }`
+        // → Type scope for namespace; Local `v` in Function scope (NOT in Type scope).
+        let src = "<?php\nnamespace App { function init() { $v = 1; } }\n";
+        let facts = PhpExtractor.extract(src, "src/App.php").unwrap();
+
+        let v = facts
+            .bindings
+            .iter()
+            .find(|b| b.kind == BindingKind::Local && b.name == "v")
+            .expect("expected a Local binding for 'v'");
+        assert_eq!(
+            facts.scopes[v.scope].kind,
+            ScopeKind::Function,
+            "Local 'v' must be in a Function scope, not the namespace Type scope"
+        );
+    }
+
+    #[test]
+    fn closure_and_arrow_params() {
+        // `function f() { $g = function(int $x) { return $x; }; $h = fn(int $y) => $y; }`
+        // → Param `x` and `y`.
+        let src = "<?php\nfunction f() { $g = function(int $x) { return $x; }; $h = fn(int $y) => $y; }\n";
+        let facts = PhpExtractor.extract(src, "src/f.php").unwrap();
+
+        let params: Vec<&str> = facts
+            .bindings
+            .iter()
+            .filter(|b| b.kind == BindingKind::Param)
+            .map(|b| b.name.as_str())
+            .collect();
+        assert!(params.contains(&"x"), "expected Param 'x', got {params:?}");
+        assert!(params.contains(&"y"), "expected Param 'y', got {params:?}");
+    }
+
+    #[test]
+    fn constructor_promoted_param_is_param_not_local() {
+        // `class Box { public function __construct(public int $size) {} }`
+        // → Param `size`, not Local.
+        let src = "<?php\nclass Box { public function __construct(public int $size) {} }\n";
+        let facts = PhpExtractor.extract(src, "src/Box.php").unwrap();
+
+        assert!(
+            facts
+                .bindings
+                .iter()
+                .any(|b| b.kind == BindingKind::Param && b.name == "size"),
+            "expected Param binding for 'size'"
+        );
+        assert!(
+            !facts
+                .bindings
+                .iter()
+                .any(|b| b.kind == BindingKind::Local && b.name == "size"),
+            "'size' must not be a Local binding"
+        );
+    }
+
+    #[test]
+    fn same_file_call_ref_has_non_zero_scope() {
+        // `function helper(): int { return 0; }` called from `run()`.
+        // The `helper` Call ref must have scope == Some(non-zero).
+        let src = "<?php\nfunction helper(): int { return 0; }\nfunction run(): int { return helper(); }\n";
+        let facts = PhpExtractor.extract(src, "src/main.php").unwrap();
+
+        assert!(
+            facts
+                .bindings
+                .iter()
+                .any(|b| b.kind == BindingKind::Definition && b.name == "helper"),
+            "expected a Definition binding for 'helper'"
+        );
+
+        let helper_ref = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Call && r.name == "helper")
+            .expect("expected a Call ref for 'helper'");
+        let scope_id = helper_ref
+            .scope
+            .expect("helper() Call ref must have a scope attached");
+        assert_ne!(
+            scope_id, 0,
+            "helper() Call ref scope must not be the module root"
         );
     }
 }
