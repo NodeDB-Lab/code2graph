@@ -1,0 +1,6 @@
+# Same-file call: `main` calls `greet`, both defined in Greet.kt.
+# Proves Tier-B same-file Scoped resolution: the `greet()` call on line 8
+# resolves to the `fun greet` definition on line 3, not fanning out to any
+# external same-named symbol. Kotlin captures non-private top-level functions
+# as Definition bindings (visibility gate in is_visible: no `private` modifier).
+Greet.kt:8 Call Greet.kt:3

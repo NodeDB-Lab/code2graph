@@ -29,12 +29,17 @@
 use tree_sitter::{Language as TsLanguage, Node, Parser};
 
 use crate::error::{CodegraphError, Result};
-use crate::graph::types::{ByteSpan, FileFacts, RefRole, Reference, Symbol, SymbolKind};
+use crate::graph::types::{
+    Binding, BindingKind, ByteSpan, FileFacts, RefRole, Reference, Scope, ScopeId, ScopeKind,
+    Symbol, SymbolKind,
+};
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
 
 use super::{
-    Extractor, child_text, collect_call_references, field_text, node_text, one_line_signature,
+    Extractor, attach_reference_scopes, child_text, collect_call_references, definition_bindings,
+    field_text, import_bindings, innermost_scope, node_span, node_text, one_line_signature,
+    push_binding, push_scope,
 };
 
 /// Tree-sitter query capturing call-callee identifiers.
@@ -80,8 +85,10 @@ impl Extractor for KotlinExtractor {
             .map(Descriptor::Namespace)
             .collect();
 
-        let mut symbols = Vec::new();
-        collect_decls(root, &ns_descriptors, false, bytes, file, &mut symbols);
+        let mut defs = Vec::new();
+        collect_decls(root, &ns_descriptors, false, bytes, file, &mut defs);
+        let def_bindings = definition_bindings(&defs);
+        let mut symbols = defs;
         symbols.push(super::module_symbol(
             Language::Kotlin,
             &ns_strings,
@@ -100,13 +107,19 @@ impl Extractor for KotlinExtractor {
         collect_inheritance(&root, bytes, file, &mut references);
         collect_imports(&root, bytes, file, &mut references);
 
+        let scopes = collect_scopes(&root, source.len());
+        attach_reference_scopes(&mut references, &scopes);
+        let mut bindings = collect_bindings(&root, bytes, &scopes);
+        bindings.extend(def_bindings);
+        bindings.extend(import_bindings(&references, &scopes));
+
         Ok(FileFacts {
             file: file.to_owned(),
             lang: Language::Kotlin.as_str().to_owned(),
             symbols,
             references,
-            scopes: Vec::new(),
-            bindings: Vec::new(),
+            scopes,
+            bindings,
             ffi_exports: Vec::new(),
         })
     }
@@ -526,6 +539,266 @@ fn handle_secondary_constructor(
     );
 }
 
+// ── Scope tree (Tier-B) ──────────────────────────────────────────────────────
+
+/// Build the lexical scope tree for one Kotlin file.
+///
+/// `scopes[0]` is always the file-root `Module` scope spanning `[0, source_len)`.
+/// Kotlin opens scopes for class/object/companion declarations (`Type`), function
+/// and lambda bodies (`Function`), and bare blocks that are not a function body
+/// (`Block`).
+fn collect_scopes(root: &Node, source_len: usize) -> Vec<Scope> {
+    let mut scopes = Vec::new();
+    push_scope(
+        &mut scopes,
+        None,
+        ByteSpan {
+            start: 0,
+            end: source_len,
+        },
+        ScopeKind::Module,
+    );
+    for child in root.children(&mut root.walk()) {
+        scope_dfs(&child, 0, &mut scopes);
+    }
+    scopes
+}
+
+/// DFS opening scopes for Kotlin declaration nodes.
+///
+/// Uses the "peel-the-body" pattern so the body block does not re-open a
+/// redundant scope on top of the declaration scope.
+fn scope_dfs(node: &Node, parent_id: ScopeId, scopes: &mut Vec<Scope>) {
+    match node.kind() {
+        "class_declaration" | "object_declaration" | "companion_object" => {
+            let type_id = push_scope(scopes, Some(parent_id), node_span(node), ScopeKind::Type);
+            // Peel the body: recurse its children directly so the body node
+            // itself does not re-open a scope.
+            for child in node.children(&mut node.walk()) {
+                if matches!(child.kind(), "class_body" | "enum_class_body") {
+                    for body_child in child.children(&mut child.walk()) {
+                        scope_dfs(&body_child, type_id, scopes);
+                    }
+                }
+            }
+        }
+        "function_declaration" | "anonymous_function" => {
+            let fn_id = push_scope(
+                scopes,
+                Some(parent_id),
+                node_span(node),
+                ScopeKind::Function,
+            );
+            // Find the function_body child and peel it.
+            for child in node.children(&mut node.walk()) {
+                if child.kind() == "function_body" {
+                    // function_body is either a `block` or `= expression`.
+                    // If it is a block, peel its children; otherwise recurse
+                    // the expression directly.
+                    let mut found_block = false;
+                    for body_child in child.children(&mut child.walk()) {
+                        if body_child.kind() == "block" {
+                            found_block = true;
+                            for block_child in body_child.children(&mut body_child.walk()) {
+                                scope_dfs(&block_child, fn_id, scopes);
+                            }
+                        }
+                    }
+                    if !found_block {
+                        // Expression body (`= expr`): recurse children of function_body.
+                        for body_child in child.children(&mut child.walk()) {
+                            scope_dfs(&body_child, fn_id, scopes);
+                        }
+                    }
+                }
+            }
+        }
+        "secondary_constructor" => {
+            let fn_id = push_scope(
+                scopes,
+                Some(parent_id),
+                node_span(node),
+                ScopeKind::Function,
+            );
+            // secondary_constructor has a `block` child for its body.
+            for child in node.children(&mut node.walk()) {
+                if child.kind() == "block" {
+                    for block_child in child.children(&mut child.walk()) {
+                        scope_dfs(&block_child, fn_id, scopes);
+                    }
+                }
+            }
+        }
+        "lambda_literal" => {
+            let fn_id = push_scope(
+                scopes,
+                Some(parent_id),
+                node_span(node),
+                ScopeKind::Function,
+            );
+            // Lambda body is not separated into a named body node; all children
+            // (including lambda_parameters and statements) are direct children.
+            for child in node.children(&mut node.walk()) {
+                scope_dfs(&child, fn_id, scopes);
+            }
+        }
+        "block" => {
+            // A bare block NOT already consumed as a function body (e.g. if/when
+            // branch bodies, standalone blocks).
+            let block_id = push_scope(scopes, Some(parent_id), node_span(node), ScopeKind::Block);
+            for child in node.children(&mut node.walk()) {
+                scope_dfs(&child, block_id, scopes);
+            }
+        }
+        _ => {
+            for child in node.children(&mut node.walk()) {
+                scope_dfs(&child, parent_id, scopes);
+            }
+        }
+    }
+}
+
+// ── Bindings (Tier-B) ────────────────────────────────────────────────────────
+
+/// Collect parameter and local-variable [`Binding`]s for one Kotlin file.
+///
+/// Covers:
+/// - `function_declaration` / `anonymous_function` / `secondary_constructor`
+///   parameters (from `function_value_parameters`) → [`BindingKind::Param`].
+/// - `lambda_literal` parameters (from `lambda_parameters` →
+///   `variable_declaration`) → [`BindingKind::Param`].
+/// - `property_declaration` with `variable_declaration` inside a `Function` or
+///   `Block` scope → [`BindingKind::Local`]. Class-level properties (in `Type`
+///   scopes) are excluded by the scope-kind guard.
+/// - `for_statement` loop variable (`variable_declaration` direct child) →
+///   [`BindingKind::Local`].
+///
+/// Class properties at `Type` scope level are covered by [`definition_bindings`]
+/// as [`BindingKind::Definition`] and intentionally excluded here.
+fn collect_bindings(root: &Node, bytes: &[u8], scopes: &[Scope]) -> Vec<Binding> {
+    let mut out = Vec::new();
+    collect_bindings_dfs(root, bytes, scopes, &mut out);
+    out
+}
+
+fn collect_bindings_dfs(node: &Node, bytes: &[u8], scopes: &[Scope], out: &mut Vec<Binding>) {
+    match node.kind() {
+        "function_declaration" | "anonymous_function" | "secondary_constructor" => {
+            // Collect params from function_value_parameters child.
+            for child in node.children(&mut node.walk()) {
+                if child.kind() == "function_value_parameters" {
+                    collect_params(&child, bytes, scopes, out);
+                }
+            }
+            // Recurse into all children to pick up body bindings.
+            for child in node.children(&mut node.walk()) {
+                collect_bindings_dfs(&child, bytes, scopes, out);
+            }
+        }
+        "lambda_literal" => {
+            // Lambda params live in a `lambda_parameters` child; each param is a
+            // `variable_declaration` whose first `identifier` child is the name.
+            for child in node.children(&mut node.walk()) {
+                if child.kind() == "lambda_parameters" {
+                    for param in child.children(&mut child.walk()) {
+                        if param.kind() == "variable_declaration" {
+                            if let Some(ident) = param
+                                .children(&mut param.walk())
+                                .find(|c| c.kind() == "identifier")
+                            {
+                                let name = node_text(&ident, bytes);
+                                let intro = ident.start_byte();
+                                push_binding(
+                                    out,
+                                    name.to_owned(),
+                                    intro,
+                                    BindingKind::Param,
+                                    scopes,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            for child in node.children(&mut node.walk()) {
+                collect_bindings_dfs(&child, bytes, scopes, out);
+            }
+        }
+        "property_declaration" => {
+            // Emit Local only when inside a Function or Block scope.
+            // Class-level properties sit in a Type scope and are excluded by this
+            // guard — they are captured by definition_bindings as Definition.
+            for child in node.children(&mut node.walk()) {
+                if child.kind() == "variable_declaration" {
+                    if let Some(ident) = child
+                        .children(&mut child.walk())
+                        .find(|c| c.kind() == "identifier")
+                    {
+                        let intro = ident.start_byte();
+                        let sid = innermost_scope(intro, scopes).unwrap_or(0);
+                        if matches!(scopes[sid].kind, ScopeKind::Function | ScopeKind::Block) {
+                            let name = node_text(&ident, bytes);
+                            push_binding(out, name.to_owned(), intro, BindingKind::Local, scopes);
+                        }
+                    }
+                    break;
+                }
+            }
+            for child in node.children(&mut node.walk()) {
+                collect_bindings_dfs(&child, bytes, scopes, out);
+            }
+        }
+        "for_statement" => {
+            // The loop variable is a `variable_declaration` direct child.
+            for child in node.children(&mut node.walk()) {
+                if child.kind() == "variable_declaration" {
+                    if let Some(ident) = child
+                        .children(&mut child.walk())
+                        .find(|c| c.kind() == "identifier")
+                    {
+                        let intro = ident.start_byte();
+                        let sid = innermost_scope(intro, scopes).unwrap_or(0);
+                        if matches!(scopes[sid].kind, ScopeKind::Function | ScopeKind::Block) {
+                            let name = node_text(&ident, bytes);
+                            push_binding(out, name.to_owned(), intro, BindingKind::Local, scopes);
+                        }
+                    }
+                    break;
+                }
+            }
+            for child in node.children(&mut node.walk()) {
+                collect_bindings_dfs(&child, bytes, scopes, out);
+            }
+        }
+        _ => {
+            for child in node.children(&mut node.walk()) {
+                collect_bindings_dfs(&child, bytes, scopes, out);
+            }
+        }
+    }
+}
+
+/// Emit a [`BindingKind::Param`] for each named parameter in a Kotlin
+/// `function_value_parameters` node.
+///
+/// Each named child of kind `"parameter"` has an `identifier` child (the param
+/// name) as its first named child. `class_parameter` (primary constructor params)
+/// is intentionally not handled here.
+fn collect_params(params: &Node, bytes: &[u8], scopes: &[Scope], out: &mut Vec<Binding>) {
+    for child in params.named_children(&mut params.walk()) {
+        if child.kind() == "parameter" {
+            if let Some(ident) = child
+                .children(&mut child.walk())
+                .find(|c| c.kind() == "identifier")
+            {
+                let name = node_text(&ident, bytes);
+                let intro = ident.start_byte();
+                push_binding(out, name.to_owned(), intro, BindingKind::Param, scopes);
+            }
+        }
+    }
+}
+
 // ── Inheritance extraction ───────────────────────────────────────────────────
 
 /// Pre-order search returning the first descendant (or self) whose kind is
@@ -900,6 +1173,248 @@ fun main() {
         assert!(
             import_refs.is_empty(),
             "expected no Import refs for wildcard, got {import_refs:?}"
+        );
+    }
+
+    // ── Tier-B scope / binding tests ─────────────────────────────────────────
+
+    // Test B1: function params → Param bindings in a Function scope.
+    #[test]
+    fn func_params_emit_param_bindings() {
+        let src = "fun f(a: Int, b: String) {}";
+        let facts = extract(src, "src/F.kt");
+
+        let fn_scope_id = facts
+            .scopes
+            .iter()
+            .position(|s| s.kind == ScopeKind::Function)
+            .expect("expected a Function scope");
+
+        let mut param_names: Vec<(&str, ScopeId)> = facts
+            .bindings
+            .iter()
+            .filter(|b| b.kind == BindingKind::Param)
+            .map(|b| (b.name.as_str(), b.scope))
+            .collect();
+        param_names.sort_by_key(|(n, _)| *n);
+
+        assert_eq!(
+            param_names,
+            vec![("a", fn_scope_id), ("b", fn_scope_id)],
+            "expected Param bindings for a and b, got {param_names:?}"
+        );
+    }
+
+    // Test B2: local val inside function → Local binding in Function scope.
+    #[test]
+    fn local_val_emits_local_binding() {
+        let src = "fun f() { val x = 1 }";
+        let facts = extract(src, "src/F.kt");
+
+        let x = facts
+            .bindings
+            .iter()
+            .find(|b| b.kind == BindingKind::Local && b.name == "x")
+            .expect("expected a Local binding for 'x'");
+        assert!(
+            matches!(
+                facts.scopes[x.scope].kind,
+                ScopeKind::Function | ScopeKind::Block
+            ),
+            "x should be in a Function or Block scope, got {:?}",
+            facts.scopes[x.scope].kind
+        );
+    }
+
+    // Test B3: local var inside function → Local binding.
+    #[test]
+    fn local_var_emits_local_binding() {
+        let src = "fun f() { var y = 2 }";
+        let facts = extract(src, "src/F.kt");
+
+        let y = facts
+            .bindings
+            .iter()
+            .find(|b| b.kind == BindingKind::Local && b.name == "y")
+            .expect("expected a Local binding for 'y'");
+        assert!(
+            matches!(
+                facts.scopes[y.scope].kind,
+                ScopeKind::Function | ScopeKind::Block
+            ),
+            "y should be in a Function or Block scope, got {:?}",
+            facts.scopes[y.scope].kind
+        );
+    }
+
+    // Test B4: for-loop variable → Local binding.
+    #[test]
+    fn for_loop_var_emits_local_binding() {
+        let src = "fun f(xs: List<Int>) { for (x in xs) {} }";
+        let facts = extract(src, "src/F.kt");
+
+        let x = facts
+            .bindings
+            .iter()
+            .find(|b| b.kind == BindingKind::Local && b.name == "x")
+            .expect("expected a Local binding for for-loop 'x'");
+        assert!(
+            matches!(
+                facts.scopes[x.scope].kind,
+                ScopeKind::Function | ScopeKind::Block
+            ),
+            "for-loop x should be in a Function or Block scope, got {:?}",
+            facts.scopes[x.scope].kind
+        );
+    }
+
+    // Test B5: class property is NOT a Local but IS a Definition.
+    #[test]
+    fn class_property_not_local_but_is_definition() {
+        let src = "class C { val count: Int = 0 }";
+        let facts = extract(src, "src/C.kt");
+
+        assert!(
+            !facts
+                .bindings
+                .iter()
+                .any(|b| b.kind == BindingKind::Local && b.name == "count"),
+            "class property 'count' must NOT be a Local binding"
+        );
+        assert!(
+            facts
+                .bindings
+                .iter()
+                .any(|b| b.kind == BindingKind::Definition && b.name == "count"),
+            "class property 'count' must have a Definition binding"
+        );
+    }
+
+    // Test B6: nested class+fun produces Module → Type → Function scope chain.
+    #[test]
+    fn nested_class_fun_scope_chain() {
+        let src = "class C { fun f() {} }";
+        let facts = extract(src, "src/C.kt");
+
+        assert_eq!(
+            facts.scopes[0].kind,
+            ScopeKind::Module,
+            "scopes[0] must be Module"
+        );
+
+        let type_scope_id = facts
+            .scopes
+            .iter()
+            .position(|s| s.kind == ScopeKind::Type)
+            .expect("expected a Type scope");
+        let fn_scope_id = facts
+            .scopes
+            .iter()
+            .position(|s| s.kind == ScopeKind::Function)
+            .expect("expected a Function scope");
+
+        assert_eq!(
+            facts.scopes[type_scope_id].parent,
+            Some(0),
+            "Type scope parent should be Module (0)"
+        );
+        assert_eq!(
+            facts.scopes[fn_scope_id].parent,
+            Some(type_scope_id),
+            "Function scope parent should be the Type scope"
+        );
+    }
+
+    // Test B7: lambda params → Param binding in a Function scope (the lambda's).
+    #[test]
+    fn lambda_params_emit_param_bindings() {
+        let src = "fun f() { val g = { a: Int -> a + 1 } }";
+        let facts = extract(src, "src/F.kt");
+
+        let a = facts
+            .bindings
+            .iter()
+            .find(|b| b.kind == BindingKind::Param && b.name == "a")
+            .expect("expected a Param binding for lambda param 'a'");
+        assert_eq!(
+            facts.scopes[a.scope].kind,
+            ScopeKind::Function,
+            "lambda param 'a' should be in a Function scope"
+        );
+    }
+
+    // Test B8: object declaration with method → Type scope + nested Function scope.
+    #[test]
+    fn object_members_produce_type_and_function_scopes() {
+        let src = "object Reg { fun get() {} }";
+        let facts = extract(src, "src/Reg.kt");
+
+        let type_scope_id = facts
+            .scopes
+            .iter()
+            .position(|s| s.kind == ScopeKind::Type)
+            .expect("expected a Type scope for the object");
+        let fn_scope_id = facts
+            .scopes
+            .iter()
+            .position(|s| s.kind == ScopeKind::Function)
+            .expect("expected a Function scope for the method");
+
+        assert_eq!(
+            facts.scopes[type_scope_id].parent,
+            Some(0),
+            "object Type scope should be nested under Module"
+        );
+        assert_eq!(
+            facts.scopes[fn_scope_id].parent,
+            Some(type_scope_id),
+            "method Function scope should be nested under the Type scope"
+        );
+    }
+
+    // Test B9: same-file call ref has scope attached (non-zero = innermost scope).
+    #[test]
+    fn same_file_call_ref_has_scope() {
+        let src = "fun greet() {}\nfun main() { greet() }";
+        let facts = extract(src, "src/Greet.kt");
+
+        // greet should be defined
+        assert!(
+            by_name(&facts, "greet").is_some(),
+            "expected 'greet' Definition"
+        );
+
+        // The greet() call reference should have scope set to Some(non-zero).
+        let greet_ref = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Call && r.name == "greet")
+            .expect("expected a Call ref for 'greet'");
+        assert!(
+            greet_ref.scope.is_some() && greet_ref.scope != Some(0),
+            "greet() call ref should be in a non-root scope, got {:?}",
+            greet_ref.scope
+        );
+    }
+
+    // Test B10: import binding.
+    #[test]
+    fn import_emits_import_binding() {
+        let src = "import com.example.Service\nclass C";
+        let facts = extract(src, "src/C.kt");
+
+        assert!(
+            facts
+                .bindings
+                .iter()
+                .any(|b| b.kind == BindingKind::Import && b.name == "Service"),
+            "expected an Import binding named 'Service', got {:?}",
+            facts
+                .bindings
+                .iter()
+                .filter(|b| b.kind == BindingKind::Import)
+                .map(|b| b.name.as_str())
+                .collect::<Vec<_>>()
         );
     }
 }
