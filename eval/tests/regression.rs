@@ -124,6 +124,36 @@ fn scope_tier_beats_name_tier_on_precision_where_it_resolves() {
 }
 
 #[test]
+fn scip_oracle_c_scope_tier_resolves_more_without_faking() {
+    // C has no module/import system, so a build-free resolver cannot anchor a
+    // cross-file call (C's flat linker namespace vs our path-based identity).
+    // The honest, measurable C contribution is therefore *intra-file*: against an
+    // external scip-clang oracle, the scope tier resolves strictly more edges than
+    // name-only resolution — it scopes the in-function local/param reads that
+    // Tier-A cannot — while still inventing no edges (precision stays perfect).
+    let cases = corpus();
+    let a = per_language(&cases, &SymbolTableResolver);
+    let b = per_language(&cases, &ScopeGraphResolver);
+    let (Some(a_c), Some(b_c)) = (a.get("c_oracle"), b.get("c_oracle")) else {
+        panic!("corpus must include c_oracle cases");
+    };
+    assert!(
+        b_c.recall() > a_c.recall(),
+        "Tier-B recall ({:.2}) must beat Tier-A ({:.2}) on c_oracle",
+        b_c.recall(),
+        a_c.recall()
+    );
+    assert_eq!(
+        b_c.false_positives, 0,
+        "Tier-B emitted a false positive on c_oracle"
+    );
+    assert_eq!(
+        a_c.false_positives, 0,
+        "Tier-A emitted a false positive on c_oracle"
+    );
+}
+
+#[test]
 fn scip_oracle_tier_b_beats_tier_a_on_ambiguous_calls() {
     // Same thesis as `scope_tier_beats_name_tier_on_precision_where_it_resolves`,
     // but locked against an EXTERNAL SCIP oracle instead of hand-authored golden

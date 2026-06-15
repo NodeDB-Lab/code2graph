@@ -1,0 +1,6 @@
+# oracle: SCIP index — location pairs (ref -> def), role-agnostic
+calc.c:9 calc.c:5
+calc.c:10 calc.c:1
+calc.c:11 calc.c:6
+calc.c:11 calc.c:9
+calc.c:11 calc.c:10
