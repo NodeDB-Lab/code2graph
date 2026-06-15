@@ -16,7 +16,7 @@
 //!
 //! Fields are `<ref_file>:<ref_line> <ROLE> <def_file>:<def_line>`, where `ROLE`
 //! is a [`RefRole`] variant name (`Call`, `IsImplementation`, `Import`,
-//! `TypeRef`).
+//! `TypeRef`, `Read`, `Write`).
 
 use crate::score::ExpectedEdge;
 use code2graph::RefRole;
@@ -178,6 +178,8 @@ fn parse_role(s: &str) -> Option<RefRole> {
         "IsImplementation" => RefRole::IsImplementation,
         "Import" => RefRole::Import,
         "TypeRef" => RefRole::TypeRef,
+        "Read" => RefRole::Read,
+        "Write" => RefRole::Write,
         _ => return None,
     })
 }

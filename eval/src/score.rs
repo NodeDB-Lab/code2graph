@@ -102,10 +102,19 @@ pub fn score(graph: &CodeGraph, expected: &[ExpectedEdge]) -> Scorecard {
         def_loc.insert(sym.id.to_scip_string(), (sym.file.clone(), sym.line));
     }
 
+    // Only score emitted edges whose role is actually asserted by this case.
+    // Roles not mentioned in `expected` are invisible — neither TP nor FP —
+    // so adding new role variants never breaks existing cases.
+    let expected_roles: std::collections::HashSet<RefRole> =
+        expected.iter().map(|e| e.role).collect();
+
     let emitted: HashSet<ExpectedEdge> = graph
         .edges
         .iter()
         .filter_map(|e| {
+            if !expected_roles.contains(&e.role) {
+                return None;
+            }
             let (def_file, def_line) = def_loc.get(&e.to.to_scip_string())?;
             Some(ExpectedEdge {
                 ref_file: e.occ.file.clone(),
