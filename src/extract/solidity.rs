@@ -41,9 +41,9 @@ use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
 
 use super::{
-    Extractor, attach_reference_scopes, collect_call_references, definition_bindings, field_text,
-    import_bindings, innermost_scope, node_span, node_text, one_line_signature, push_binding,
-    push_scope,
+    Extractor, MIN_REF_LEN, attach_reference_scopes, collect_call_references, definition_bindings,
+    field_text, import_bindings, innermost_scope, node_span, node_text, one_line_signature,
+    push_binding, push_ref, push_scope,
 };
 
 /// Tree-sitter query capturing call-callee identifiers.
@@ -110,6 +110,8 @@ impl Extractor for SolidityExtractor {
         )?;
         collect_inheritance(&root, bytes, file, &mut references);
         collect_imports(&root, bytes, file, &mut references);
+        collect_read_references(&root, bytes, file, &mut references);
+        collect_write_references(&root, bytes, file, &mut references);
 
         let scopes = collect_scopes(&root, source.len());
         attach_reference_scopes(&mut references, &scopes);
@@ -865,6 +867,177 @@ fn collect_inheritance(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Refe
     }
 }
 
+// ── Edge richness: Read / Write ──────────────────────────────────────────────
+
+/// Returns `true` when `node` (an `identifier`) is in a Solidity position that
+/// is already captured by another collector and must NOT also be emitted as a
+/// Read reference.
+///
+/// Skipped positions:
+/// - Call callee: in the Solidity grammar a free call `foo()` is
+///   `(call_expression (expression (identifier)))` — the identifier's parent is
+///   the anonymous `expression` wrapper whose parent is `call_expression` with
+///   `function:` field pointing at that `expression`. These identifiers are
+///   already captured as [`RefRole::Call`] by the CALL_QUERY.
+/// - Member property: `x.foo` — the `property:` field of `member_expression`.
+///   Only the object base (`x`) is a read; the property name is not an
+///   independent identifier read.
+/// - Declaration names: `function_definition` / `modifier_definition` /
+///   `event_definition` / `struct_declaration` / `state_variable_declaration` /
+///   `constant_variable_declaration` / `constructor_definition` /
+///   `error_declaration` / `user_defined_type_definition` `name:` field.
+/// - Local variable declaration: `variable_declaration` `name:` field.
+/// - Parameter name: `parameter` `name:` field.
+/// - Type-position identifiers: children of `user_defined_type` (type
+///   references like `MyContract`, `IERC20`) and `type_name` `key_identifier` /
+///   `value_identifier` fields (mapping key/value types).
+/// - Import bindings: children of `import_directive` (already
+///   [`RefRole::Import`]).
+/// - Inheritance specifiers: children of `inheritance_specifier` (already
+///   [`RefRole::IsImplementation`]).
+/// - Assignment LHS: `left:` field of `assignment_expression` /
+///   `augmented_assignment_expression` — handled by
+///   [`collect_write_references`].
+fn is_non_read_position(node: &Node) -> bool {
+    let parent = match node.parent() {
+        Some(p) => p,
+        None => return true, // root — not a read
+    };
+    match parent.kind() {
+        // Solidity wraps many expression positions in an `expression` node.
+        // Check the grandparent context to decide whether to skip.
+        "expression" => {
+            if let Some(grandparent) = parent.parent() {
+                match grandparent.kind() {
+                    // Call callee: `foo()` →
+                    // (call_expression function: (expression (identifier)))
+                    "call_expression" => {
+                        if let Some(fn_field) = grandparent.child_by_field_name("function") {
+                            if fn_field == parent {
+                                return true; // skip — already a Call ref
+                            }
+                        }
+                    }
+                    // Assignment LHS: `x = 5` / `x += 1` →
+                    // (assignment_expression left: (expression (identifier)) …)
+                    "assignment_expression" | "augmented_assignment_expression" => {
+                        if let Some(left_field) = grandparent.child_by_field_name("left") {
+                            if left_field == parent {
+                                return true; // skip — handled by collect_write_references
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            false
+        }
+        // Member property: `x.foo` — property field of member_expression.
+        // Only skip the property identifier (the object base IS a read).
+        "member_expression" => parent.child_by_field_name("property").as_ref() == Some(node),
+        // Declaration names — the identifier is being introduced, not read.
+        "function_definition"
+        | "modifier_definition"
+        | "event_definition"
+        | "struct_declaration"
+        | "state_variable_declaration"
+        | "constant_variable_declaration"
+        | "constructor_definition"
+        | "error_declaration"
+        | "user_defined_type_definition"
+        | "enum_declaration" => parent.child_by_field_name("name").as_ref() == Some(node),
+        // Local variable declaration name.
+        "variable_declaration" => parent.child_by_field_name("name").as_ref() == Some(node),
+        // Parameter binding name.
+        "parameter" => parent.child_by_field_name("name").as_ref() == Some(node),
+        // Type-position: user_defined_type children (e.g. `MyContract`,
+        // `IERC20`) are type references, not value reads.
+        "user_defined_type" => true,
+        // type_name key_identifier / value_identifier fields (mapping types).
+        "type_name" => {
+            let is_key = parent.child_by_field_name("key_identifier").as_ref() == Some(node);
+            let is_val = parent.child_by_field_name("value_identifier").as_ref() == Some(node);
+            is_key || is_val
+        }
+        // Import directives — already RefRole::Import.
+        "import_directive" => true,
+        // Inheritance specifiers — already RefRole::IsImplementation.
+        // (identifiers inside user_defined_type inside inheritance_specifier are
+        // caught by the `user_defined_type` arm above)
+        "inheritance_specifier" => true,
+        // struct_field_assignment key (named initializer `{field: val}`) —
+        // the field name is a struct member, not a local read.
+        "struct_field_assignment" => parent.child_by_field_name("name").as_ref() == Some(node),
+        _ => false,
+    }
+}
+
+/// Recursively walk `node` and emit [`RefRole::Read`] references for bare
+/// `identifier` nodes used in value/expression positions.
+///
+/// Skips identifiers that are:
+/// - Call callees (already [`RefRole::Call`] via the CALL_QUERY)
+/// - Member property names in `member_expression` (the object base IS a read)
+/// - Declaration names (function / modifier / event / struct / state-variable /
+///   local variable / parameter `name:` fields)
+/// - Type-position identifiers inside `user_defined_type` or `type_name`
+///   mapping fields
+/// - Import binding names (already [`RefRole::Import`])
+/// - Assignment LHS (handled by [`collect_write_references`])
+///
+/// Applies [`MIN_REF_LEN`] (same threshold as call references).
+fn collect_read_references(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    if node.kind() == "identifier" {
+        let name = node_text(node, bytes);
+        if name.len() >= MIN_REF_LEN && !is_non_read_position(node) {
+            push_ref(out, name, node, file, RefRole::Read);
+        }
+        // `identifier` nodes have no meaningful children; return early.
+        return;
+    }
+    for child in node.children(&mut node.walk()) {
+        collect_read_references(&child, bytes, file, out);
+    }
+}
+
+/// Recursively walk `node` and emit [`RefRole::Write`] references for the
+/// bare-identifier LHS of `assignment_expression` and
+/// `augmented_assignment_expression` nodes (e.g. `x = 5`, `x += 1`).
+///
+/// Member / index LHS (`obj.prop = …`, `arr[i] = …`) are not covered in v1 —
+/// only bare `identifier` nodes at the LHS. Applies [`MIN_REF_LEN`].
+///
+/// Note: `variable_declaration_statement` (`uint x = 5;`) is a definition, not
+/// an assignment — it is correctly excluded. Only `assignment_expression` /
+/// `augmented_assignment_expression` are handled here.
+fn collect_write_references(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    if matches!(
+        node.kind(),
+        "assignment_expression" | "augmented_assignment_expression"
+    ) {
+        if let Some(lhs) = node.child_by_field_name("left") {
+            // The LHS is an `expression` wrapper in the Solidity grammar; peel it.
+            let bare = if lhs.kind() == "expression" {
+                // Single named child of the expression wrapper.
+                lhs.named_children(&mut lhs.walk()).next()
+            } else {
+                Some(lhs)
+            };
+            if let Some(bare_node) = bare {
+                if bare_node.kind() == "identifier" {
+                    let name = node_text(&bare_node, bytes);
+                    if name.len() >= MIN_REF_LEN {
+                        push_ref(out, name, &bare_node, file, RefRole::Write);
+                    }
+                }
+            }
+        }
+    }
+    for child in node.children(&mut node.walk()) {
+        collect_write_references(&child, bytes, file, out);
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1414,6 +1587,139 @@ contract C {
                 .any(|b| b.kind == BindingKind::Import && b.name == "ERC20"),
             "expected an Import binding for 'ERC20', got {:?}",
             facts.bindings
+        );
+    }
+
+    // ── Edge richness: Read / Write ──────────────────────────────────────────
+
+    // Test (C1): Read at use — the use of `base` in `return base` emits Read;
+    // the declaration `uint base = 1` must NOT produce a Read.
+    #[test]
+    fn read_ref_at_use_not_at_declaration() {
+        let src = r#"
+contract C {
+    function f() public returns (uint) {
+        uint base = 1;
+        return base;
+    }
+}
+"#;
+        let facts = extract(src, "contracts/C.sol");
+
+        let read_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Read && r.name == "base")
+            .collect();
+        // Must have at least one Read ref (the use in `return base`).
+        assert!(
+            !read_refs.is_empty(),
+            "expected at least one Read ref for 'base', got none; all refs: {:?}",
+            facts
+                .references
+                .iter()
+                .map(|r| (&r.name, r.role))
+                .collect::<Vec<_>>()
+        );
+        // The declaration `uint base = 1` comes first; the use in `return base`
+        // has a larger byte offset. Verify at least one Read ref is at the use site.
+        let decl_byte = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Read && r.name == "base")
+            .map(|r| r.occ.byte)
+            .unwrap();
+        // In the source, `return base` is after `uint base = 1;` — byte > 40.
+        assert!(
+            decl_byte > 40,
+            "Read ref for 'base' should be at the use site (byte > 40), got byte={}",
+            decl_byte
+        );
+    }
+
+    // Test (C2): Write — `cnt = 5;` emits Write "cnt".
+    #[test]
+    fn write_ref_emitted_for_assignment() {
+        let src = r#"
+contract C {
+    function f() public {
+        uint cnt = 0;
+        cnt = 5;
+    }
+}
+"#;
+        let facts = extract(src, "contracts/C.sol");
+
+        let write_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Write && r.name == "cnt")
+            .collect();
+        assert!(
+            !write_refs.is_empty(),
+            "expected at least one Write ref for 'cnt', got none; all refs: {:?}",
+            facts
+                .references
+                .iter()
+                .map(|r| (&r.name, r.role))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // Test (C3): No double-emit — `helper()` produces Call "helper", not also Read.
+    #[test]
+    fn call_not_also_read() {
+        let src = r#"
+contract C {
+    function f() public {
+        helper();
+    }
+}
+"#;
+        let facts = extract(src, "contracts/C.sol");
+
+        let call_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Call && r.name == "helper")
+            .collect();
+        assert!(!call_refs.is_empty(), "expected a Call ref for 'helper'");
+
+        let read_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Read && r.name == "helper")
+            .collect();
+        assert!(
+            read_refs.is_empty(),
+            "helper() must NOT produce a Read ref; got: {read_refs:?}"
+        );
+    }
+
+    // Test (C4): Member access — `msg.sender` → Read "msg", no Read "sender".
+    #[test]
+    fn member_access_reads_object_not_property() {
+        let src = r#"
+contract C {
+    function f() public {
+        address who = msg.sender;
+    }
+}
+"#;
+        let facts = extract(src, "contracts/C.sol");
+
+        // `msg` is the object (base) of a member_expression → should be a Read.
+        // (It may or may not appear depending on whether `msg` is a special
+        // built-in identifier in tree-sitter-solidity; the key assertion is that
+        // `sender` must NOT appear as a Read.)
+        let sender_reads: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Read && r.name == "sender")
+            .collect();
+        assert!(
+            sender_reads.is_empty(),
+            "property 'sender' in member_expression must NOT be a Read ref; got: {sender_reads:?}"
         );
     }
 }

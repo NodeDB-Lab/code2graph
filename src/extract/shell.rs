@@ -16,14 +16,16 @@ use tree_sitter::{Language as TsLanguage, Node, Parser};
 
 use crate::error::{CodegraphError, Result};
 use crate::graph::types::{
-    Binding, BindingKind, ByteSpan, FileFacts, Scope, ScopeId, ScopeKind, Symbol, SymbolKind,
+    Binding, BindingKind, ByteSpan, FileFacts, RefRole, Reference, Scope, ScopeId, ScopeKind,
+    Symbol, SymbolKind,
 };
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
 
 use super::{
-    Extractor, attach_reference_scopes, collect_call_references, definition_bindings, field_text,
-    innermost_scope, node_span, node_text, one_line_signature, push_binding, push_scope,
+    Extractor, MIN_REF_LEN, attach_reference_scopes, collect_call_references, definition_bindings,
+    field_text, innermost_scope, node_span, node_text, one_line_signature, push_binding, push_ref,
+    push_scope,
 };
 
 /// Tree-sitter query capturing command-name identifiers as call references.
@@ -76,6 +78,9 @@ impl Extractor for ShellExtractor {
             bytes,
             file,
         )?;
+
+        collect_read_references(&root, bytes, file, &mut references);
+        collect_write_references(&root, bytes, file, &mut references);
 
         let scopes = collect_scopes(&root, source.len());
         attach_reference_scopes(&mut references, &scopes);
@@ -154,6 +159,65 @@ fn collect_symbols(
         });
     }
     out
+}
+
+// ── Edge richness: Read / Write ─────────────────────────────────────────────
+
+/// Recursively walk `node` and emit [`RefRole::Read`] references for every
+/// `variable_name` node whose parent is a `simple_expansion` (`$var`) or
+/// `expansion` (`${var}`). These are the only positions where a `variable_name`
+/// represents a variable *read* in the bash grammar.
+///
+/// Assignment LHS variable names (the `name:` child of `variable_assignment`)
+/// are naturally excluded because their parent kind is `variable_assignment`,
+/// not `simple_expansion` or `expansion`.
+///
+/// Special/positional parameters (`$1`, `$?`, `$@`, …) are plain tokens — not
+/// `variable_name` nodes — so they are excluded automatically.
+///
+/// Applies [`MIN_REF_LEN`].
+fn collect_read_references(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    if node.kind() == "variable_name" {
+        if let Some(parent) = node.parent() {
+            if matches!(parent.kind(), "simple_expansion" | "expansion") {
+                let name = node_text(node, bytes);
+                if name.len() >= MIN_REF_LEN {
+                    push_ref(out, name, node, file, RefRole::Read);
+                }
+            }
+        }
+        // variable_name has no meaningful children for reads; return early.
+        return;
+    }
+    for child in node.children(&mut node.walk()) {
+        collect_read_references(&child, bytes, file, out);
+    }
+}
+
+/// Recursively walk `node` and emit [`RefRole::Write`] references for the
+/// `name:` field of every `variable_assignment` node whose name is a
+/// `variable_name` (not a subscript/array LHS, deferred to v2).
+///
+/// This covers both plain assignments (`count=5`) and those inside
+/// `declaration_command` (`local x=1`, `declare y=2`). The resolver's
+/// self-edge guard handles the case where a `local x=5` simultaneously
+/// defines and writes `x`.
+///
+/// Applies [`MIN_REF_LEN`].
+fn collect_write_references(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    if node.kind() == "variable_assignment" {
+        if let Some(name_node) = node.child_by_field_name("name") {
+            if name_node.kind() == "variable_name" {
+                let name = node_text(&name_node, bytes);
+                if name.len() >= MIN_REF_LEN {
+                    push_ref(out, name, &name_node, file, RefRole::Write);
+                }
+            }
+        }
+    }
+    for child in node.children(&mut node.walk()) {
+        collect_write_references(&child, bytes, file, out);
+    }
 }
 
 // ── Scope tree (Tier-B) ──────────────────────────────────────────────────────
@@ -454,5 +518,105 @@ mod tests {
             .find(|b| b.kind == BindingKind::Definition && b.name == "deploy")
             .expect("expected a Definition binding for 'deploy'");
         assert_eq!(b.scope, 0, "top-level def must bind in scope 0 (Module)");
+    }
+
+    // ── Edge richness: Read / Write ──────────────────────────────────────────
+
+    #[test]
+    fn read_via_simple_expansion() {
+        // `$conf` → simple_expansion → Read ref "conf".
+        let src = "setup() {\n  local conf=1\n  echo $conf\n}\n";
+        let facts = ShellExtractor.extract(src, "scripts/test.sh").unwrap();
+        let read_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Read && r.name == "conf")
+            .collect();
+        assert!(
+            !read_refs.is_empty(),
+            "expected Read ref for 'conf' via $conf expansion, got none; all refs: {:?}",
+            facts
+                .references
+                .iter()
+                .map(|r| (&r.name, r.role))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn read_via_brace_expansion() {
+        // `${name}` → expansion → Read ref "name".
+        let src = "f() {\n  local name=x\n  echo ${name}\n}\n";
+        let facts = ShellExtractor.extract(src, "scripts/test.sh").unwrap();
+        let read_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Read && r.name == "name")
+            .collect();
+        assert!(
+            !read_refs.is_empty(),
+            "expected Read ref for 'name' via ${{name}} expansion, got none; all refs: {:?}",
+            facts
+                .references
+                .iter()
+                .map(|r| (&r.name, r.role))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn write_via_variable_assignment() {
+        // `count=5` → variable_assignment → Write ref "count".
+        let src = "f() {\n  count=5\n}\n";
+        let facts = ShellExtractor.extract(src, "scripts/test.sh").unwrap();
+        let write_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Write && r.name == "count")
+            .collect();
+        assert!(
+            !write_refs.is_empty(),
+            "expected Write ref for 'count' from count=5 assignment, got none; all refs: {:?}",
+            facts
+                .references
+                .iter()
+                .map(|r| (&r.name, r.role))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn assignment_lhs_is_write_not_read() {
+        // `base=1` → exactly one Read "base" (from `$base`), zero Reads from the LHS.
+        let src = "f() {\n  base=1\n  echo $base\n}\n";
+        let facts = ShellExtractor.extract(src, "scripts/test.sh").unwrap();
+
+        let base_reads: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Read && r.name == "base")
+            .collect();
+        assert_eq!(
+            base_reads.len(),
+            1,
+            "expected exactly one Read ref for 'base' (from $base), got {}; refs: {:?}",
+            base_reads.len(),
+            facts
+                .references
+                .iter()
+                .filter(|r| r.name == "base")
+                .map(|r| (&r.name, r.role))
+                .collect::<Vec<_>>()
+        );
+
+        let base_writes: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Write && r.name == "base")
+            .collect();
+        assert!(
+            !base_writes.is_empty(),
+            "expected a Write ref for 'base' from base=1, got none"
+        );
     }
 }
