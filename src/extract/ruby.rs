@@ -16,7 +16,10 @@
 //! indistinguishable from local-variable reads at the tree-sitter level. Only
 //! explicit `call` nodes with a `method:` field are captured as references.
 //!
-//! References: callee identifiers of `(call method: (identifier) @callee)` nodes.
+//! References: callee identifiers of `call` nodes — both bare (`foo()`, no
+//! receiver) and receiver-qualified (`Recv.foo()`, where the receiver is
+//! captured as `@qualifier` and forwarded to the resolver for type-qualified
+//! resolution).
 
 use tree_sitter::{Node, Parser};
 
@@ -35,9 +38,18 @@ use super::{
 };
 
 /// Tree-sitter query capturing explicit call-callee identifiers.
+///
+/// Two mutually-exclusive patterns (split on the `receiver` field so a qualified
+/// call is never double-counted):
+/// - bare call `foo()` — `!receiver` asserts no receiver, captures `@callee`.
+/// - qualified call `Recv.foo()` — captures the receiver as `@qualifier` and the
+///   method as `@callee`, so the call resolves through its receiver (e.g. a module
+///   like `Alpha`) instead of fanning out across every same-named method.
 const CALL_QUERY: &str = r#"
-(call
-  method: (identifier) @callee)
+[
+  (call !receiver method: (identifier) @callee)
+  (call receiver: (_) @qualifier method: (identifier) @callee)
+]
 "#;
 
 /// Extracts Ruby symbols and references.
@@ -671,6 +683,35 @@ end
         let names: Vec<&str> = facts.references.iter().map(|r| r.name.as_str()).collect();
         assert!(names.contains(&"validate"));
         assert!(names.contains(&"process"));
+    }
+
+    #[test]
+    fn qualified_call_captures_receiver_as_qualifier() {
+        // `Alpha.compute` is one call to `compute` qualified by its receiver
+        // `Alpha` (a module), so the resolver can disambiguate it from a same-named
+        // method in another module. A bare `helper()` carries no qualifier.
+        let src = "def run\n  Alpha.compute\n  helper()\nend\n";
+        let facts = RubyExtractor.extract(src, "lib/main.rb").unwrap();
+
+        let compute = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Call && r.name == "compute")
+            .expect("expected a Call ref for 'compute'");
+        assert_eq!(
+            compute.qualifier.as_deref(),
+            Some("Alpha"),
+            "`Alpha.compute` must be qualified by `Alpha`"
+        );
+        let helper = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Call && r.name == "helper")
+            .expect("expected a Call ref for 'helper'");
+        assert_eq!(
+            helper.qualifier, None,
+            "a bare `helper()` call must have no qualifier"
+        );
     }
 
     #[test]
