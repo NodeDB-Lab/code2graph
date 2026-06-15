@@ -71,6 +71,19 @@ pub(crate) fn field_text(node: &Node, field: &str, bytes: &[u8]) -> Option<Strin
 /// (e.g. an `import`) is attributed to it by the resolver's span-containment rule.
 /// Every file gets exactly one; when the namespace path is empty (a root file),
 /// the file stem is used so the identity stays stable and unique.
+/// The module name a file's [`module_symbol`] is identified by: the leaf of the
+/// namespace path, or the file stem when the path is empty (e.g. crate-root
+/// files like `lib.rs`/`main.rs`). Extractors that need to reference a file's own
+/// module (e.g. a Rust `crate::` anchor) derive the name through this so it
+/// matches the symbol exactly and resolves against the Tier-B module index.
+pub(crate) fn module_name(namespaces: &[String], file: &str) -> String {
+    if let Some(leaf) = namespaces.last() {
+        return leaf.clone();
+    }
+    let stem = file.rsplit('/').next().unwrap_or(file);
+    stem.split('.').next().unwrap_or(stem).to_owned()
+}
+
 pub(crate) fn module_symbol(
     lang: Language,
     namespaces: &[String],
@@ -82,16 +95,10 @@ pub(crate) fn module_symbol(
         .cloned()
         .map(Descriptor::Namespace)
         .collect();
-    if descriptors.is_empty() {
-        let stem = file.rsplit('/').next().unwrap_or(file);
-        let stem = stem.split('.').next().unwrap_or(stem);
-        if !stem.is_empty() {
-            descriptors.push(Descriptor::Namespace(stem.to_owned()));
-        }
+    let name = module_name(namespaces, file);
+    if descriptors.is_empty() && !name.is_empty() {
+        descriptors.push(Descriptor::Namespace(name.clone()));
     }
-    let name = descriptors
-        .last()
-        .map_or_else(String::new, |d| d.name().to_owned());
     Symbol {
         id: SymbolId::global(lang.as_str(), descriptors),
         name,

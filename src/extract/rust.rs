@@ -452,34 +452,73 @@ fn collect_module_decl_refs(node: &Node, bytes: &[u8], file: &str, out: &mut Vec
     }
 }
 
-/// Emit a [`RefRole::ModuleRef`] for the immediate module segment that precedes
-/// the leaf of a use-path: the last segment of a `scoped_identifier`'s `path`
-/// field. For `crate::alpha::helper` this is `alpha`; the occurrence is the
-/// `alpha` identifier so its line/byte point at that segment.
+/// Emit a [`RefRole::ModuleRef`] for **every** module segment that precedes the
+/// imported leaf of a use-path. Given the `path` field of a leaf
+/// `scoped_identifier{ path, name }` (where `name` is the imported leaf, already
+/// emitted as an `Import`), this walks the entire `path` chain and emits one
+/// `ModuleRef` per module segment. For `crate::a::b::helper` the leaf is
+/// `helper` and the segments are `crate`, `a`, `b`; for `a::b::c::Thing` they are
+/// `a`, `b`, `c`. Each occurrence is positioned at *that* segment's own node, so
+/// edge locations point at the precise segment rather than the whole path.
 ///
-/// Path *anchors* (`crate`, `self`, `super`, `Self`) are intentionally skipped
-/// in v1 — they never name a resolvable local module. (External roots like
-/// `std` are *not* anchors and are still emitted; the resolver simply finds no
-/// matching local module and emits no edge — an honest no-op.)
-fn push_use_module_ref(path: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
-    // The immediate module segment is the last identifier of `path`: the whole
-    // node when `path` is a bare `identifier`, or its `name` field when `path`
-    // is itself a `scoped_identifier`.
-    let seg = match path.kind() {
-        "identifier" => *path,
+/// The chain is processed deepest-first: when `path` is itself a
+/// `scoped_identifier{ path: inner, name: seg }` we recurse into `inner` before
+/// emitting `seg`. The innermost node determines the base case by kind:
+/// - `identifier` → emit a `ModuleRef` named after it.
+/// - `crate` → in a **crate-root file** (`lib.rs`, `main.rs`, `mod.rs`) it names
+///   *this very file's* module, so emit a `ModuleRef` named after this file's own
+///   module symbol, positioned at the `crate` keyword — letting Tier-B resolve it
+///   to the file's per-file module. In a **non-root** file `crate` refers to a
+///   *different* file (the crate root, which this extractor cannot identify from a
+///   single file), so it is skipped — an honest limitation, not a wrong edge.
+/// - `self` / `super` / `Self` / `metavariable` / anything else → skip; they
+///   never name a resolvable local module.
+///
+/// (External roots like `std` are *not* anchors and are still emitted as plain
+/// `identifier` segments; the resolver simply finds no matching local module and
+/// emits no edge — an honest no-op.)
+fn push_path_module_refs(path: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    match path.kind() {
         "scoped_identifier" => {
-            let Some(name_node) = path.child_by_field_name("name") else {
+            // Process the deeper prefix first so segments are emitted in path
+            // order, then the segment named by this node's `name` field.
+            if let Some(inner) = path.child_by_field_name("path") {
+                push_path_module_refs(&inner, bytes, file, out);
+            }
+            let Some(seg) = path.child_by_field_name("name") else {
                 return;
             };
-            name_node
+            let name = node_text(&seg, bytes);
+            if matches!(name, "crate" | "self" | "super" | "Self") {
+                return;
+            }
+            push_ref(out, name, &seg, file, RefRole::ModuleRef);
         }
-        _ => return, // keyword nodes (`crate`, `self`, `super`, …) and other unrecognised forms: skip
-    };
-    let name = node_text(&seg, bytes);
-    if matches!(name, "crate" | "self" | "super" | "Self") {
-        return;
+        "identifier" => {
+            push_ref(out, node_text(path, bytes), path, file, RefRole::ModuleRef);
+        }
+        // The `crate` keyword anchor: in a crate-root file it names this file's
+        // own module, so emit a ModuleRef for it positioned at the keyword.
+        "crate" if is_crate_root(file) => {
+            push_ref(out, &self_module_name(file), path, file, RefRole::ModuleRef);
+        }
+        // `self`/`super`/`Self`/`crate`(non-root)/`metavariable`/other: skip.
+        _ => {}
     }
-    push_ref(out, name, &seg, file, RefRole::ModuleRef);
+}
+
+/// Whether `file` is a crate-root file — its basename is `lib.rs`, `main.rs`, or
+/// `mod.rs` (matches both a bare `lib.rs` and a path like `src/lib.rs`).
+fn is_crate_root(file: &str) -> bool {
+    let base = file.rsplit('/').next().unwrap_or(file);
+    matches!(base, "lib.rs" | "main.rs" | "mod.rs")
+}
+
+/// This file's own module-symbol name, derived through the shared
+/// [`super::module_name`] so the emitted ModuleRef name equals the file's module
+/// symbol and therefore resolves against the Tier-B module index.
+fn self_module_name(file: &str) -> String {
+    super::module_name(&rust_namespaces(file), file)
 }
 
 /// Recursively collect leaf import names from a use-tree node and push an
@@ -519,13 +558,16 @@ fn collect_use_leaves(
         }
         "scoped_identifier" => {
             // The node's `path` field is the authoritative from-path.
-            let from_path = node
-                .child_by_field_name("path")
-                .map_or("", |n| super::node_text(&n, bytes));
-            // Emit a ModuleRef for the module segment immediately before the leaf
-            // (e.g. `alpha` in `crate::alpha::helper`); anchors are skipped inside.
-            if let Some(path_node) = node.child_by_field_name("path") {
-                push_use_module_ref(&path_node, bytes, file, out);
+            // Bind once: used both for from_path text and for ModuleRef emission.
+            let path_node = node.child_by_field_name("path");
+            let from_path = path_node
+                .as_ref()
+                .map_or("", |n| super::node_text(n, bytes));
+            // Emit a ModuleRef for every module segment preceding the leaf
+            // (e.g. `crate`/`alpha` in `crate::alpha::helper`); anchors are
+            // resolved/skipped inside per the file's crate-root status.
+            if let Some(ref pn) = path_node {
+                push_path_module_refs(pn, bytes, file, out);
             }
             if let Some(name_node) = node.child_by_field_name("name") {
                 super::push_import_ref(
@@ -1320,9 +1362,12 @@ impl std::fmt::Display for Point {
 
     #[test]
     fn use_path_segment_emits_module_ref_and_keeps_import_leaf() {
-        // `use crate::alpha::helper;` → ModuleRef("alpha") + Import("helper").
+        // `use crate::alpha::helper;` in a NON-root file → ModuleRef("alpha")
+        // (the `crate` anchor is skipped on non-root files) + Import("helper").
+        // Uses src/foo.rs so the assertion isolates the path-segment emission
+        // from the crate-root self-module ref (covered separately).
         let src = "use crate::alpha::helper;";
-        let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
+        let facts = RustExtractor.extract(src, "src/foo.rs").unwrap();
 
         let module_refs: Vec<&str> = facts
             .references
@@ -1351,10 +1396,11 @@ impl std::fmt::Display for Point {
 
     #[test]
     fn use_path_anchor_emits_no_module_ref() {
-        // `use crate::helper;` → only the Import for "helper"; the `crate`
-        // anchor produces NO ModuleRef.
+        // `use crate::helper;` in a NON-root file → only the Import for
+        // "helper"; the `crate` anchor produces NO ModuleRef (in a non-root
+        // file `crate` names a different file, not this one).
         let src = "use crate::helper;";
-        let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
+        let facts = RustExtractor.extract(src, "src/foo.rs").unwrap();
 
         let module_refs: Vec<&str> = facts
             .references
@@ -1365,6 +1411,143 @@ impl std::fmt::Display for Point {
         assert!(
             module_refs.is_empty(),
             "expected no ModuleRef for an anchor, got {module_refs:?}"
+        );
+
+        let import_names: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Import)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert_eq!(
+            import_names,
+            vec!["helper"],
+            "expected Import ['helper'], got {import_names:?}"
+        );
+    }
+
+    #[test]
+    fn crate_anchor_in_root_file_emits_self_module_ref() {
+        // `use crate::alpha::helper;` in a crate-root file (lib.rs) → the
+        // `crate` anchor names THIS file's own module, so we emit a ModuleRef
+        // "lib" (the crate root's module-symbol name) alongside the existing
+        // ModuleRef "alpha" and the Import "helper".
+        let src = "use crate::alpha::helper;";
+        let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
+
+        let module_refs: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::ModuleRef)
+            .map(|r| r.name.as_str())
+            .collect();
+        let mut sorted = module_refs.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            sorted,
+            vec!["alpha", "lib"],
+            "expected ModuleRefs == {{lib, alpha}}, got {module_refs:?}"
+        );
+
+        let import_names: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Import)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert_eq!(
+            import_names,
+            vec!["helper"],
+            "expected Import ['helper'], got {import_names:?}"
+        );
+    }
+
+    #[test]
+    fn crate_anchor_root_file_single_segment() {
+        // `use crate::helper;` in a crate-root file (lib.rs) → the only module
+        // segment is the `crate` anchor, which resolves to this file's own
+        // module "lib"; the leaf "helper" stays an Import.
+        let src = "use crate::helper;";
+        let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
+
+        let module_refs: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::ModuleRef)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert_eq!(
+            module_refs,
+            vec!["lib"],
+            "expected ModuleRef ['lib'], got {module_refs:?}"
+        );
+
+        let import_names: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Import)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert_eq!(
+            import_names,
+            vec!["helper"],
+            "expected Import ['helper'], got {import_names:?}"
+        );
+    }
+
+    #[test]
+    fn deep_use_path_emits_every_module_segment() {
+        // `use a::b::c::Thing;` → a ModuleRef for each of the three module
+        // segments (a, b, c) and a single Import for the leaf `Thing`. The
+        // recursive walk must reach the innermost `a`, not just the pre-leaf `c`.
+        let src = "use a::b::c::Thing;";
+        let facts = RustExtractor.extract(src, "src/foo.rs").unwrap();
+
+        let mut module_refs: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::ModuleRef)
+            .map(|r| r.name.as_str())
+            .collect();
+        module_refs.sort_unstable();
+        assert_eq!(
+            module_refs,
+            vec!["a", "b", "c"],
+            "expected ModuleRefs ['a','b','c'], got {module_refs:?}"
+        );
+
+        let import_names: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Import)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert_eq!(
+            import_names,
+            vec!["Thing"],
+            "expected Import ['Thing'], got {import_names:?}"
+        );
+    }
+
+    #[test]
+    fn crate_anchor_in_non_root_file_skipped() {
+        // Same source in a NON-root file (src/foo.rs) → the `crate` anchor
+        // refers to a DIFFERENT file (the crate root), which this extractor
+        // cannot identify, so NO ModuleRef is emitted for it. Only the "alpha"
+        // segment ModuleRef and the "helper" Import remain.
+        let src = "use crate::alpha::helper;";
+        let facts = RustExtractor.extract(src, "src/foo.rs").unwrap();
+
+        let module_refs: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::ModuleRef)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert_eq!(
+            module_refs,
+            vec!["alpha"],
+            "expected only ModuleRef ['alpha'] (crate anchor skipped), got {module_refs:?}"
         );
 
         let import_names: Vec<&str> = facts
