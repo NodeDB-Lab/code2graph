@@ -122,3 +122,31 @@ fn scope_tier_beats_name_tier_on_precision_where_it_resolves() {
         );
     }
 }
+
+#[test]
+fn scip_oracle_tier_b_beats_tier_a_on_ambiguous_calls() {
+    // Same thesis as `scope_tier_beats_name_tier_on_precision_where_it_resolves`,
+    // but locked against an EXTERNAL SCIP oracle instead of hand-authored golden
+    // edges: on the oracle lanes that include an ambiguous-call case
+    // ("rust_oracle", "py_oracle", "ts_oracle"), Tier-B must be strictly more
+    // precise than Tier-A and invent no edges. "go_oracle" is excluded — it has
+    // no ambiguous_call case, so name resolution never fans out there.
+    let cases = corpus();
+    let a = per_language(&cases, &SymbolTableResolver);
+    let b = per_language(&cases, &ScopeGraphResolver);
+    for lang in ["rust_oracle", "py_oracle", "ts_oracle"] {
+        let (Some(a_l), Some(b_l)) = (a.get(lang), b.get(lang)) else {
+            panic!("corpus must include {lang} cases");
+        };
+        assert!(
+            b_l.precision() > a_l.precision(),
+            "Tier-B precision ({:.2}) must beat Tier-A ({:.2}) on {lang}",
+            b_l.precision(),
+            a_l.precision()
+        );
+        assert_eq!(
+            b_l.false_positives, 0,
+            "Tier-B emitted a false positive on {lang}"
+        );
+    }
+}
