@@ -106,6 +106,23 @@ pub(crate) fn build_subgraph(f: &FileFacts) -> FileSubgraph {
         };
         let from = symbols[from_idx].id.clone();
 
+        // MODULE REFERENCE: a `mod x;` declaration or an intermediate module
+        // segment of an import path names a MODULE itself. It resolves by unique
+        // module name (v1: empty `segs` — an ambiguous module name yields no
+        // edge, honestly). Module decls / use-paths are module-level, so this is
+        // NOT gated on `r.scope`; it is deferred for the module-only stitch path.
+        if r.role == RefRole::ModuleRef {
+            pending.push(PendingRef {
+                from,
+                name: r.name.clone(),
+                segs: Vec::new(),
+                role: RefRole::ModuleRef,
+                occ: r.occ.clone(),
+                confidence: Confidence::Scoped,
+            });
+            continue;
+        }
+
         // QUALIFIED CALL: explicit written path → unique global namespace-suffix
         // match. Bypasses scope_walk entirely (this is a path lookup, not
         // lexical resolution). Deferred to the stitch phase as a PendingRef.
