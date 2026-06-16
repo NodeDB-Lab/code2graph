@@ -111,6 +111,12 @@ pub fn csharp() -> Language {
     tree_sitter_c_sharp::LANGUAGE.into()
 }
 
+#[cfg(feature = "scala")]
+/// Returns the tree-sitter grammar for Scala.
+pub fn scala() -> Language {
+    tree_sitter_scala::LANGUAGE.into()
+}
+
 #[cfg(test)]
 mod tests {
     use tree_sitter::{LANGUAGE_VERSION, MIN_COMPATIBLE_LANGUAGE_VERSION};
@@ -159,5 +165,7 @@ mod tests {
         check("hcl", super::hcl());
         #[cfg(feature = "csharp")]
         check("csharp", super::csharp());
+        #[cfg(feature = "scala")]
+        check("scala", super::scala());
     }
 }

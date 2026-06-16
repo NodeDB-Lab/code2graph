@@ -31,6 +31,8 @@ use super::PythonExtractor;
 use super::RubyExtractor;
 #[cfg(feature = "rust")]
 use super::RustExtractor;
+#[cfg(feature = "scala")]
+use super::ScalaExtractor;
 #[cfg(feature = "shell")]
 use super::ShellExtractor;
 #[cfg(feature = "solidity")]
@@ -94,6 +96,8 @@ pub fn extract_file(lang: Language, source: &str, file: &str) -> Result<FileFact
         Language::Hcl => HclExtractor.extract(source, file),
         #[cfg(feature = "typescript")]
         Language::TypeScript => TypeScriptExtractor.extract(source, file),
+        #[cfg(feature = "scala")]
+        Language::Scala => ScalaExtractor.extract(source, file),
         _ => Err(CodegraphError::UnsupportedLanguage(format!(
             "{} (grammar feature disabled)",
             lang.as_str()

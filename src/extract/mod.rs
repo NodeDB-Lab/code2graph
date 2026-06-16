@@ -36,6 +36,8 @@ pub mod python;
 pub mod ruby;
 #[cfg(feature = "rust")]
 pub mod rust;
+#[cfg(feature = "scala")]
+pub mod scala;
 #[cfg(feature = "shell")]
 pub mod shell;
 #[cfg(feature = "solidity")]
@@ -73,6 +75,8 @@ pub use python::PythonExtractor;
 pub use ruby::RubyExtractor;
 #[cfg(feature = "rust")]
 pub use rust::RustExtractor;
+#[cfg(feature = "scala")]
+pub use scala::ScalaExtractor;
 #[cfg(feature = "shell")]
 pub use shell::ShellExtractor;
 #[cfg(feature = "solidity")]

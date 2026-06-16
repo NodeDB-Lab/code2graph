@@ -13,7 +13,7 @@ keywords = ["code-graph", "tree-sitter", "static-analysis", "symbols", "cpg"]
 categories = ["development-tools", "parsing"]
 
 [features]
-default = ["rust","python","typescript","go","java","c","cpp","ruby","php","shell","swift","kotlin","solidity","sql","hcl","csharp"]
+default = ["rust","python","typescript","go","java","c","cpp","ruby","php","shell","swift","kotlin","solidity","sql","hcl","csharp","scala"]
 manifest = ["dep:toml", "dep:serde", "dep:serde_json"]
 rust = ["dep:tree-sitter-rust"]
 python = ["dep:tree-sitter-python"]
@@ -31,6 +31,7 @@ solidity = ["dep:tree-sitter-solidity"]
 sql = ["dep:tree-sitter-sequel"]
 hcl = ["dep:tree-sitter-hcl"]
 csharp = ["dep:tree-sitter-c-sharp"]
+scala = ["dep:tree-sitter-scala"]
 
 [dependencies]
 thiserror = "2"
@@ -55,6 +56,7 @@ tree-sitter-solidity = { version = "1.2.13", optional = true }
 tree-sitter-sequel = { version = "0.3", optional = true }
 tree-sitter-hcl = { version = "1.1", optional = true }
 tree-sitter-c-sharp = { version = "0.23.5", optional = true }
+tree-sitter-scala = { version = "0.26.0", optional = true }
 
 [profile.release]
 opt-level = 3

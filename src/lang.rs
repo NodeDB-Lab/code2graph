@@ -25,6 +25,7 @@ pub enum Language {
     Sql,        // .sql
     Hcl,        // .tf, .hcl, .tfvars
     CSharp,     // .cs
+    Scala,      // .scala, .sc
 }
 
 impl Language {
@@ -48,6 +49,7 @@ impl Language {
             Language::Sql => "sql",
             Language::Hcl => "hcl",
             Language::CSharp => "csharp",
+            Language::Scala => "scala",
         }
     }
 
@@ -71,6 +73,7 @@ impl Language {
             "sql" => Some(Self::Sql),
             "tf" | "hcl" | "tfvars" => Some(Self::Hcl),
             "cs" => Some(Self::CSharp),
+            "scala" | "sc" => Some(Self::Scala),
             _ => None,
         }
     }
