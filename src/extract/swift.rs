@@ -30,12 +30,12 @@ use crate::graph::types::{
     Symbol, SymbolKind, TypeRefContext, Visibility,
 };
 use crate::lang::Language;
-use crate::symbol::{Descriptor, SymbolId};
+use crate::symbol::Descriptor;
 
 use super::{
-    Extractor, MIN_REF_LEN, attach_reference_scopes, collect_call_references, definition_bindings,
-    field_text, import_bindings, innermost_scope, node_span, node_text, one_line_signature,
-    push_binding, push_ref, push_scope, push_type_ref,
+    ExtractCtx, Extractor, MIN_REF_LEN, attach_reference_scopes, collect_call_references,
+    definition_bindings, field_text, import_bindings, innermost_scope, make_symbol, node_span,
+    node_text, one_line_signature, push_binding, push_ref, push_scope, push_type_ref,
 };
 
 /// Tree-sitter query capturing call-callee identifiers.
@@ -74,6 +74,11 @@ impl Extractor for SwiftExtractor {
 
         let root = tree.root_node();
         let bytes = source.as_bytes();
+        let ctx = ExtractCtx {
+            bytes,
+            file,
+            lang: Language::Swift,
+        };
         let ns_strings = swift_namespaces(file);
         let ns_descriptors: Vec<Descriptor> = ns_strings
             .iter()
@@ -82,7 +87,7 @@ impl Extractor for SwiftExtractor {
             .collect();
 
         let mut defs = Vec::new();
-        collect_decls(root, &ns_descriptors, bytes, file, &mut defs);
+        collect_decls(root, &ns_descriptors, &ctx, &mut defs);
         let def_bindings = definition_bindings(&defs);
         let mut symbols = defs;
         symbols.push(super::module_symbol(
@@ -265,31 +270,27 @@ fn collect_imports(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Referenc
 
 /// Build a [`Symbol`] and push it onto `out`.
 ///
-/// `(kind, visibility)` is collapsed into a single tuple parameter so the
-/// total argument count stays ≤ 7 (avoids the `clippy::too_many_arguments`
-/// lint).
+/// Delegates to [`make_symbol`] from `support.rs`; the signature stop-chars
+/// for Swift are `['{', '\n']`.
 fn push_symbol(
     out: &mut Vec<Symbol>,
+    ctx: &ExtractCtx,
     node: &Node,
     name: String,
-    (kind, visibility): (SymbolKind, Visibility),
+    kind: SymbolKind,
+    visibility: Visibility,
     descriptors: Vec<Descriptor>,
-    bytes: &[u8],
-    file: &str,
 ) {
-    out.push(Symbol {
-        id: SymbolId::global(Language::Swift.as_str(), descriptors),
+    let signature = one_line_signature(node_text(node, ctx.bytes), &['{', '\n']);
+    out.push(make_symbol(
+        ctx,
+        node,
         name,
         kind,
         visibility,
-        file: file.to_owned(),
-        line: (node.start_position().row + 1) as u32,
-        span: ByteSpan {
-            start: node.start_byte(),
-            end: node.end_byte(),
-        },
-        signature: one_line_signature(node_text(node, bytes), &['{', '\n']),
-    });
+        descriptors,
+        signature,
+    ));
 }
 
 // ── Declaration collection ───────────────────────────────────────────────────
@@ -299,26 +300,20 @@ fn push_symbol(
 /// `prefix` is the descriptor list up to (but not including) the current level.
 /// For top-level: prefix = file-path Namespace descriptors.
 /// For type members: prefix = file-path Namespaces + Type(name).
-fn collect_decls(
-    container: Node,
-    prefix: &[Descriptor],
-    bytes: &[u8],
-    file: &str,
-    out: &mut Vec<Symbol>,
-) {
+fn collect_decls(container: Node, prefix: &[Descriptor], ctx: &ExtractCtx, out: &mut Vec<Symbol>) {
     // A function declared inside a type body should be SymbolKind::Method.
     let inside_type = matches!(prefix.last(), Some(Descriptor::Type(_)));
 
     let mut cursor = container.walk();
     for child in container.children(&mut cursor) {
         match child.kind() {
-            "class_declaration" => handle_class_declaration(child, prefix, bytes, file, out),
-            "protocol_declaration" => handle_protocol_declaration(child, prefix, bytes, file, out),
-            "function_declaration" => handle_function(child, prefix, bytes, file, out, inside_type),
-            "init_declaration" => handle_init(child, prefix, bytes, file, out),
-            "property_declaration" => handle_property(child, prefix, bytes, file, out),
-            "typealias_declaration" => handle_typealias(child, prefix, bytes, file, out),
-            "enum_entry" => handle_enum_entry(child, prefix, bytes, file, out),
+            "class_declaration" => handle_class_declaration(child, prefix, ctx, out),
+            "protocol_declaration" => handle_protocol_declaration(child, prefix, ctx, out),
+            "function_declaration" => handle_function(child, prefix, ctx, out, inside_type),
+            "init_declaration" => handle_init(child, prefix, ctx, out),
+            "property_declaration" => handle_property(child, prefix, ctx, out),
+            "typealias_declaration" => handle_typealias(child, prefix, ctx, out),
+            "enum_entry" => handle_enum_entry(child, prefix, ctx, out),
             _ => {}
         }
     }
@@ -328,17 +323,16 @@ fn collect_decls(
 fn handle_class_declaration(
     node: Node,
     prefix: &[Descriptor],
-    bytes: &[u8],
-    file: &str,
+    ctx: &ExtractCtx,
     out: &mut Vec<Symbol>,
 ) {
-    let visibility = read_visibility(&node, bytes);
-    let kind_text = field_text(&node, "declaration_kind", bytes).unwrap_or_default();
+    let visibility = read_visibility(&node, ctx.bytes);
+    let kind_text = field_text(&node, "declaration_kind", ctx.bytes).unwrap_or_default();
     let name_node = match node.child_by_field_name("name") {
         Some(n) => n,
         None => return,
     };
-    let type_name = match leaf_type_name(name_node, bytes) {
+    let type_name = match leaf_type_name(name_node, ctx.bytes) {
         Some(n) => n,
         None => return,
     };
@@ -353,7 +347,7 @@ fn handle_class_declaration(
         // using the file-path prefix (same as if the type were defined here).
         let mut member_prefix = prefix.to_vec();
         member_prefix.push(Descriptor::Type(type_name));
-        collect_decls(body, &member_prefix, bytes, file, out);
+        collect_decls(body, &member_prefix, ctx, out);
         return;
     }
 
@@ -370,28 +364,27 @@ fn handle_class_declaration(
     type_descriptors.push(Descriptor::Type(type_name.clone()));
     push_symbol(
         out,
+        ctx,
         &node,
         type_name,
-        (sym_kind, visibility),
+        sym_kind,
+        visibility,
         type_descriptors.clone(),
-        bytes,
-        file,
     );
 
     // Recurse into body for members.
-    collect_decls(body, &type_descriptors, bytes, file, out);
+    collect_decls(body, &type_descriptors, ctx, out);
 }
 
 /// Handle `protocol_declaration`.
 fn handle_protocol_declaration(
     node: Node,
     prefix: &[Descriptor],
-    bytes: &[u8],
-    file: &str,
+    ctx: &ExtractCtx,
     out: &mut Vec<Symbol>,
 ) {
-    let visibility = read_visibility(&node, bytes);
-    let type_name = match field_text(&node, "name", bytes) {
+    let visibility = read_visibility(&node, ctx.bytes);
+    let type_name = match field_text(&node, "name", ctx.bytes) {
         Some(n) => n,
         None => return,
     };
@@ -400,18 +393,18 @@ fn handle_protocol_declaration(
     type_descriptors.push(Descriptor::Type(type_name.clone()));
     push_symbol(
         out,
+        ctx,
         &node,
         type_name,
-        (SymbolKind::Interface, visibility),
+        SymbolKind::Interface,
+        visibility,
         type_descriptors.clone(),
-        bytes,
-        file,
     );
 
     // protocol_declaration has a `body` field whose kind is `protocol_body`.
     // protocol_body itself has a `body` field (inner compound_statement-like node).
     if let Some(proto_body) = node.child_by_field_name("body") {
-        collect_protocol_members(proto_body, &type_descriptors, bytes, file, out);
+        collect_protocol_members(proto_body, &type_descriptors, ctx, out);
     }
 }
 
@@ -424,16 +417,15 @@ fn handle_protocol_declaration(
 fn collect_protocol_members(
     body: Node,
     prefix: &[Descriptor],
-    bytes: &[u8],
-    file: &str,
+    ctx: &ExtractCtx,
     out: &mut Vec<Symbol>,
 ) {
     let mut cursor = body.walk();
     for member in body.children(&mut cursor) {
         match member.kind() {
             "protocol_function_declaration" => {
-                let visibility = read_visibility(&member, bytes);
-                let name = match field_text(&member, "name", bytes) {
+                let visibility = read_visibility(&member, ctx.bytes);
+                let name = match field_text(&member, "name", ctx.bytes) {
                     Some(n) => n,
                     None => continue,
                 };
@@ -444,20 +436,20 @@ fn collect_protocol_members(
                 });
                 push_symbol(
                     out,
+                    ctx,
                     &member,
                     name,
-                    (SymbolKind::Method, visibility),
+                    SymbolKind::Method,
+                    visibility,
                     descriptors,
-                    bytes,
-                    file,
                 );
             }
             "protocol_property_declaration" => {
-                let visibility = read_visibility(&member, bytes);
+                let visibility = read_visibility(&member, ctx.bytes);
                 // field `name` on protocol_property_declaration is a `pattern` node
                 let name = match member.child_by_field_name("name") {
                     Some(pat) => match pat.child_by_field_name("bound_identifier") {
-                        Some(bi) => node_text(&bi, bytes).to_owned(),
+                        Some(bi) => node_text(&bi, ctx.bytes).to_owned(),
                         None => continue,
                     },
                     None => continue,
@@ -466,12 +458,12 @@ fn collect_protocol_members(
                 descriptors.push(Descriptor::Term(name.clone()));
                 push_symbol(
                     out,
+                    ctx,
                     &member,
                     name,
-                    (SymbolKind::Const, visibility),
+                    SymbolKind::Const,
+                    visibility,
                     descriptors,
-                    bytes,
-                    file,
                 );
             }
             _ => {}
@@ -486,14 +478,13 @@ fn collect_protocol_members(
 fn handle_function(
     node: Node,
     prefix: &[Descriptor],
-    bytes: &[u8],
-    file: &str,
+    ctx: &ExtractCtx,
     out: &mut Vec<Symbol>,
     inside_type: bool,
 ) {
-    let visibility = read_visibility(&node, bytes);
+    let visibility = read_visibility(&node, ctx.bytes);
     // field `name` is usually a simple_identifier; for operators it may not be.
-    let name = match field_text(&node, "name", bytes) {
+    let name = match field_text(&node, "name", ctx.bytes) {
         Some(n) => n,
         None => return,
     };
@@ -507,20 +498,12 @@ fn handle_function(
         name: name.clone(),
         disambiguator: String::new(),
     });
-    push_symbol(
-        out,
-        &node,
-        name,
-        (kind, visibility),
-        descriptors,
-        bytes,
-        file,
-    );
+    push_symbol(out, ctx, &node, name, kind, visibility, descriptors);
 }
 
 /// Handle `init_declaration` — name is always "init".
-fn handle_init(node: Node, prefix: &[Descriptor], bytes: &[u8], file: &str, out: &mut Vec<Symbol>) {
-    let visibility = read_visibility(&node, bytes);
+fn handle_init(node: Node, prefix: &[Descriptor], ctx: &ExtractCtx, out: &mut Vec<Symbol>) {
+    let visibility = read_visibility(&node, ctx.bytes);
     let mut descriptors = prefix.to_vec();
     descriptors.push(Descriptor::Method {
         name: "init".to_owned(),
@@ -528,12 +511,12 @@ fn handle_init(node: Node, prefix: &[Descriptor], bytes: &[u8], file: &str, out:
     });
     push_symbol(
         out,
+        ctx,
         &node,
         "init".to_owned(),
-        (SymbolKind::Method, visibility),
+        SymbolKind::Method,
+        visibility,
         descriptors,
-        bytes,
-        file,
     );
 }
 
@@ -541,14 +524,8 @@ fn handle_init(node: Node, prefix: &[Descriptor], bytes: &[u8], file: &str, out:
 ///
 /// Finds the `value_binding_pattern` child to determine let/var mutability.
 /// The variable name is from the `name` field (a `pattern` node) → `bound_identifier`.
-fn handle_property(
-    node: Node,
-    prefix: &[Descriptor],
-    bytes: &[u8],
-    file: &str,
-    out: &mut Vec<Symbol>,
-) {
-    let visibility = read_visibility(&node, bytes);
+fn handle_property(node: Node, prefix: &[Descriptor], ctx: &ExtractCtx, out: &mut Vec<Symbol>) {
+    let visibility = read_visibility(&node, ctx.bytes);
 
     // Determine let vs var from the value_binding_pattern child.
     let is_let = {
@@ -556,7 +533,7 @@ fn handle_property(
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             if child.kind() == "value_binding_pattern" {
-                found_let = field_text(&child, "mutability", bytes).is_none_or(|m| m == "let");
+                found_let = field_text(&child, "mutability", ctx.bytes).is_none_or(|m| m == "let");
                 break;
             }
         }
@@ -570,7 +547,7 @@ fn handle_property(
         None => return,
     };
     let var_name = match name_node.child_by_field_name("bound_identifier") {
-        Some(bi) => node_text(&bi, bytes).to_owned(),
+        Some(bi) => node_text(&bi, ctx.bytes).to_owned(),
         // Tuple destructuring or other complex patterns — skip gracefully.
         None => return,
     };
@@ -582,27 +559,13 @@ fn handle_property(
     };
     let mut descriptors = prefix.to_vec();
     descriptors.push(Descriptor::Term(var_name.clone()));
-    push_symbol(
-        out,
-        &node,
-        var_name,
-        (kind, visibility),
-        descriptors,
-        bytes,
-        file,
-    );
+    push_symbol(out, ctx, &node, var_name, kind, visibility, descriptors);
 }
 
 /// Handle `typealias_declaration`.
-fn handle_typealias(
-    node: Node,
-    prefix: &[Descriptor],
-    bytes: &[u8],
-    file: &str,
-    out: &mut Vec<Symbol>,
-) {
-    let visibility = read_visibility(&node, bytes);
-    let name = match field_text(&node, "name", bytes) {
+fn handle_typealias(node: Node, prefix: &[Descriptor], ctx: &ExtractCtx, out: &mut Vec<Symbol>) {
+    let visibility = read_visibility(&node, ctx.bytes);
+    let name = match field_text(&node, "name", ctx.bytes) {
         Some(n) => n,
         None => return,
     };
@@ -610,25 +573,19 @@ fn handle_typealias(
     descriptors.push(Descriptor::Type(name.clone()));
     push_symbol(
         out,
+        ctx,
         &node,
         name,
-        (SymbolKind::TypeAlias, visibility),
+        SymbolKind::TypeAlias,
+        visibility,
         descriptors,
-        bytes,
-        file,
     );
 }
 
 /// Handle `enum_entry` (cases inside an enum body).
-fn handle_enum_entry(
-    node: Node,
-    prefix: &[Descriptor],
-    bytes: &[u8],
-    file: &str,
-    out: &mut Vec<Symbol>,
-) {
-    let visibility = read_visibility(&node, bytes);
-    let name = match field_text(&node, "name", bytes) {
+fn handle_enum_entry(node: Node, prefix: &[Descriptor], ctx: &ExtractCtx, out: &mut Vec<Symbol>) {
+    let visibility = read_visibility(&node, ctx.bytes);
+    let name = match field_text(&node, "name", ctx.bytes) {
         Some(n) => n,
         None => return,
     };
@@ -636,12 +593,12 @@ fn handle_enum_entry(
     descriptors.push(Descriptor::Term(name.clone()));
     push_symbol(
         out,
+        ctx,
         &node,
         name,
-        (SymbolKind::Const, visibility),
+        SymbolKind::Const,
+        visibility,
         descriptors,
-        bytes,
-        file,
     );
 }
 
