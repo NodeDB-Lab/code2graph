@@ -15,6 +15,7 @@
 
 pub mod ffi_bridge;
 mod incremental;
+pub mod layered;
 mod resolver;
 pub mod scope_graph;
 mod support;
@@ -22,6 +23,7 @@ pub mod symbol_table;
 
 pub use ffi_bridge::FfiBridgeResolver;
 pub use incremental::IncrementalGraph;
+pub use layered::LayeredResolver;
 pub use resolver::Resolver;
 pub use scope_graph::ScopeGraphResolver;
 pub(crate) use support::{
