@@ -169,9 +169,115 @@ jobs:
         with:
           skip-existing: true
 
+  build-node:
+    name: Build addon (${{ matrix.target }})
+    needs: validate-version
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            napi_cross: true
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            zig: true
+          - target: x86_64-apple-darwin
+            runner: macos-13
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: node-${{ matrix.target }}
+      - name: Install zig (musl cross-compile)
+        if: matrix.zig
+        run: |
+          pip install ziglang
+          cargo install --locked cargo-zigbuild
+      - name: Install napi cross-toolchain (linux aarch64)
+        if: matrix.napi_cross
+        run: npm install -g @napi-rs/cross-toolchain
+      - name: Install deps
+        working-directory: bindings/node
+        run: npm ci
+      - name: Build addon
+        working-directory: bindings/node
+        run: npx napi build --platform --release --target ${{ matrix.target }} ${{ matrix.zig && '-x' || '' }} ${{ matrix.napi_cross && '--use-napi-cross' || '' }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: node-${{ matrix.target }}
+          path: bindings/node/*.node
+
+  publish-npm:
+    name: Publish to npm
+    needs: [validate-version, build-node, publish-crates]
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+      - name: Install deps
+        working-directory: bindings/node
+        run: npm ci
+      - name: Download addon artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: bindings/node/artifacts
+          pattern: node-*
+          merge-multiple: true
+      - name: Stamp version
+        working-directory: bindings/node
+        run: |
+          VERSION="${{ needs.validate-version.outputs.version }}"
+          jq --arg v "$VERSION" '.version = $v' package.json > tmp.json && mv tmp.json package.json
+      - name: Assemble platform packages
+        working-directory: bindings/node
+        run: |
+          npx napi create-npm-dirs --npm-dir ./npm
+          npx napi artifacts --output-dir ./artifacts --npm-dir ./npm
+          npx napi prepublish -t npm --npm-dir ./npm --skip-optional-publish
+      - name: Publish (idempotent, with provenance)
+        working-directory: bindings/node
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_CONFIG_PROVENANCE: "true"
+        run: |
+          publish_pkg() {
+            local dir="$1" name ver
+            name=$(jq -r .name "$dir/package.json")
+            ver=$(jq -r .version "$dir/package.json")
+            if npm view "$name@$ver" version >/dev/null 2>&1; then
+              echo "$name@$ver already published — skipping"
+            else
+              npm publish "$dir" --access public
+            fi
+          }
+          for dir in npm/*/; do publish_pkg "$dir"; done
+          publish_pkg .
+
   github-release:
     name: GitHub release
-    needs: [validate-version, publish-crates, publish-pypi]
+    needs: [validate-version, publish-crates, publish-pypi, publish-npm]
     runs-on: ubuntu-latest
     permissions:
       contents: write
