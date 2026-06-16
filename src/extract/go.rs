@@ -24,12 +24,13 @@ use crate::graph::types::{
     Symbol, SymbolKind, TypeRefContext, Visibility,
 };
 use crate::lang::Language;
-use crate::symbol::{Descriptor, SymbolId};
+use crate::symbol::Descriptor;
 
 use super::{
-    Extractor, MIN_REF_LEN, attach_reference_scopes, child_text, collect_call_references,
-    definition_bindings, field_text, import_bindings, innermost_scope, node_span, node_text,
-    one_line_signature, push_binding, push_ref, push_scope, push_type_ref, simple_type_name,
+    ExtractCtx, Extractor, MIN_REF_LEN, attach_reference_scopes, child_text,
+    collect_call_references, definition_bindings, field_text, import_bindings, innermost_scope,
+    make_symbol, node_span, node_text, one_line_signature, push_binding, push_ref, push_scope,
+    push_type_ref, simple_type_name,
 };
 
 /// Tree-sitter query capturing call-callee identifiers.
@@ -73,7 +74,12 @@ impl Extractor for GoExtractor {
         let bytes = source.as_bytes();
         let namespaces = go_namespaces(&root, bytes, file);
 
-        let defs = collect_symbols(&root, bytes, file, &namespaces);
+        let ctx = ExtractCtx {
+            bytes,
+            file,
+            lang: Language::Go,
+        };
+        let defs = collect_symbols(&root, &ctx, &namespaces);
         let def_bindings = definition_bindings(&defs);
         let mut symbols = defs;
         symbols.push(super::module_symbol(
@@ -161,7 +167,7 @@ fn go_package_name(root: &Node, bytes: &[u8]) -> Option<String> {
     if name.is_empty() { None } else { Some(name) }
 }
 
-fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String]) -> Vec<Symbol> {
+fn collect_symbols(root: &Node, ctx: &ExtractCtx, namespaces: &[String]) -> Vec<Symbol> {
     let mut out = Vec::new();
 
     let push = |out: &mut Vec<Symbol>,
@@ -176,25 +182,21 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
             .map(Descriptor::Namespace)
             .collect();
         descriptors.push(leaf);
-        out.push(Symbol {
-            id: SymbolId::global(Language::Go.as_str(), descriptors),
+        out.push(make_symbol(
+            ctx,
+            node,
             name,
             kind,
             visibility,
-            file: file.to_owned(),
-            line: (node.start_position().row + 1) as u32,
-            span: ByteSpan {
-                start: node.start_byte(),
-                end: node.end_byte(),
-            },
-            signature: one_line_signature(node_text(node, bytes), &['{']),
-        });
+            descriptors,
+            one_line_signature(node_text(node, ctx.bytes), &['{']),
+        ));
     };
 
     for child in root.children(&mut root.walk()) {
         match child.kind() {
             "function_declaration" => {
-                let Some(name) = field_text(&child, "name", bytes) else {
+                let Some(name) = field_text(&child, "name", ctx.bytes) else {
                     continue;
                 };
                 let vis = name_visibility(&name);
@@ -211,7 +213,7 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
                 );
             }
             "method_declaration" => {
-                let Some(name) = field_text(&child, "name", bytes) else {
+                let Some(name) = field_text(&child, "name", ctx.bytes) else {
                     continue;
                 };
                 let vis = name_visibility(&name);
@@ -231,7 +233,7 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
                 for spec in child.children(&mut child.walk()) {
                     let (kind, name) = match spec.kind() {
                         "type_spec" => {
-                            let Some(name) = field_text(&spec, "name", bytes) else {
+                            let Some(name) = field_text(&spec, "name", ctx.bytes) else {
                                 continue;
                             };
                             // Inspect the `type` field to determine the concrete kind.
@@ -246,7 +248,7 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
                             (kind, name)
                         }
                         "type_alias" => {
-                            let Some(name) = field_text(&spec, "name", bytes) else {
+                            let Some(name) = field_text(&spec, "name", ctx.bytes) else {
                                 continue;
                             };
                             (SymbolKind::TypeAlias, name)
@@ -273,7 +275,7 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
                         if ident.kind() != "identifier" {
                             continue;
                         }
-                        let name = node_text(&ident, bytes).to_owned();
+                        let name = node_text(&ident, ctx.bytes).to_owned();
                         let vis = name_visibility(&name);
                         push(
                             &mut out,
@@ -295,7 +297,7 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
                         if ident.kind() != "identifier" {
                             continue;
                         }
-                        let name = node_text(&ident, bytes).to_owned();
+                        let name = node_text(&ident, ctx.bytes).to_owned();
                         let vis = name_visibility(&name);
                         push(
                             &mut out,
