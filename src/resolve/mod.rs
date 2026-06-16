@@ -17,6 +17,7 @@ pub mod conformance;
 pub mod ffi_bridge;
 mod incremental;
 pub mod layered;
+pub mod normalized_name;
 mod resolver;
 pub mod scope_graph;
 mod support;
@@ -26,6 +27,7 @@ pub use conformance::ConformanceResolver;
 pub use ffi_bridge::FfiBridgeResolver;
 pub use incremental::IncrementalGraph;
 pub use layered::LayeredResolver;
+pub use normalized_name::NormalizedNameResolver;
 pub use resolver::Resolver;
 pub use scope_graph::ScopeGraphResolver;
 pub(crate) use support::{

@@ -256,12 +256,18 @@ pub struct Binding {
 /// How confident the resolver is in an [`Edge`] — the precision marker that lets
 /// consumers (e.g. a quality analyzer) gate on resolution quality.
 ///
-/// Variants are ordered from least to most precise: `NameOnly < Scoped < Exact`.
+/// Variants are ordered from least to most precise:
+/// `Heuristic < NameOnly < Scoped < Exact`.
 /// More-precise compares greater, so consumers can write threshold filters such
-/// as `edge.confidence >= Confidence::Scoped` to drop `NameOnly` edges.
+/// as `edge.confidence >= Confidence::Scoped` to drop `NameOnly` edges, or
+/// `edge.confidence >= Confidence::NameOnly` to drop the lowest `Heuristic` tier.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Confidence {
+    /// Lowest tier: a synthesized or normalized-name guess (e.g. case-folded
+    /// name match). Present so consumers can opt into maximum recall, never
+    /// dressed as a precise fact — filter it out for strict precision.
+    Heuristic,
     /// Matched by name only — may be one of several same-named symbols.
     NameOnly,
     /// Narrowed by lexical scope / imports, or the referenced name has a unique
@@ -296,6 +302,10 @@ pub enum Provenance {
     /// found by traversing `IsImplementation` relationships up the type
     /// hierarchy (structural, not type-inferred).
     Conformance,
+    /// Derived by case-insensitive / normalized name matching — a low-confidence
+    /// recall tier that catches references differing from the definition only by
+    /// case. Never fuzzy beyond case folding (no edit-distance/LSH).
+    NormalizedName,
 }
 
 // ── FFI / cross-language boundary facts ──────────────────────────────────────
@@ -409,7 +419,7 @@ pub struct CodeGraph {
 impl CodeGraph {
     /// Borrowing iterator over edges whose confidence is at or above `threshold`
     /// (the zero-alloc tiered-retrieval primitive). E.g. `Confidence::Scoped`
-    /// yields `Scoped` and `Exact` edges, dropping `NameOnly`.
+    /// yields `Scoped` and `Exact` edges, dropping `NameOnly` and `Heuristic`.
     pub fn edges_min_confidence(&self, threshold: Confidence) -> impl Iterator<Item = &Edge> {
         self.edges.iter().filter(move |e| e.confidence >= threshold)
     }
