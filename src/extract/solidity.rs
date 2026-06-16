@@ -38,12 +38,12 @@ use crate::graph::types::{
     Symbol, SymbolKind, TypeRefContext, Visibility,
 };
 use crate::lang::Language;
-use crate::symbol::{Descriptor, SymbolId};
+use crate::symbol::Descriptor;
 
 use super::{
-    Extractor, MIN_REF_LEN, attach_reference_scopes, collect_call_references, definition_bindings,
-    field_text, import_bindings, innermost_scope, node_span, node_text, one_line_signature,
-    push_binding, push_ref, push_scope, push_type_ref,
+    ExtractCtx, Extractor, MIN_REF_LEN, attach_reference_scopes, collect_call_references,
+    definition_bindings, field_text, import_bindings, innermost_scope, make_symbol, node_span,
+    node_text, one_line_signature, push_binding, push_ref, push_scope, push_type_ref,
 };
 
 /// Tree-sitter query capturing call-callee identifiers.
@@ -81,6 +81,11 @@ impl Extractor for SolidityExtractor {
 
         let root = tree.root_node();
         let bytes = source.as_bytes();
+        let ctx = ExtractCtx {
+            bytes,
+            file,
+            lang: Language::Solidity,
+        };
 
         let ns_strings = solidity_namespaces(file);
         let ns_descriptors: Vec<Descriptor> = ns_strings
@@ -90,7 +95,7 @@ impl Extractor for SolidityExtractor {
             .collect();
 
         let mut defs = Vec::new();
-        collect_decls(root, &ns_descriptors, false, bytes, file, &mut defs);
+        collect_decls(root, &ns_descriptors, false, &ctx, &mut defs);
         let def_bindings = definition_bindings(&defs);
         let mut symbols = defs;
         symbols.push(super::module_symbol(
@@ -105,18 +110,18 @@ impl Extractor for SolidityExtractor {
             &ts_language,
             CALL_QUERY,
             Language::Solidity,
-            bytes,
-            file,
+            ctx.bytes,
+            ctx.file,
         )?;
-        collect_inheritance(&root, bytes, file, &mut references);
-        collect_imports(&root, bytes, file, &mut references);
-        collect_type_references(&root, bytes, file, &mut references);
-        collect_read_references(&root, bytes, file, &mut references);
-        collect_write_references(&root, bytes, file, &mut references);
+        collect_inheritance(&root, ctx.bytes, ctx.file, &mut references);
+        collect_imports(&root, ctx.bytes, ctx.file, &mut references);
+        collect_type_references(&root, ctx.bytes, ctx.file, &mut references);
+        collect_read_references(&root, ctx.bytes, ctx.file, &mut references);
+        collect_write_references(&root, ctx.bytes, ctx.file, &mut references);
 
         let scopes = collect_scopes(&root, source.len());
         attach_reference_scopes(&mut references, &scopes);
-        let mut bindings = collect_bindings(&root, bytes, &scopes);
+        let mut bindings = collect_bindings(&root, ctx.bytes, &scopes);
         bindings.extend(def_bindings);
         bindings.extend(import_bindings(&references, &scopes));
 
@@ -177,37 +182,33 @@ fn read_visibility(node: &Node, bytes: &[u8]) -> Visibility {
 /// Build a [`Symbol`] and push it onto `out`.
 fn push_symbol(
     out: &mut Vec<Symbol>,
+    ctx: &ExtractCtx,
     node: &Node,
     name: String,
-    (kind, visibility): (SymbolKind, Visibility),
+    kind: SymbolKind,
+    visibility: Visibility,
     descriptors: Vec<Descriptor>,
-    bytes: &[u8],
-    file: &str,
 ) {
-    out.push(Symbol {
-        id: SymbolId::global(Language::Solidity.as_str(), descriptors),
+    let signature = one_line_signature(node_text(node, ctx.bytes), &['{', ';']);
+    out.push(make_symbol(
+        ctx,
+        node,
         name,
         kind,
         visibility,
-        file: file.to_owned(),
-        line: (node.start_position().row + 1) as u32,
-        span: ByteSpan {
-            start: node.start_byte(),
-            end: node.end_byte(),
-        },
-        signature: one_line_signature(node_text(node, bytes), &['{', ';']),
-    });
+        descriptors,
+        signature,
+    ));
 }
 
 /// Emit a container (contract/interface/library) Type symbol and recurse into its body.
 fn emit_container_and_body(
     out: &mut Vec<Symbol>,
+    ctx: &ExtractCtx,
     node: Node,
     type_name: String,
     kind: SymbolKind,
     prefix: &[Descriptor],
-    bytes: &[u8],
-    file: &str,
 ) {
     let mut type_descriptors = prefix.to_vec();
     type_descriptors.push(Descriptor::Type(type_name.clone()));
@@ -215,17 +216,17 @@ fn emit_container_and_body(
     // always accessible at the file level → Public.
     push_symbol(
         out,
+        ctx,
         &node,
         type_name,
-        (kind, Visibility::Public),
+        kind,
+        Visibility::Public,
         type_descriptors.clone(),
-        bytes,
-        file,
     );
 
     // Recurse into `contract_body` (field "body").
     if let Some(body) = node.child_by_field_name("body") {
-        collect_decls(body, &type_descriptors, true, bytes, file, out);
+        collect_decls(body, &type_descriptors, true, ctx, out);
     }
 }
 
@@ -240,48 +241,47 @@ fn collect_decls(
     container: Node,
     prefix: &[Descriptor],
     inside_type: bool,
-    bytes: &[u8],
-    file: &str,
+    ctx: &ExtractCtx,
     out: &mut Vec<Symbol>,
 ) {
     let mut cursor = container.walk();
     for child in container.children(&mut cursor) {
         match child.kind() {
             "contract_declaration" | "library_declaration" => {
-                handle_container(child, SymbolKind::Class, prefix, bytes, file, out);
+                handle_container(child, SymbolKind::Class, prefix, ctx, out);
             }
             "interface_declaration" => {
-                handle_container(child, SymbolKind::Interface, prefix, bytes, file, out);
+                handle_container(child, SymbolKind::Interface, prefix, ctx, out);
             }
             "function_definition" => {
-                handle_function(child, prefix, inside_type, bytes, file, out);
+                handle_function(child, prefix, inside_type, ctx, out);
             }
             "constructor_definition" => {
-                handle_constructor(child, prefix, bytes, file, out);
+                handle_constructor(child, prefix, ctx, out);
             }
             "modifier_definition" => {
-                handle_modifier(child, prefix, bytes, file, out);
+                handle_modifier(child, prefix, ctx, out);
             }
             "fallback_receive_definition" => {
-                handle_fallback_receive(child, prefix, bytes, file, out);
+                handle_fallback_receive(child, prefix, ctx, out);
             }
             "state_variable_declaration" => {
-                handle_state_variable(child, prefix, bytes, file, out);
+                handle_state_variable(child, prefix, ctx, out);
             }
             "constant_variable_declaration" => {
-                handle_constant_variable(child, prefix, bytes, file, out);
+                handle_constant_variable(child, prefix, ctx, out);
             }
             "event_definition" | "error_declaration" => {
-                handle_event_or_error(child, prefix, bytes, file, out);
+                handle_event_or_error(child, prefix, ctx, out);
             }
             "struct_declaration" => {
-                handle_struct(child, prefix, bytes, file, out);
+                handle_struct(child, prefix, ctx, out);
             }
             "enum_declaration" => {
-                handle_enum(child, prefix, bytes, file, out);
+                handle_enum(child, prefix, ctx, out);
             }
             "user_defined_type_definition" => {
-                handle_typedef(child, prefix, bytes, file, out);
+                handle_typedef(child, prefix, ctx, out);
             }
             // pragma_directive, import_directive, using_directive → skip
             _ => {}
@@ -294,16 +294,15 @@ fn handle_container(
     node: Node,
     kind: SymbolKind,
     prefix: &[Descriptor],
-    bytes: &[u8],
-    file: &str,
+    ctx: &ExtractCtx,
     out: &mut Vec<Symbol>,
 ) {
     // Containers have no visibility keyword themselves, but be defensive.
-    let type_name = match field_text(&node, "name", bytes) {
+    let type_name = match field_text(&node, "name", ctx.bytes) {
         Some(n) => n,
         None => return,
     };
-    emit_container_and_body(out, node, type_name, kind, prefix, bytes, file);
+    emit_container_and_body(out, ctx, node, type_name, kind, prefix);
 }
 
 /// Handle `function_definition`.
@@ -317,11 +316,10 @@ fn handle_function(
     node: Node,
     prefix: &[Descriptor],
     inside_type: bool,
-    bytes: &[u8],
-    file: &str,
+    ctx: &ExtractCtx,
     out: &mut Vec<Symbol>,
 ) {
-    let name = match field_text(&node, "name", bytes) {
+    let name = match field_text(&node, "name", ctx.bytes) {
         Some(n) => n,
         None => return,
     };
@@ -330,31 +328,17 @@ fn handle_function(
     } else {
         SymbolKind::Function
     };
-    let visibility = read_visibility(&node, bytes);
+    let visibility = read_visibility(&node, ctx.bytes);
     let mut descriptors = prefix.to_vec();
     descriptors.push(Descriptor::Method {
         name: name.clone(),
         disambiguator: String::new(),
     });
-    push_symbol(
-        out,
-        &node,
-        name,
-        (kind, visibility),
-        descriptors,
-        bytes,
-        file,
-    );
+    push_symbol(out, ctx, &node, name, kind, visibility, descriptors);
 }
 
 /// Handle `constructor_definition` (no name field → always "constructor").
-fn handle_constructor(
-    node: Node,
-    prefix: &[Descriptor],
-    bytes: &[u8],
-    file: &str,
-    out: &mut Vec<Symbol>,
-) {
+fn handle_constructor(node: Node, prefix: &[Descriptor], ctx: &ExtractCtx, out: &mut Vec<Symbol>) {
     // Constructors are always emitted; they have no visibility keyword and are
     // effectively public (they can only be called at deployment time).
     let mut descriptors = prefix.to_vec();
@@ -364,12 +348,12 @@ fn handle_constructor(
     });
     push_symbol(
         out,
+        ctx,
         &node,
         "constructor".to_owned(),
-        (SymbolKind::Method, Visibility::Public),
+        SymbolKind::Method,
+        Visibility::Public,
         descriptors,
-        bytes,
-        file,
     );
 }
 
@@ -377,14 +361,8 @@ fn handle_constructor(
 ///
 /// Modifiers have no explicit visibility keyword in Solidity; they are
 /// accessible only within the contract hierarchy → [`Visibility::Internal`].
-fn handle_modifier(
-    node: Node,
-    prefix: &[Descriptor],
-    bytes: &[u8],
-    file: &str,
-    out: &mut Vec<Symbol>,
-) {
-    let name = match field_text(&node, "name", bytes) {
+fn handle_modifier(node: Node, prefix: &[Descriptor], ctx: &ExtractCtx, out: &mut Vec<Symbol>) {
+    let name = match field_text(&node, "name", ctx.bytes) {
         Some(n) => n,
         None => return,
     };
@@ -395,12 +373,12 @@ fn handle_modifier(
     });
     push_symbol(
         out,
+        ctx,
         &node,
         name,
-        (SymbolKind::Method, Visibility::Internal),
+        SymbolKind::Method,
+        Visibility::Internal,
         descriptors,
-        bytes,
-        file,
     );
 }
 
@@ -414,11 +392,10 @@ fn handle_modifier(
 fn handle_fallback_receive(
     node: Node,
     prefix: &[Descriptor],
-    bytes: &[u8],
-    file: &str,
+    ctx: &ExtractCtx,
     out: &mut Vec<Symbol>,
 ) {
-    let text = node_text(&node, bytes).trim_start();
+    let text = node_text(&node, ctx.bytes).trim_start();
     let name = if text.starts_with("fallback") {
         "fallback"
     } else if text.starts_with("receive") {
@@ -433,12 +410,12 @@ fn handle_fallback_receive(
     });
     push_symbol(
         out,
+        ctx,
         &node,
         name.to_owned(),
-        (SymbolKind::Method, Visibility::Public),
+        SymbolKind::Method,
+        Visibility::Public,
         descriptors,
-        bytes,
-        file,
     );
 }
 
@@ -452,14 +429,13 @@ fn handle_fallback_receive(
 fn handle_state_variable(
     node: Node,
     prefix: &[Descriptor],
-    bytes: &[u8],
-    file: &str,
+    ctx: &ExtractCtx,
     out: &mut Vec<Symbol>,
 ) {
     // Read visibility from the named field (state_variable_declaration uses a
     // field rather than a plain child kind, but the text values are the same).
     let visibility = match node.child_by_field_name("visibility") {
-        Some(vis_node) => match node_text(&vis_node, bytes) {
+        Some(vis_node) => match node_text(&vis_node, ctx.bytes) {
             "public" | "external" => Visibility::Public,
             "internal" => Visibility::Internal,
             "private" => Visibility::Private,
@@ -469,7 +445,7 @@ fn handle_state_variable(
         None => Visibility::Internal,
     };
 
-    let name = match field_text(&node, "name", bytes) {
+    let name = match field_text(&node, "name", ctx.bytes) {
         Some(n) => n,
         None => return,
     };
@@ -478,7 +454,7 @@ fn handle_state_variable(
     let has_immutable = node
         .children(&mut node.walk())
         .any(|c| c.kind() == "immutable");
-    let text = node_text(&node, bytes);
+    let text = node_text(&node, ctx.bytes);
     let is_constant = has_immutable || text.split_whitespace().any(|w| w == "constant");
 
     let kind = if is_constant {
@@ -489,15 +465,7 @@ fn handle_state_variable(
 
     let mut descriptors = prefix.to_vec();
     descriptors.push(Descriptor::Term(name.clone()));
-    push_symbol(
-        out,
-        &node,
-        name,
-        (kind, visibility),
-        descriptors,
-        bytes,
-        file,
-    );
+    push_symbol(out, ctx, &node, name, kind, visibility, descriptors);
 }
 
 /// Handle `constant_variable_declaration` (file-level `uint constant X = 1;`).
@@ -507,11 +475,10 @@ fn handle_state_variable(
 fn handle_constant_variable(
     node: Node,
     prefix: &[Descriptor],
-    bytes: &[u8],
-    file: &str,
+    ctx: &ExtractCtx,
     out: &mut Vec<Symbol>,
 ) {
-    let name = match field_text(&node, "name", bytes) {
+    let name = match field_text(&node, "name", ctx.bytes) {
         Some(n) => n,
         None => return,
     };
@@ -519,12 +486,12 @@ fn handle_constant_variable(
     descriptors.push(Descriptor::Term(name.clone()));
     push_symbol(
         out,
+        ctx,
         &node,
         name,
-        (SymbolKind::Const, Visibility::Public),
+        SymbolKind::Const,
+        Visibility::Public,
         descriptors,
-        bytes,
-        file,
     );
 }
 
@@ -535,11 +502,10 @@ fn handle_constant_variable(
 fn handle_event_or_error(
     node: Node,
     prefix: &[Descriptor],
-    bytes: &[u8],
-    file: &str,
+    ctx: &ExtractCtx,
     out: &mut Vec<Symbol>,
 ) {
-    let name = match field_text(&node, "name", bytes) {
+    let name = match field_text(&node, "name", ctx.bytes) {
         Some(n) => n,
         None => return,
     };
@@ -547,12 +513,12 @@ fn handle_event_or_error(
     descriptors.push(Descriptor::Term(name.clone()));
     push_symbol(
         out,
+        ctx,
         &node,
         name,
-        (SymbolKind::Other, Visibility::Public),
+        SymbolKind::Other,
+        Visibility::Public,
         descriptors,
-        bytes,
-        file,
     );
 }
 
@@ -560,14 +526,8 @@ fn handle_event_or_error(
 ///
 /// Emits a Struct Type symbol, then descends into `struct_body` to emit each
 /// `struct_member` as a Term/Static nested under the struct.
-fn handle_struct(
-    node: Node,
-    prefix: &[Descriptor],
-    bytes: &[u8],
-    file: &str,
-    out: &mut Vec<Symbol>,
-) {
-    let type_name = match field_text(&node, "name", bytes) {
+fn handle_struct(node: Node, prefix: &[Descriptor], ctx: &ExtractCtx, out: &mut Vec<Symbol>) {
+    let type_name = match field_text(&node, "name", ctx.bytes) {
         Some(n) => n,
         None => return,
     };
@@ -578,12 +538,12 @@ fn handle_struct(
     // accessibility → Public.
     push_symbol(
         out,
+        ctx,
         &node,
         type_name,
-        (SymbolKind::Struct, Visibility::Public),
+        SymbolKind::Struct,
+        Visibility::Public,
         type_descriptors.clone(),
-        bytes,
-        file,
     );
 
     // Descend into struct_body for members.
@@ -596,7 +556,7 @@ fn handle_struct(
         if member.kind() != "struct_member" {
             continue;
         }
-        let member_name = match field_text(&member, "name", bytes) {
+        let member_name = match field_text(&member, "name", ctx.bytes) {
             Some(n) => n,
             None => continue,
         };
@@ -606,12 +566,12 @@ fn handle_struct(
         // the struct itself).
         push_symbol(
             out,
+            ctx,
             &member,
             member_name,
-            (SymbolKind::Static, Visibility::Public),
+            SymbolKind::Static,
+            Visibility::Public,
             member_descriptors,
-            bytes,
-            file,
         );
     }
 }
@@ -620,8 +580,8 @@ fn handle_struct(
 ///
 /// Emits an Enum Type symbol, then descends into `enum_body` to emit each
 /// `enum_value` as a Term/Const nested under the enum.
-fn handle_enum(node: Node, prefix: &[Descriptor], bytes: &[u8], file: &str, out: &mut Vec<Symbol>) {
-    let type_name = match field_text(&node, "name", bytes) {
+fn handle_enum(node: Node, prefix: &[Descriptor], ctx: &ExtractCtx, out: &mut Vec<Symbol>) {
+    let type_name = match field_text(&node, "name", ctx.bytes) {
         Some(n) => n,
         None => return,
     };
@@ -631,12 +591,12 @@ fn handle_enum(node: Node, prefix: &[Descriptor], bytes: &[u8], file: &str, out:
     // Enums have no visibility keyword; they follow container accessibility → Public.
     push_symbol(
         out,
+        ctx,
         &node,
         type_name,
-        (SymbolKind::Enum, Visibility::Public),
+        SymbolKind::Enum,
+        Visibility::Public,
         type_descriptors.clone(),
-        bytes,
-        file,
     );
 
     // Descend into enum_body for values.
@@ -650,7 +610,7 @@ fn handle_enum(node: Node, prefix: &[Descriptor], bytes: &[u8], file: &str, out:
             continue;
         }
         // enum_value is a leaf named node; its text is the case name.
-        let value_name = node_text(&value_node, bytes).to_owned();
+        let value_name = node_text(&value_node, ctx.bytes).to_owned();
         if value_name.is_empty() {
             continue;
         }
@@ -659,12 +619,12 @@ fn handle_enum(node: Node, prefix: &[Descriptor], bytes: &[u8], file: &str, out:
         // Enum values inherit the enum's public accessibility.
         push_symbol(
             out,
+            ctx,
             &value_node,
             value_name,
-            (SymbolKind::Const, Visibility::Public),
+            SymbolKind::Const,
+            Visibility::Public,
             value_descriptors,
-            bytes,
-            file,
         );
     }
 }
@@ -673,14 +633,8 @@ fn handle_enum(node: Node, prefix: &[Descriptor], bytes: &[u8], file: &str, out:
 ///
 /// Type aliases have no visibility keyword; they are accessible wherever
 /// they are in scope → [`Visibility::Public`].
-fn handle_typedef(
-    node: Node,
-    prefix: &[Descriptor],
-    bytes: &[u8],
-    file: &str,
-    out: &mut Vec<Symbol>,
-) {
-    let name = match field_text(&node, "name", bytes) {
+fn handle_typedef(node: Node, prefix: &[Descriptor], ctx: &ExtractCtx, out: &mut Vec<Symbol>) {
+    let name = match field_text(&node, "name", ctx.bytes) {
         Some(n) => n,
         None => return,
     };
@@ -688,12 +642,12 @@ fn handle_typedef(
     descriptors.push(Descriptor::Type(name.clone()));
     push_symbol(
         out,
+        ctx,
         &node,
         name,
-        (SymbolKind::TypeAlias, Visibility::Public),
+        SymbolKind::TypeAlias,
+        Visibility::Public,
         descriptors,
-        bytes,
-        file,
     );
 }
 
