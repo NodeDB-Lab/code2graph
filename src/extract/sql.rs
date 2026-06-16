@@ -23,10 +23,11 @@ use crate::graph::types::{
     ScopeKind, Symbol, SymbolKind, Visibility,
 };
 use crate::lang::Language;
-use crate::symbol::{Descriptor, SymbolId};
+use crate::symbol::Descriptor;
 
 use super::{
-    Extractor, attach_reference_scopes, definition_bindings, innermost_scope, node_span, push_scope,
+    ExtractCtx, Extractor, attach_reference_scopes, definition_bindings, innermost_scope,
+    make_symbol, node_span, push_scope,
 };
 
 /// Extracts SQL symbols and references (tables, views, columns).
@@ -53,22 +54,27 @@ impl Extractor for SqlExtractor {
 
         let root = tree.root_node();
         let bytes = source.as_bytes();
+        let ctx = ExtractCtx {
+            bytes,
+            file,
+            lang: Language::Sql,
+        };
 
         // DDL symbols (CREATE TABLE / VIEW / columns) — bound at file-root scope (0).
-        let defs = collect_symbols(&root, bytes, file);
+        let defs = collect_symbols(&root, &ctx);
         let def_bindings = definition_bindings(&defs);
         let mut symbols = defs;
 
         // CTE symbols: each `WITH name AS (…)` introduces a name local to its
         // enclosing statement scope — NOT the file root.
-        let cte_symbols = collect_cte_symbols(&root, bytes, file);
+        let cte_symbols = collect_cte_symbols(&root, &ctx);
         symbols.extend(cte_symbols.iter().cloned());
 
         // Module symbol: stable SCIP identity for the whole file.
         symbols.push(super::module_symbol(Language::Sql, &[], file, source.len()));
 
         // References (all object_reference nodes that aren't DDL definition names).
-        let mut references = collect_references(&root, bytes, file);
+        let mut references = collect_references(&root, ctx.bytes, ctx.file);
 
         // Scope tree: scope[0] = Module over whole file; each `statement` or
         // `subquery` node gets its own `Other` scope.
@@ -76,7 +82,7 @@ impl Extractor for SqlExtractor {
         attach_reference_scopes(&mut references, &scopes);
 
         // CTE bindings (Definition in statement scope) + DDL bindings (scope 0).
-        let mut bindings = collect_cte_bindings(&root, bytes, &scopes, &cte_symbols);
+        let mut bindings = collect_cte_bindings(&root, ctx.bytes, &scopes, &cte_symbols);
         bindings.extend(def_bindings);
 
         Ok(FileFacts {
@@ -97,23 +103,23 @@ impl Extractor for SqlExtractor {
 ///
 /// SQL has no path-namespace derived from the file path — the optional schema
 /// prefix comes from the SQL itself and is captured directly.
-fn collect_symbols(root: &Node, bytes: &[u8], file: &str) -> Vec<Symbol> {
+fn collect_symbols(root: &Node, ctx: &ExtractCtx) -> Vec<Symbol> {
     let mut out = Vec::new();
-    collect_symbols_recursive(root, bytes, file, &mut out);
+    collect_symbols_recursive(root, ctx, &mut out);
     out
 }
 
-fn collect_symbols_recursive(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Symbol>) {
+fn collect_symbols_recursive(node: &Node, ctx: &ExtractCtx, out: &mut Vec<Symbol>) {
     match node.kind() {
         "create_table" => {
-            extract_table(node, bytes, file, out);
+            extract_table(node, ctx, out);
         }
         "create_view" | "create_materialized_view" => {
-            extract_view(node, bytes, file, out);
+            extract_view(node, ctx, out);
         }
         _ => {
             for child in node.children(&mut node.walk()) {
-                collect_symbols_recursive(&child, bytes, file, out);
+                collect_symbols_recursive(&child, ctx, out);
             }
         }
     }
@@ -137,26 +143,22 @@ fn object_name_and_schema<'a>(
 
 /// Extract the table name (and optional schema) from the first `object_reference`
 /// child of a `create_table` node.
-fn extract_table(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Symbol>) {
-    let Some((table_name, schema)) = object_name_and_schema(node, bytes) else {
+fn extract_table(node: &Node, ctx: &ExtractCtx, out: &mut Vec<Symbol>) {
+    let Some((table_name, schema)) = object_name_and_schema(node, ctx.bytes) else {
         return;
     };
 
     // Build the table symbol.
     let table_descriptors = build_descriptors(schema.as_deref(), &table_name, None);
-    out.push(Symbol {
-        id: SymbolId::global(Language::Sql.as_str(), table_descriptors),
-        name: table_name.clone(),
-        kind: SymbolKind::Table,
-        visibility: Visibility::Public,
-        file: file.to_owned(),
-        line: (node.start_position().row + 1) as u32,
-        span: ByteSpan {
-            start: node.start_byte(),
-            end: node.end_byte(),
-        },
-        signature: super::one_line_signature(super::node_text(node, bytes), &['(']),
-    });
+    out.push(make_symbol(
+        ctx,
+        node,
+        table_name.clone(),
+        SymbolKind::Table,
+        Visibility::Public,
+        table_descriptors,
+        super::one_line_signature(super::node_text(node, ctx.bytes), &['(']),
+    ));
 
     // Extract columns from the `column_definitions` child (absent for CTAS).
     let Some(col_defs) = node
@@ -173,47 +175,39 @@ fn extract_table(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Symbol>) {
         let Some(col_name_node) = col_child.child_by_field_name("name") else {
             continue;
         };
-        let raw_col = super::node_text(&col_name_node, bytes);
+        let raw_col = super::node_text(&col_name_node, ctx.bytes);
         let col_name = super::unquote(raw_col).to_owned();
 
         let col_descriptors = build_descriptors(schema.as_deref(), &table_name, Some(&col_name));
-        out.push(Symbol {
-            id: SymbolId::global(Language::Sql.as_str(), col_descriptors),
-            name: col_name,
-            kind: SymbolKind::Column,
-            visibility: Visibility::Public,
-            file: file.to_owned(),
-            line: (col_child.start_position().row + 1) as u32,
-            span: ByteSpan {
-                start: col_child.start_byte(),
-                end: col_child.end_byte(),
-            },
-            signature: super::one_line_signature(super::node_text(&col_child, bytes), &['(']),
-        });
+        out.push(make_symbol(
+            ctx,
+            &col_child,
+            col_name,
+            SymbolKind::Column,
+            Visibility::Public,
+            col_descriptors,
+            super::one_line_signature(super::node_text(&col_child, ctx.bytes), &['(']),
+        ));
     }
 }
 
 /// Extract the view name (and optional schema) from the first `object_reference`
 /// child of a `create_view` or `create_materialized_view` node.
-fn extract_view(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Symbol>) {
-    let Some((view_name, schema)) = object_name_and_schema(node, bytes) else {
+fn extract_view(node: &Node, ctx: &ExtractCtx, out: &mut Vec<Symbol>) {
+    let Some((view_name, schema)) = object_name_and_schema(node, ctx.bytes) else {
         return;
     };
 
     let view_descriptors = build_descriptors(schema.as_deref(), &view_name, None);
-    out.push(Symbol {
-        id: SymbolId::global(Language::Sql.as_str(), view_descriptors),
-        name: view_name,
-        kind: SymbolKind::View,
-        visibility: Visibility::Public,
-        file: file.to_owned(),
-        line: (node.start_position().row + 1) as u32,
-        span: ByteSpan {
-            start: node.start_byte(),
-            end: node.end_byte(),
-        },
-        signature: super::one_line_signature(super::node_text(node, bytes), &['(']),
-    });
+    out.push(make_symbol(
+        ctx,
+        node,
+        view_name,
+        SymbolKind::View,
+        Visibility::Public,
+        view_descriptors,
+        super::one_line_signature(super::node_text(node, ctx.bytes), &['(']),
+    ));
 }
 
 /// Find the first child of `node` with kind `object_reference`.
@@ -363,30 +357,29 @@ fn cte_identifier_node<'a>(cte_node: &Node<'a>) -> Option<Node<'a>> {
 /// The CTE name is the first `identifier` child of a `cte` node. The symbol
 /// uses the same [`Descriptor::Type`] leaf as DDL table/view definitions (no
 /// schema prefix — CTEs are always local to their statement scope).
-fn collect_cte_symbols(root: &Node, bytes: &[u8], file: &str) -> Vec<Symbol> {
+fn collect_cte_symbols(root: &Node, ctx: &ExtractCtx) -> Vec<Symbol> {
     let mut out = Vec::new();
-    collect_cte_symbols_dfs(root, bytes, file, &mut out);
+    collect_cte_symbols_dfs(root, ctx, &mut out);
     out
 }
 
-fn collect_cte_symbols_dfs(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Symbol>) {
+fn collect_cte_symbols_dfs(node: &Node, ctx: &ExtractCtx, out: &mut Vec<Symbol>) {
     if node.kind() == "cte" {
         // The first child of kind `identifier` is the CTE name.
         if let Some(name_node) = cte_identifier_node(node) {
-            let name = super::unquote(super::node_text(&name_node, bytes)).to_owned();
+            let name = super::unquote(super::node_text(&name_node, ctx.bytes)).to_owned();
             if !name.is_empty() {
                 // Mirror DDL SymbolId style: Descriptor::Type as the single leaf.
                 let descriptors = vec![Descriptor::Type(name.clone())];
-                out.push(Symbol {
-                    id: SymbolId::global(Language::Sql.as_str(), descriptors),
+                out.push(make_symbol(
+                    ctx,
+                    node,
                     name,
-                    kind: SymbolKind::Other,
-                    visibility: Visibility::Public,
-                    file: file.to_owned(),
-                    line: (node.start_position().row + 1) as u32,
-                    span: node_span(node),
-                    signature: String::new(),
-                });
+                    SymbolKind::Other,
+                    Visibility::Public,
+                    descriptors,
+                    String::new(),
+                ));
             }
         }
         // Do NOT recurse into `cte` children to avoid re-entering nested CTEs
@@ -395,7 +388,7 @@ fn collect_cte_symbols_dfs(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<
         return;
     }
     for child in node.children(&mut node.walk()) {
-        collect_cte_symbols_dfs(&child, bytes, file, out);
+        collect_cte_symbols_dfs(&child, ctx, out);
     }
 }
 
