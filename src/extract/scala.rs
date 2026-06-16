@@ -233,7 +233,7 @@ fn emit_type_def(
         id: SymbolId::global(Language::Scala.as_str(), descriptors.clone()),
         name: name.clone(),
         kind,
-        visibility: Visibility::Unknown,
+        visibility: read_visibility(node, bytes),
         file: file.to_owned(),
         line: (node.start_position().row + 1) as u32,
         span: ByteSpan {
@@ -266,7 +266,7 @@ fn emit_enum_def(
         id: SymbolId::global(Language::Scala.as_str(), descriptors.clone()),
         name: name.clone(),
         kind: SymbolKind::Enum,
-        visibility: Visibility::Unknown,
+        visibility: read_visibility(node, bytes),
         file: file.to_owned(),
         line: (node.start_position().row + 1) as u32,
         span: ByteSpan {
@@ -300,7 +300,7 @@ fn emit_enum_def(
                         id: SymbolId::global(Language::Scala.as_str(), case_desc),
                         name: case_name,
                         kind: SymbolKind::Const,
-                        visibility: Visibility::Unknown,
+                        visibility: read_visibility(&case, bytes),
                         file: file.to_owned(),
                         line: (case.start_position().row + 1) as u32,
                         span: ByteSpan {
@@ -377,7 +377,7 @@ fn emit_function(
         id: SymbolId::global(Language::Scala.as_str(), descriptors),
         name,
         kind: SymbolKind::Method,
-        visibility: Visibility::Unknown,
+        visibility: read_visibility(node, bytes),
         file: file.to_owned(),
         line: (node.start_position().row + 1) as u32,
         span: ByteSpan {
@@ -421,7 +421,7 @@ fn emit_val_or_var(
         id: SymbolId::global(Language::Scala.as_str(), descriptors),
         name,
         kind,
-        visibility: Visibility::Unknown,
+        visibility: read_visibility(node, bytes),
         file: file.to_owned(),
         line: (node.start_position().row + 1) as u32,
         span: ByteSpan {
@@ -450,7 +450,7 @@ fn emit_type_alias(
         id: SymbolId::global(Language::Scala.as_str(), descriptors),
         name,
         kind: SymbolKind::TypeAlias,
-        visibility: Visibility::Unknown,
+        visibility: read_visibility(node, bytes),
         file: file.to_owned(),
         line: (node.start_position().row + 1) as u32,
         span: ByteSpan {
@@ -468,6 +468,71 @@ fn emit_type_alias(
 fn name_text(node: &Node, bytes: &[u8]) -> Option<String> {
     let n = node.child_by_field_name("name")?;
     Some(node_text(&n, bytes).to_owned())
+}
+
+/// Read the declared visibility from a Scala definition node.
+///
+/// Scala's access modifiers live in a `modifiers` named child, which in turn
+/// contains an `access_modifier` node. The `access_modifier` is structured as:
+///
+/// ```text
+/// access_modifier
+///   "private" | "protected"   ← anonymous keyword token
+///   access_qualifier?          ← present when [qualifier] is written
+///     identifier               ← the package/this name
+/// ```
+///
+/// Mapping:
+/// - `private` (bare)         → `Visibility::Private`
+/// - `protected` (bare)       → `Visibility::Protected`
+/// - `private[...]`           → `Visibility::Internal`  (scoped/package access)
+/// - `protected[...]`         → `Visibility::Internal`
+/// - no access modifier       → `Visibility::Public`    (Scala's default)
+fn read_visibility(node: &Node, bytes: &[u8]) -> Visibility {
+    // Walk unnamed children to find the `modifiers` named child.
+    let modifiers = node
+        .children(&mut node.walk())
+        .find(|c| c.kind() == "modifiers");
+
+    let modifiers = match modifiers {
+        Some(m) => m,
+        None => return Visibility::Public,
+    };
+
+    // Within `modifiers`, look for an `access_modifier` child.
+    let access_mod = modifiers
+        .children(&mut modifiers.walk())
+        .find(|c| c.kind() == "access_modifier");
+
+    let access_mod = match access_mod {
+        Some(a) => a,
+        None => return Visibility::Public,
+    };
+
+    // The first child of `access_modifier` is the anonymous keyword token
+    // (`private` or `protected`). We read its text from the source bytes.
+    let keyword_node = match access_mod.child(0) {
+        Some(n) => n,
+        None => return Visibility::Public,
+    };
+    let keyword = node_text(&keyword_node, bytes);
+
+    // Check whether a `[qualifier]` is present — indicated by an
+    // `access_qualifier` named child.
+    let has_qualifier = access_mod
+        .children(&mut access_mod.walk())
+        .any(|c| c.kind() == "access_qualifier");
+
+    if has_qualifier {
+        // `private[pkg]`, `protected[pkg]`, `private[this]` → package/scoped.
+        Visibility::Internal
+    } else {
+        match keyword {
+            "private" => Visibility::Private,
+            "protected" => Visibility::Protected,
+            _ => Visibility::Public,
+        }
+    }
 }
 
 // ── Inheritance (extends_clause) ─────────────────────────────────────────────
@@ -1179,6 +1244,80 @@ object O {
                 .iter()
                 .map(|r| (&r.role, &r.name))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    // ── Visibility ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn plain_def_has_public_visibility() {
+        let src = r#"
+package app
+
+class Svc {
+  def open(): Unit = {}
+}
+"#;
+        let facts = extract(src, "src/app/Svc.scala");
+        let sym = by_name(&facts, "open").unwrap();
+        assert_eq!(
+            sym.visibility,
+            Visibility::Public,
+            "plain `def` must be Public (Scala default)"
+        );
+    }
+
+    #[test]
+    fn private_def_has_private_visibility() {
+        let src = r#"
+package app
+
+class Svc {
+  private def secret(): Unit = {}
+}
+"#;
+        let facts = extract(src, "src/app/Svc.scala");
+        let sym = by_name(&facts, "secret").unwrap();
+        assert_eq!(
+            sym.visibility,
+            Visibility::Private,
+            "`private def` must be Private"
+        );
+    }
+
+    #[test]
+    fn protected_def_has_protected_visibility() {
+        let src = r#"
+package app
+
+class Svc {
+  protected def hook(): Unit = {}
+}
+"#;
+        let facts = extract(src, "src/app/Svc.scala");
+        let sym = by_name(&facts, "hook").unwrap();
+        assert_eq!(
+            sym.visibility,
+            Visibility::Protected,
+            "`protected def` must be Protected"
+        );
+    }
+
+    #[test]
+    fn private_qualified_def_has_internal_visibility() {
+        let src = r#"
+package app
+
+class Svc {
+  private[app] def pkg(): Unit = {}
+}
+"#;
+        let facts = extract(src, "src/app/Svc.scala");
+        let sym = by_name(&facts, "pkg").unwrap();
+        assert_eq!(
+            sym.visibility,
+            Visibility::Internal,
+            "`private[pkg] def` must be Internal"
         );
     }
 
