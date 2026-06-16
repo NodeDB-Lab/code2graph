@@ -20,6 +20,46 @@ use crate::graph::types::{
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
 
+/// The invariant per-extraction context threaded through an extractor's helpers:
+/// the source bytes, the file path, and the language tag. These three do not
+/// change during a single file's extraction (unlike the namespace/descriptor
+/// prefix, which is extended as the walk descends — so that stays a separate
+/// per-scope argument and is deliberately NOT part of this struct).
+pub(crate) struct ExtractCtx<'a> {
+    pub bytes: &'a [u8],
+    pub file: &'a str,
+    pub lang: Language,
+}
+
+/// Build a [`Symbol`] from the extraction context plus the per-symbol facts.
+/// `span_node` provides the span (its byte range) and 1-based line. `signature`
+/// is precomputed by the caller (stop-chars vary per language; some callers — e.g.
+/// the TS exported-decl case — take the span from a wrapper node but the signature
+/// from the inner declaration, so signature stays a caller-supplied `String`).
+pub(crate) fn make_symbol(
+    ctx: &ExtractCtx,
+    span_node: &Node,
+    name: String,
+    kind: SymbolKind,
+    visibility: Visibility,
+    descriptors: Vec<Descriptor>,
+    signature: String,
+) -> Symbol {
+    Symbol {
+        id: SymbolId::global(ctx.lang.as_str(), descriptors),
+        name,
+        kind,
+        visibility,
+        file: ctx.file.to_owned(),
+        line: (span_node.start_position().row + 1) as u32,
+        span: ByteSpan {
+            start: span_node.start_byte(),
+            end: span_node.end_byte(),
+        },
+        signature,
+    }
+}
+
 /// UTF-8 text of a node's byte range (lossy fallback on invalid UTF-8).
 pub(crate) fn node_text<'a>(node: &Node, bytes: &'a [u8]) -> &'a str {
     std::str::from_utf8(&bytes[node.start_byte()..node.end_byte()]).unwrap_or("<invalid utf8>")
@@ -496,6 +536,49 @@ mod tests {
     fn unquote_bare_and_empty_unchanged() {
         assert_eq!(super::unquote("users"), "users");
         assert_eq!(super::unquote(""), "");
+    }
+
+    #[cfg(feature = "rust")]
+    #[test]
+    fn make_symbol_from_extract_ctx() {
+        use crate::graph::types::{SymbolKind, Visibility};
+        use crate::lang::Language;
+        use crate::symbol::Descriptor;
+        use tree_sitter::Parser;
+
+        let ts_lang = crate::grammar::rust();
+        let mut parser = Parser::new();
+        parser.set_language(&ts_lang).unwrap();
+        let src = b"fn f() {}";
+        let tree = parser.parse(src, None).unwrap();
+        // The function_item node is the first named child of the source_file root.
+        let root = tree.root_node();
+        let fn_node = root.named_child(0).unwrap();
+        assert_eq!(fn_node.kind(), "function_item");
+
+        let ctx = super::ExtractCtx {
+            bytes: src,
+            file: "src/lib.rs",
+            lang: Language::Rust,
+        };
+        let sym = super::make_symbol(
+            &ctx,
+            &fn_node,
+            "f".to_owned(),
+            SymbolKind::Function,
+            Visibility::Private,
+            vec![Descriptor::Term("f".to_owned())],
+            "fn f()".to_owned(),
+        );
+
+        assert_eq!(sym.file, "src/lib.rs");
+        assert_eq!(sym.name, "f");
+        assert_eq!(sym.kind, SymbolKind::Function);
+        assert_eq!(sym.visibility, Visibility::Private);
+        assert_eq!(sym.signature, "fn f()");
+        assert_eq!(sym.line, 1, "first line is 1-based");
+        assert_eq!(sym.span.start, fn_node.start_byte());
+        assert_eq!(sym.span.end, fn_node.end_byte());
     }
 
     #[cfg(feature = "rust")]

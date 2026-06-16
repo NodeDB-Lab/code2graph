@@ -112,8 +112,9 @@ pub use typescript::TypeScriptExtractor;
 #[cfg(feature = "_extractors")]
 #[allow(unused_imports)]
 pub(crate) use support::{
-    MIN_REF_LEN, attach_reference_scopes, byte_to_line_col, child_text, collect_call_references,
-    definition_bindings, field_text, import_bindings, innermost_scope, is_static, module_name,
-    module_symbol, node_occurrence, node_span, node_text, one_line_signature, push_binding,
-    push_import_ref, push_ref, push_scope, push_type_ref, shift_offsets, simple_type_name, unquote,
+    ExtractCtx, MIN_REF_LEN, attach_reference_scopes, byte_to_line_col, child_text,
+    collect_call_references, definition_bindings, field_text, import_bindings, innermost_scope,
+    is_static, make_symbol, module_name, module_symbol, node_occurrence, node_span, node_text,
+    one_line_signature, push_binding, push_import_ref, push_ref, push_scope, push_type_ref,
+    shift_offsets, simple_type_name, unquote,
 };
