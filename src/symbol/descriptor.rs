@@ -29,7 +29,12 @@ pub enum Descriptor {
     Type(String),
     /// A term: const, static, variable, value (`ident.`).
     Term(String),
-    /// A method or free function (`ident(disambiguator).`). Empty disambiguator is common.
+    /// A method or free function (`ident(disambiguator).`). The `disambiguator`
+    /// distinguishes overloads and **must** be a SCIP *simple-identifier* (chars
+    /// per [`is_simple_ident_char`]) or empty: SCIP's grammar is
+    /// `method-disambiguator ::= simple-identifier?` with **no escaped form**, so
+    /// a non-simple disambiguator cannot be rendered to a parseable SCIP string.
+    /// Empty disambiguator is the common case.
     Method { name: String, disambiguator: String },
     /// A generic type parameter (`[ident]`).
     TypeParameter(String),
@@ -77,6 +82,15 @@ impl Descriptor {
             } => {
                 push_ident(out, name)?;
                 out.write_char('(')?;
+                // SCIP defines no escaped form for the disambiguator
+                // (`method-disambiguator ::= simple-identifier?`). A non-simple
+                // value would render to an unparseable / mis-round-tripping
+                // string, silently corrupting identity — catch it loudly in
+                // dev/tests rather than emit a broken symbol in release.
+                debug_assert!(
+                    disambiguator.chars().all(is_simple_ident_char),
+                    "SCIP method disambiguator must be a simple identifier, got {disambiguator:?}"
+                );
                 out.write_str(disambiguator)?;
                 out.write_str(").")
             }
@@ -249,5 +263,24 @@ mod tests {
         let mut s = String::new();
         Descriptor::Type("Foo Bar".into()).render(&mut s).unwrap();
         assert_eq!(s, "`Foo Bar`#");
+    }
+
+    #[test]
+    fn method_with_nonempty_disambiguator_round_trips() {
+        // A SCIP-valid (simple-identifier) overload disambiguator must survive
+        // render → parse → identical descriptor. "1" is the canonical overload
+        // index; this locks the disambiguator path that all extractors leave
+        // empty today, so a future overload-aware extractor can't silently break
+        // identity.
+        let desc = Descriptor::Method {
+            name: "to_string".into(),
+            disambiguator: "1".into(),
+        };
+        let mut s = String::new();
+        desc.render(&mut s).unwrap();
+        assert_eq!(s, "to_string(1).");
+        let (parsed, rest) = parse_descriptor(&s).unwrap();
+        assert_eq!(parsed, desc);
+        assert!(rest.is_empty(), "no trailing input, got {rest:?}");
     }
 }
