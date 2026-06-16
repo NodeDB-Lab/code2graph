@@ -7,10 +7,12 @@
 <p>
 A purpose-neutral, language-agnostic code-graph extraction library. It turns source code into
 </br><strong>symbols</strong>, <strong>references</strong>, and <strong>cross-file edges</strong> (calls, imports, …) 
-</br>as plain data — and stops there.
+</br>as plain data — and stops there. 
 </p>
 
 <p>
+  <a href="#install"><strong>Install</strong></a>
+·
   <a href="#quickstart"><strong>Quickstart</strong></a>
 ·
   <a href="#languages"><strong>Languages</strong></a>
@@ -24,6 +26,14 @@ A purpose-neutral, language-agnostic code-graph extraction library. It turns sou
   <a href="https://discord.gg/s54gDMVc7B">
     <img src="assets/discord-cta.svg" alt="Join the code2graph Discord" width="340">
   </a>
+</p>
+
+<p>
+  <a href="https://crates.io/crates/code2graph"><img src="https://img.shields.io/crates/v/code2graph?logo=rust" alt="crates.io"></a>
+  <a href="https://pypi.org/project/code2graph-rs/"><img src="https://img.shields.io/pypi/v/code2graph-rs?logo=pypi&logoColor=white&label=pypi" alt="PyPI"></a>
+  <a href="https://www.npmjs.com/package/code2graph-rs"><img src="https://img.shields.io/npm/v/code2graph-rs?logo=npm" alt="npm"></a>
+  <a href="https://docs.rs/code2graph"><img src="https://img.shields.io/docsrs/code2graph?logo=docsdotrs&logoColor=white" alt="docs.rs"></a>
+  <a href="https://github.com/nodedb-lab/code2graph/actions/workflows/ci.yml"><img src="https://github.com/nodedb-lab/code2graph/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
 </p>
 
 <p>
@@ -68,6 +78,18 @@ Reach for it when:
 - you want honest, deterministic facts with an explicit `Confidence` on every edge. Not a black box that scores, ranks, or persists for you.
 
 It's **not** for you if you want a turnkey, batteries-included code-intelligence product. Code2graph is the substrate _beneath_ that, not the product itself.
+
+## Install
+
+code2graph ships to three ecosystems from a single source — the Rust crate plus native bindings that emit the same neutral facts as language-native objects:
+
+| Ecosystem  | Package                                                        | Install                     |
+| ---------- | -------------------------------------------------------------- | --------------------------- |
+| Rust       | [`code2graph`](https://crates.io/crates/code2graph)            | `cargo add code2graph`      |
+| Python     | [`code2graph-rs`](https://pypi.org/project/code2graph-rs/)     | `pip install code2graph-rs` |
+| Node / Bun | [`code2graph-rs`](https://www.npmjs.com/package/code2graph-rs) | `npm install code2graph-rs` |
+
+API reference: [docs.rs/code2graph](https://docs.rs/code2graph). Binding sources: [`bindings/python`](bindings/python) (PyO3 / maturin) and [`bindings/node`](bindings/node) (napi-rs).
 
 ## Quickstart
 
