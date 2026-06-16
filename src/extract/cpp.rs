@@ -19,8 +19,8 @@ use tree_sitter::{Node, Parser};
 
 use crate::error::{CodegraphError, Result};
 use crate::graph::types::{
-    Binding, BindingKind, ByteSpan, FileFacts, RefRole, Reference, Scope, ScopeId, ScopeKind,
-    Symbol, SymbolKind, TypeRefContext, Visibility,
+    Binding, BindingKind, ByteSpan, EntryPoint, FileFacts, RefRole, Reference, Scope, ScopeId,
+    ScopeKind, Symbol, SymbolKind, TypeRefContext, Visibility,
 };
 use crate::lang::Language;
 use crate::symbol::Descriptor;
@@ -257,6 +257,7 @@ fn process_node(node: &Node, namespaces: &[String], ctx: &ExtractCtx, out: &mut 
             let Some((name, _)) = declarator_name(&decl, ctx.bytes) else {
                 return;
             };
+            let is_main = name == "main";
             let prefix = namespace_prefix(namespaces);
             push_symbol(
                 out,
@@ -270,6 +271,13 @@ fn process_node(node: &Node, namespaces: &[String], ctx: &ExtractCtx, out: &mut 
                 SymbolKind::Function,
                 vis,
             );
+            // Only free/namespace functions reach this arm — class methods are
+            // handled in `collect_members`, so `Foo::main` is never flagged.
+            if is_main {
+                if let Some(s) = out.last_mut() {
+                    s.entry_points.push(EntryPoint::Main);
+                }
+            }
         }
 
         "declaration" => {
@@ -1089,6 +1097,33 @@ mod tests {
 
     fn by_name<'a>(facts: &'a FileFacts, n: &str) -> Option<&'a Symbol> {
         facts.symbols.iter().find(|s| s.name == n)
+    }
+
+    #[test]
+    fn free_main_is_entry_point() {
+        let facts = CppExtractor
+            .extract("int main() { return 0; }", "src/main.cpp")
+            .unwrap();
+        let main = by_name(&facts, "main").unwrap();
+        assert!(
+            main.entry_points
+                .iter()
+                .any(|e| matches!(e, EntryPoint::Main))
+        );
+    }
+
+    #[test]
+    fn method_main_is_not_entry_point() {
+        let facts = CppExtractor
+            .extract("struct S { int main(); };", "src/s.cpp")
+            .unwrap();
+        let main = by_name(&facts, "main").unwrap();
+        assert!(
+            !main
+                .entry_points
+                .iter()
+                .any(|e| matches!(e, EntryPoint::Main))
+        );
     }
 
     #[test]

@@ -115,7 +115,7 @@ pub(super) fn extract_ecmascript(source: &str, file: &str, lang: Language) -> Re
 
 /// Module path (namespace descriptors) from a source file path: all path
 /// segments, with the final file extension stripped from the last segment.
-fn module_namespaces(file: &str) -> Vec<String> {
+pub(super) fn module_namespaces(file: &str) -> Vec<String> {
     let mut parts: Vec<String> = file
         .split('/')
         .filter(|s| !s.is_empty())

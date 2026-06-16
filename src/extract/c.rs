@@ -19,8 +19,8 @@ use tree_sitter::{Node, Parser};
 
 use crate::error::{CodegraphError, Result};
 use crate::graph::types::{
-    Binding, BindingKind, ByteSpan, FfiAbi, FfiExport, FileFacts, RefRole, Reference, Scope,
-    ScopeId, ScopeKind, Symbol, SymbolKind, TypeRefContext, Visibility,
+    Binding, BindingKind, ByteSpan, EntryPoint, FfiAbi, FfiExport, FileFacts, RefRole, Reference,
+    Scope, ScopeId, ScopeKind, Symbol, SymbolKind, TypeRefContext, Visibility,
 };
 use crate::lang::Language;
 use crate::symbol::Descriptor;
@@ -237,6 +237,7 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
                 let Some((name, _)) = declarator_name(&decl, bytes) else {
                     continue;
                 };
+                let is_main = name == "main";
                 push(
                     &mut out,
                     &child,
@@ -248,6 +249,12 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
                         disambiguator: String::new(),
                     },
                 );
+                // C `main` is always a free function — name-only detection.
+                if is_main {
+                    if let Some(s) = out.last_mut() {
+                        s.entry_points.push(EntryPoint::Main);
+                    }
+                }
             }
 
             "declaration" => {
@@ -757,6 +764,19 @@ fn collect_write_references(node: &Node, bytes: &[u8], file: &str, out: &mut Vec
 mod tests {
     use super::*;
     use crate::graph::types::{RefRole, TypeRefContext};
+
+    #[test]
+    fn main_function_is_entry_point() {
+        let facts = CExtractor
+            .extract("int main(void) { return 0; }", "src/main.c")
+            .unwrap();
+        let main = facts.symbols.iter().find(|s| s.name == "main").unwrap();
+        assert!(
+            main.entry_points
+                .iter()
+                .any(|e| matches!(e, EntryPoint::Main))
+        );
+    }
 
     #[test]
     fn extracts_defs_with_visibility() {

@@ -30,8 +30,8 @@ use tree_sitter::{Node, Parser};
 
 use crate::error::{CodegraphError, Result};
 use crate::graph::types::{
-    Binding, BindingKind, ByteSpan, FileFacts, RefRole, Reference, Scope, ScopeId, ScopeKind,
-    Symbol, SymbolKind, TypeRefContext, Visibility,
+    Binding, BindingKind, ByteSpan, EntryPoint, FileFacts, RefRole, Reference, Scope, ScopeId,
+    ScopeKind, Symbol, SymbolKind, TypeRefContext, Visibility,
 };
 use crate::lang::Language;
 use crate::symbol::Descriptor;
@@ -375,12 +375,19 @@ fn handle_function(
         SymbolKind::Function
     };
     let vis = read_visibility(&node, ctx.bytes);
+    // Top-level `fun main` only — a `main` method inside a type is not an entry point.
+    let is_main = !inside_type && name == "main";
     let mut descriptors = prefix.to_vec();
     descriptors.push(Descriptor::Method {
         name: name.clone(),
         disambiguator: String::new(),
     });
     push_symbol(out, ctx, &node, name, kind, vis, descriptors);
+    if is_main {
+        if let Some(s) = out.last_mut() {
+            s.entry_points.push(EntryPoint::Main);
+        }
+    }
 }
 
 /// Handle `property_declaration`.
@@ -1178,6 +1185,29 @@ mod tests {
 
     fn by_name(facts: &FileFacts, name: &str) -> Option<Symbol> {
         facts.symbols.iter().find(|s| s.name == name).cloned()
+    }
+
+    #[test]
+    fn top_level_main_is_entry_point() {
+        let facts = extract("fun main() {}", "src/main.kt");
+        let main = by_name(&facts, "main").unwrap();
+        assert!(
+            main.entry_points
+                .iter()
+                .any(|e| matches!(e, EntryPoint::Main))
+        );
+    }
+
+    #[test]
+    fn method_main_is_not_entry_point() {
+        let facts = extract("class App { fun main() {} }", "src/app.kt");
+        let main = by_name(&facts, "main").unwrap();
+        assert!(
+            !main
+                .entry_points
+                .iter()
+                .any(|e| matches!(e, EntryPoint::Main))
+        );
     }
 
     // Test 1: class with public fun + private fun; all emit with correct Visibility.

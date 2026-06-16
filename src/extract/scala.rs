@@ -16,8 +16,8 @@ use tree_sitter::{Node, Parser};
 
 use crate::error::{CodegraphError, Result};
 use crate::graph::types::{
-    Binding, BindingKind, ByteSpan, FileFacts, RefRole, Reference, Scope, ScopeId, ScopeKind,
-    Symbol, SymbolKind, TypeRefContext, Visibility,
+    Binding, BindingKind, ByteSpan, EntryPoint, FileFacts, RefRole, Reference, Scope, ScopeId,
+    ScopeKind, Symbol, SymbolKind, TypeRefContext, Visibility,
 };
 use crate::lang::Language;
 use crate::symbol::Descriptor;
@@ -342,6 +342,8 @@ fn emit_function(node: &Node, ctx: &ExtractCtx, prefix: &[Descriptor], out: &mut
     let Some(name) = name_text(node, ctx.bytes) else {
         return;
     };
+    // Name-only `main` detection (covers `def main` in an `object`).
+    let is_main = name == "main";
     let mut descriptors = prefix.to_vec();
     descriptors.push(Descriptor::Method {
         name: name.clone(),
@@ -356,6 +358,11 @@ fn emit_function(node: &Node, ctx: &ExtractCtx, prefix: &[Descriptor], out: &mut
         descriptors,
         one_line_signature(node_text(node, ctx.bytes), &['{', ';', '=']),
     ));
+    if is_main {
+        if let Some(s) = out.last_mut() {
+            s.entry_points.push(EntryPoint::Main);
+        }
+    }
 }
 
 /// Emit a `val_definition` or `var_definition` → `SymbolKind::Const`/`Static`.
@@ -903,6 +910,20 @@ mod tests {
 
     fn by_name(facts: &FileFacts, name: &str) -> Option<Symbol> {
         facts.symbols.iter().find(|s| s.name == name).cloned()
+    }
+
+    #[test]
+    fn main_method_is_entry_point() {
+        let facts = extract(
+            "object M { def main(args: Array[String]): Unit = {} }",
+            "src/M.scala",
+        );
+        let main = by_name(&facts, "main").unwrap();
+        assert!(
+            main.entry_points
+                .iter()
+                .any(|e| matches!(e, EntryPoint::Main))
+        );
     }
 
     // ── Definitions ──────────────────────────────────────────────────────────

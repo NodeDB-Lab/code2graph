@@ -70,8 +70,13 @@ impl Extractor for PythonExtractor {
         let defs = collect_symbols(&root, &ctx, &namespaces);
         let def_bindings = definition_bindings(&defs);
         let mut symbols = defs;
-        let mod_sym = super::module_symbol(Language::Python, &namespaces, file, source.len());
+        let mut mod_sym = super::module_symbol(Language::Python, &namespaces, file, source.len());
         let module_id = mod_sym.id.to_scip_string();
+        // Idiomatic Python entry point: a module-level `if __name__ == "__main__"`
+        // guard marks the whole module as a `Main` entry point.
+        if module_is_main_entry(&root, bytes) {
+            mod_sym.entry_points.push(EntryPoint::Main);
+        }
         symbols.push(mod_sym);
         let mut references = collect_call_references(
             &root,
@@ -224,6 +229,77 @@ fn entry_points_for(fn_name: &str, outer_node: &Node, bytes: &[u8]) -> Vec<Entry
     }
 
     markers
+}
+
+/// Returns `true` iff a DIRECT child of the `module` root is an `if_statement`
+/// whose `condition:` is a `comparison_operator` representing the idiomatic
+/// `__name__ == "__main__"` guard (in either operand order).
+///
+/// Node-kind path:
+/// ```text
+/// module
+///   if_statement
+///     condition: comparison_operator
+///       identifier ("__name__")  "=="  string ("__main__")
+/// ```
+/// Detection is strict: the operator must be `==` (an anonymous `==` token child
+/// of the `comparison_operator`), one operand must be the bare identifier
+/// `__name__`, and the other a string whose content is `__main__`. `!=`/`is`/
+/// other comparisons are rejected.
+fn module_is_main_entry(root: &tree_sitter::Node, bytes: &[u8]) -> bool {
+    root.children(&mut root.walk())
+        .filter(|n| n.kind() == "if_statement")
+        .filter_map(|n| n.child_by_field_name("condition"))
+        .filter(|cond| cond.kind() == "comparison_operator")
+        .any(|cond| is_name_eq_main(&cond, bytes))
+}
+
+/// Returns `true` when `cond` (a `comparison_operator`) is exactly
+/// `__name__ == "__main__"` (either operand order).
+fn is_name_eq_main(cond: &Node, bytes: &[u8]) -> bool {
+    // The operator must be `==`: exactly one child is the anonymous `==` token,
+    // and there must be no other comparison operator token (reject chained/`!=`).
+    let eq_tokens = cond
+        .children(&mut cond.walk())
+        .filter(|c| !c.is_named() && c.kind() == "==")
+        .count();
+    if eq_tokens != 1 {
+        return false;
+    }
+
+    let operands: Vec<Node> = cond.named_children(&mut cond.walk()).collect();
+    if operands.len() != 2 {
+        return false;
+    }
+
+    let (a, b) = (operands[0], operands[1]);
+    is_dunder_name_pair(&a, &b, bytes) || is_dunder_name_pair(&b, &a, bytes)
+}
+
+/// `true` when `name_node` is the identifier `__name__` and `str_node` is a
+/// string whose content is `__main__`.
+fn is_dunder_name_pair(name_node: &Node, str_node: &Node, bytes: &[u8]) -> bool {
+    name_node.kind() == "identifier"
+        && node_text(name_node, bytes) == "__name__"
+        && str_node.kind() == "string"
+        && string_content(str_node, bytes) == "__main__"
+}
+
+/// Read the textual content of a `string` node, quote-style agnostic.
+///
+/// Prefers the `string_content` child (the grammar's named content node); falls
+/// back to stripping a single layer of surrounding quotes when absent (e.g. an
+/// empty string with no `string_content` child).
+fn string_content<'a>(string_node: &Node, bytes: &'a [u8]) -> &'a str {
+    if let Some(content) = string_node
+        .children(&mut string_node.walk())
+        .find(|c| c.kind() == "string_content")
+    {
+        return node_text(&content, bytes);
+    }
+    node_text(string_node, bytes)
+        .trim_matches('"')
+        .trim_matches('\'')
 }
 
 fn collect_symbols(root: &Node, ctx: &ExtractCtx, namespaces: &[String]) -> Vec<Symbol> {
@@ -1566,6 +1642,44 @@ MAX_RETRIES = 3
             matches!(&sym.entry_points[0], EntryPoint::HttpRoute(m) if m == "bp.websocket"),
             "expected HttpRoute(\"bp.websocket\"), got [{}]",
             ep_str(&sym.entry_points)
+        );
+    }
+
+    #[test]
+    fn entry_point_main_guard_marks_module() {
+        // A module-level `if __name__ == "__main__":` guard marks the MODULE
+        // symbol (kind Module) as a `Main` entry point.
+        let src = "if __name__ == \"__main__\":\n    pass\n";
+        let facts = PythonExtractor.extract(src, "src/app.py").unwrap();
+        let module = facts
+            .symbols
+            .iter()
+            .find(|s| s.kind == SymbolKind::Module)
+            .expect("expected a Module symbol");
+        assert!(
+            module
+                .entry_points
+                .iter()
+                .any(|ep| matches!(ep, EntryPoint::Main)),
+            "module guard must mark the module Main; got [{}]",
+            ep_str(&module.entry_points)
+        );
+    }
+
+    #[test]
+    fn entry_point_non_main_guard_ignored() {
+        // `if __name__ == "__other__":` is NOT the main guard → no entry point.
+        let src = "if __name__ == \"__other__\":\n    pass\n";
+        let facts = PythonExtractor.extract(src, "src/app.py").unwrap();
+        let module = facts
+            .symbols
+            .iter()
+            .find(|s| s.kind == SymbolKind::Module)
+            .expect("expected a Module symbol");
+        assert!(
+            module.entry_points.is_empty(),
+            "non-main guard must not mark the module; got [{}]",
+            ep_str(&module.entry_points)
         );
     }
 }

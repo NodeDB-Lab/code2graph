@@ -19,8 +19,8 @@ use tree_sitter::{Node, Parser};
 
 use crate::error::{CodegraphError, Result};
 use crate::graph::types::{
-    Binding, BindingKind, ByteSpan, FileFacts, RefRole, Reference, Scope, ScopeId, ScopeKind,
-    Symbol, SymbolKind, TypeRefContext, Visibility,
+    Binding, BindingKind, ByteSpan, EntryPoint, FileFacts, RefRole, Reference, Scope, ScopeId,
+    ScopeKind, Symbol, SymbolKind, TypeRefContext, Visibility,
 };
 use crate::lang::Language;
 use crate::symbol::Descriptor;
@@ -193,6 +193,12 @@ fn read_visibility(node: &Node, bytes: &[u8]) -> Visibility {
     }
 }
 
+/// Whether `node` carries a `modifier` child whose text equals `kw`.
+fn has_modifier(node: &tree_sitter::Node, bytes: &[u8], kw: &str) -> bool {
+    node.children(&mut node.walk())
+        .any(|c| c.kind() == "modifier" && node_text(&c, bytes) == kw)
+}
+
 // ── Symbol collection ────────────────────────────────────────────────────────
 
 fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String]) -> Vec<Symbol> {
@@ -310,6 +316,10 @@ fn collect_members(
                     disambiguator: String::new(),
                 });
                 let sig = one_line_signature(node_text(&member, ctx.bytes), &['{', ';']);
+                // A `static Main` (case-sensitive) method is the C# entry point.
+                let is_main = member.kind() == "method_declaration"
+                    && name == "Main"
+                    && has_modifier(&member, ctx.bytes, "static");
                 out.push(make_symbol(
                     ctx,
                     &member,
@@ -319,6 +329,11 @@ fn collect_members(
                     descriptors,
                     sig,
                 ));
+                if is_main {
+                    if let Some(s) = out.last_mut() {
+                        s.entry_points.push(EntryPoint::Main);
+                    }
+                }
             }
             "field_declaration" => {
                 let vis = if implicit_public {
@@ -841,6 +856,39 @@ fn collect_params(params: &Node, bytes: &[u8], scopes: &[Scope], out: &mut Vec<B
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn static_main_is_entry_point() {
+        let src = r#"
+class Program {
+    static void Main(string[] args) {}
+}
+"#;
+        let facts = CSharpExtractor.extract(src, "src/Program.cs").unwrap();
+        let main = facts.symbols.iter().find(|s| s.name == "Main").unwrap();
+        assert!(
+            main.entry_points
+                .iter()
+                .any(|e| matches!(e, EntryPoint::Main))
+        );
+    }
+
+    #[test]
+    fn instance_main_is_not_entry_point() {
+        let src = r#"
+class Program {
+    void Main() {}
+}
+"#;
+        let facts = CSharpExtractor.extract(src, "src/Program.cs").unwrap();
+        let main = facts.symbols.iter().find(|s| s.name == "Main").unwrap();
+        assert!(
+            !main
+                .entry_points
+                .iter()
+                .any(|e| matches!(e, EntryPoint::Main))
+        );
+    }
 
     // ── Definitions ──────────────────────────────────────────────────────────
 

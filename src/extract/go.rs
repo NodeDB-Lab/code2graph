@@ -79,7 +79,11 @@ impl Extractor for GoExtractor {
             file,
             lang: Language::Go,
         };
-        let defs = collect_symbols(&root, &ctx, &namespaces);
+        // `func main` is only the program entry point in `package main`; gate the
+        // Main marker on the file's actual package clause (not the directory-based
+        // namespace).
+        let is_pkg_main = go_package_name(&root, bytes).as_deref() == Some("main");
+        let defs = collect_symbols(&root, &ctx, &namespaces, is_pkg_main);
         let def_bindings = definition_bindings(&defs);
         let mut symbols = defs;
         symbols.push(super::module_symbol(
@@ -172,8 +176,9 @@ fn go_package_name(root: &Node, bytes: &[u8]) -> Option<String> {
 /// # v1 rules (definition-time detection only)
 ///
 /// - `EntryPoint::Main` — a top-level **function** (not a method) whose bare
-///   name is exactly `main`.  This is Go's program entry-point convention
-///   (`func main()` in `package main`).
+///   name is exactly `main`, **and** whose file declares `package main`
+///   (`is_pkg_main`). This is Go's program entry-point convention: a `func main`
+///   in any other package is an ordinary function, not the program entry point.
 /// - `EntryPoint::HttpRoute("ServeHTTP")` — a **method** whose bare name is
 ///   exactly `ServeHTTP`.  Any type implementing the `http.Handler` interface
 ///   must have a `ServeHTTP(ResponseWriter, *Request)` method; detecting the
@@ -190,11 +195,12 @@ fn go_package_name(root: &Node, bytes: &[u8]) -> Option<String> {
 /// (cross-file, cross-call-graph), which is out of scope for a
 /// definition-time extractor.  A future pass over `CodeGraph` edges could
 /// detect `HandleFunc`-style calls and back-annotate the handler symbol.
-fn entry_points_for_go(name: &str, is_method: bool) -> Vec<EntryPoint> {
+fn entry_points_for_go(name: &str, is_method: bool, is_pkg_main: bool) -> Vec<EntryPoint> {
     let mut markers: Vec<EntryPoint> = Vec::new();
 
-    // (a) `func main()` — the Go program entry point (function, not method).
-    if !is_method && name == "main" {
+    // (a) `func main()` in `package main` — the Go program entry point (function,
+    // not method). A `func main` in any other package is an ordinary function.
+    if !is_method && is_pkg_main && name == "main" {
         markers.push(EntryPoint::Main);
     }
 
@@ -207,7 +213,12 @@ fn entry_points_for_go(name: &str, is_method: bool) -> Vec<EntryPoint> {
     markers
 }
 
-fn collect_symbols(root: &Node, ctx: &ExtractCtx, namespaces: &[String]) -> Vec<Symbol> {
+fn collect_symbols(
+    root: &Node,
+    ctx: &ExtractCtx,
+    namespaces: &[String],
+    is_pkg_main: bool,
+) -> Vec<Symbol> {
     let mut out = Vec::new();
 
     let push = |out: &mut Vec<Symbol>,
@@ -258,7 +269,7 @@ fn collect_symbols(root: &Node, ctx: &ExtractCtx, namespaces: &[String]) -> Vec<
                     descriptors,
                     one_line_signature(node_text(&child, ctx.bytes), &['{']),
                 );
-                sym.entry_points = entry_points_for_go(&name, false);
+                sym.entry_points = entry_points_for_go(&name, false, is_pkg_main);
                 out.push(sym);
             }
             "method_declaration" => {
@@ -284,7 +295,7 @@ fn collect_symbols(root: &Node, ctx: &ExtractCtx, namespaces: &[String]) -> Vec<
                     descriptors,
                     one_line_signature(node_text(&child, ctx.bytes), &['{']),
                 );
-                sym.entry_points = entry_points_for_go(&name, true);
+                sym.entry_points = entry_points_for_go(&name, true, is_pkg_main);
                 out.push(sym);
             }
             "type_declaration" => {
@@ -1711,6 +1722,24 @@ func main() {
         assert!(
             sym.entry_points.is_empty(),
             "non-ServeHTTP method must have no entry points; got {:?}",
+            sym.entry_points
+        );
+    }
+
+    #[test]
+    fn entry_point_main_in_non_main_package_empty() {
+        // `func main()` in `package foo` is an ordinary function, NOT the program
+        // entry point → entry_points must be empty.
+        let src = "package foo\n\nfunc main() {}\n";
+        let facts = GoExtractor.extract(src, "foo.go").unwrap();
+        let sym = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "main")
+            .expect("symbol 'main' not found");
+        assert!(
+            sym.entry_points.is_empty(),
+            "func main in non-main package must have no entry points; got {:?}",
             sym.entry_points
         );
     }

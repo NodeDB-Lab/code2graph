@@ -82,9 +82,17 @@ pub enum SymbolKind {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone)]
 pub enum EntryPoint {
-    /// The definition is a language entry point — a function named `main`
-    /// (`fn main`, `func main`, `public static void main`) or a Python
-    /// `if __name__ == "__main__"` module entry.
+    /// The definition is a language entry point. Emitted for:
+    /// - a function/method named `main`: Rust/Go/C/C++ `main` (Go gated to
+    ///   `package main`; Go/C++ require a free function, not a method), Python
+    ///   `def main`, Kotlin top-level `fun main`, Scala/Swift `main`;
+    /// - a `static` method named `Main` in C# (case-sensitive) and Java's
+    ///   `public static void main`;
+    /// - a Python module containing a top-level `if __name__ == "__main__":`
+    ///   guard (the marker is attached to the module symbol).
+    ///
+    /// Honest syntactic markers only — never `@main`/`App`-style or framework
+    /// conventions that need more than the name + an immediate modifier.
     Main,
     /// An HTTP route / request handler, identified by a framework decorator,
     /// annotation, or attribute. Carries the raw marker IDENTIFIER as written

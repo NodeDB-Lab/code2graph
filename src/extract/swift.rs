@@ -26,8 +26,8 @@ use tree_sitter::{Node, Parser};
 
 use crate::error::{CodegraphError, Result};
 use crate::graph::types::{
-    Binding, BindingKind, ByteSpan, FileFacts, RefRole, Reference, Scope, ScopeId, ScopeKind,
-    Symbol, SymbolKind, TypeRefContext, Visibility,
+    Binding, BindingKind, ByteSpan, EntryPoint, FileFacts, RefRole, Reference, Scope, ScopeId,
+    ScopeKind, Symbol, SymbolKind, TypeRefContext, Visibility,
 };
 use crate::lang::Language;
 use crate::symbol::Descriptor;
@@ -493,12 +493,20 @@ fn handle_function(
     } else {
         SymbolKind::Function
     };
+    // Name-only across top-level and inside-type (covers `static func main`
+    // of an `@main` type); `@main` itself is deferred.
+    let is_main = name == "main";
     let mut descriptors = prefix.to_vec();
     descriptors.push(Descriptor::Method {
         name: name.clone(),
         disambiguator: String::new(),
     });
     push_symbol(out, ctx, &node, name, kind, visibility, descriptors);
+    if is_main {
+        if let Some(s) = out.last_mut() {
+            s.entry_points.push(EntryPoint::Main);
+        }
+    }
 }
 
 /// Handle `init_declaration` — name is always "init".
@@ -1133,6 +1141,17 @@ mod tests {
 
     fn by_name(facts: &FileFacts, name: &str) -> Option<Symbol> {
         facts.symbols.iter().find(|s| s.name == name).cloned()
+    }
+
+    #[test]
+    fn main_function_is_entry_point() {
+        let facts = extract("func main() {}", "src/main.swift");
+        let main = by_name(&facts, "main").unwrap();
+        assert!(
+            main.entry_points
+                .iter()
+                .any(|e| matches!(e, EntryPoint::Main))
+        );
     }
 
     // Test 1: public class with public func and private func — all emitted with correct visibility.
