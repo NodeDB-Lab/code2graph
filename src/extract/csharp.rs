@@ -23,12 +23,13 @@ use crate::graph::types::{
     Symbol, SymbolKind, TypeRefContext, Visibility,
 };
 use crate::lang::Language;
-use crate::symbol::{Descriptor, SymbolId};
+use crate::symbol::Descriptor;
 
 use super::{
-    Extractor, MIN_REF_LEN, attach_reference_scopes, collect_call_references, definition_bindings,
-    field_text, import_bindings, innermost_scope, node_span, node_text, one_line_signature,
-    push_binding, push_import_ref, push_ref, push_scope, push_type_ref, simple_type_name,
+    ExtractCtx, Extractor, MIN_REF_LEN, attach_reference_scopes, collect_call_references,
+    definition_bindings, field_text, import_bindings, innermost_scope, make_symbol, node_span,
+    node_text, one_line_signature, push_binding, push_import_ref, push_ref, push_scope,
+    push_type_ref, simple_type_name,
 };
 
 /// Tree-sitter query capturing call-callee identifiers.
@@ -196,6 +197,11 @@ fn read_visibility(node: &Node, bytes: &[u8]) -> Visibility {
 
 fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String]) -> Vec<Symbol> {
     let mut out = Vec::new();
+    let ctx = ExtractCtx {
+        bytes,
+        file,
+        lang: Language::CSharp,
+    };
     let ns_descriptors: Vec<Descriptor> = namespaces
         .iter()
         .cloned()
@@ -203,7 +209,7 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
         .collect();
 
     // Walk looking for namespace or type declarations at the top level.
-    collect_types_in(root, bytes, file, &ns_descriptors, false, &mut out);
+    collect_types_in(root, &ctx, &ns_descriptors, false, &mut out);
     out
 }
 
@@ -214,8 +220,7 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
 /// are implicitly public regardless of modifiers).
 fn collect_types_in(
     node: &Node,
-    bytes: &[u8],
-    file: &str,
+    ctx: &ExtractCtx,
     prefix: &[Descriptor],
     implicit_public: bool,
     out: &mut Vec<Symbol>,
@@ -227,7 +232,7 @@ fn collect_types_in(
             "namespace_declaration" | "file_scoped_namespace_declaration" => {
                 // The body holds the type declarations.
                 if let Some(body) = child.child_by_field_name("body") {
-                    collect_types_in(&body, bytes, file, prefix, false, out);
+                    collect_types_in(&body, ctx, prefix, false, out);
                 } else {
                     // file-scoped namespace: members are siblings in compilation_unit
                     // — they will be visited in the outer loop.
@@ -238,7 +243,7 @@ fn collect_types_in(
             | "interface_declaration"
             | "enum_declaration"
             | "record_declaration") => {
-                let Some(type_name) = field_text(&child, "name", bytes) else {
+                let Some(type_name) = field_text(&child, "name", ctx.bytes) else {
                     continue;
                 };
                 let type_kind = match k {
@@ -251,30 +256,27 @@ fn collect_types_in(
                 let vis = if implicit_public {
                     Visibility::Public
                 } else {
-                    read_visibility(&child, bytes)
+                    read_visibility(&child, ctx.bytes)
                 };
 
                 let mut type_descriptors = prefix.to_vec();
                 type_descriptors.push(Descriptor::Type(type_name.clone()));
-                out.push(Symbol {
-                    id: SymbolId::global(Language::CSharp.as_str(), type_descriptors.clone()),
-                    name: type_name.clone(),
-                    kind: type_kind,
-                    visibility: vis,
-                    file: file.to_owned(),
-                    line: (child.start_position().row + 1) as u32,
-                    span: ByteSpan {
-                        start: child.start_byte(),
-                        end: child.end_byte(),
-                    },
-                    signature: one_line_signature(node_text(&child, bytes), &['{', ';']),
-                });
+                let sig = one_line_signature(node_text(&child, ctx.bytes), &['{', ';']);
+                out.push(make_symbol(
+                    ctx,
+                    &child,
+                    type_name.clone(),
+                    type_kind,
+                    vis,
+                    type_descriptors.clone(),
+                    sig,
+                ));
 
                 let implicit = k == "interface_declaration";
 
                 // Descend into the type body for members.
                 if let Some(body) = child.child_by_field_name("body") {
-                    collect_members(&body, bytes, file, &type_descriptors, implicit, out);
+                    collect_members(&body, ctx, &type_descriptors, implicit, out);
                 }
             }
             _ => {}
@@ -286,8 +288,7 @@ fn collect_types_in(
 /// `enum_member_declaration_list`).
 fn collect_members(
     body: &Node,
-    bytes: &[u8],
-    file: &str,
+    ctx: &ExtractCtx,
     type_prefix: &[Descriptor],
     implicit_public: bool,
     out: &mut Vec<Symbol>,
@@ -295,63 +296,57 @@ fn collect_members(
     for member in body.children(&mut body.walk()) {
         match member.kind() {
             "method_declaration" | "constructor_declaration" | "property_declaration" => {
-                let Some(name) = field_text(&member, "name", bytes) else {
+                let Some(name) = field_text(&member, "name", ctx.bytes) else {
                     continue;
                 };
                 let vis = if implicit_public {
                     Visibility::Public
                 } else {
-                    read_visibility(&member, bytes)
+                    read_visibility(&member, ctx.bytes)
                 };
                 let mut descriptors = type_prefix.to_vec();
                 descriptors.push(Descriptor::Method {
                     name: name.clone(),
                     disambiguator: String::new(),
                 });
-                out.push(Symbol {
-                    id: SymbolId::global(Language::CSharp.as_str(), descriptors),
+                let sig = one_line_signature(node_text(&member, ctx.bytes), &['{', ';']);
+                out.push(make_symbol(
+                    ctx,
+                    &member,
                     name,
-                    kind: SymbolKind::Method,
-                    visibility: vis,
-                    file: file.to_owned(),
-                    line: (member.start_position().row + 1) as u32,
-                    span: ByteSpan {
-                        start: member.start_byte(),
-                        end: member.end_byte(),
-                    },
-                    signature: one_line_signature(node_text(&member, bytes), &['{', ';']),
-                });
+                    SymbolKind::Method,
+                    vis,
+                    descriptors,
+                    sig,
+                ));
             }
             "field_declaration" => {
                 let vis = if implicit_public {
                     Visibility::Public
                 } else {
-                    read_visibility(&member, bytes)
+                    read_visibility(&member, ctx.bytes)
                 };
                 // field_declaration has no `name` field — descend into
                 // variable_declaration → variable_declarator.
-                collect_field_declarators(&member, bytes, file, type_prefix, vis, out);
+                collect_field_declarators(&member, ctx, type_prefix, vis, out);
             }
             "enum_member_declaration" => {
                 // Enum members are always public.
-                let Some(name) = field_text(&member, "name", bytes) else {
+                let Some(name) = field_text(&member, "name", ctx.bytes) else {
                     continue;
                 };
                 let mut descriptors = type_prefix.to_vec();
                 descriptors.push(Descriptor::Term(name.clone()));
-                out.push(Symbol {
-                    id: SymbolId::global(Language::CSharp.as_str(), descriptors),
+                let sig = one_line_signature(node_text(&member, ctx.bytes), &['{', ';', ',']);
+                out.push(make_symbol(
+                    ctx,
+                    &member,
                     name,
-                    kind: SymbolKind::Const,
-                    visibility: Visibility::Public,
-                    file: file.to_owned(),
-                    line: (member.start_position().row + 1) as u32,
-                    span: ByteSpan {
-                        start: member.start_byte(),
-                        end: member.end_byte(),
-                    },
-                    signature: one_line_signature(node_text(&member, bytes), &['{', ';', ',']),
-                });
+                    SymbolKind::Const,
+                    Visibility::Public,
+                    descriptors,
+                    sig,
+                ));
             }
             // Nested type declarations inside another type.
             k @ ("class_declaration"
@@ -359,7 +354,7 @@ fn collect_members(
             | "interface_declaration"
             | "enum_declaration"
             | "record_declaration") => {
-                let Some(nested_name) = field_text(&member, "name", bytes) else {
+                let Some(nested_name) = field_text(&member, "name", ctx.bytes) else {
                     continue;
                 };
                 let nested_kind = match k {
@@ -372,33 +367,23 @@ fn collect_members(
                 let vis = if implicit_public {
                     Visibility::Public
                 } else {
-                    read_visibility(&member, bytes)
+                    read_visibility(&member, ctx.bytes)
                 };
                 let mut nested_descriptors = type_prefix.to_vec();
                 nested_descriptors.push(Descriptor::Type(nested_name.clone()));
-                out.push(Symbol {
-                    id: SymbolId::global(Language::CSharp.as_str(), nested_descriptors.clone()),
-                    name: nested_name.clone(),
-                    kind: nested_kind,
-                    visibility: vis,
-                    file: file.to_owned(),
-                    line: (member.start_position().row + 1) as u32,
-                    span: ByteSpan {
-                        start: member.start_byte(),
-                        end: member.end_byte(),
-                    },
-                    signature: one_line_signature(node_text(&member, bytes), &['{', ';']),
-                });
+                let sig = one_line_signature(node_text(&member, ctx.bytes), &['{', ';']);
+                out.push(make_symbol(
+                    ctx,
+                    &member,
+                    nested_name.clone(),
+                    nested_kind,
+                    vis,
+                    nested_descriptors.clone(),
+                    sig,
+                ));
                 let implicit = k == "interface_declaration";
                 if let Some(nested_body) = member.child_by_field_name("body") {
-                    collect_members(
-                        &nested_body,
-                        bytes,
-                        file,
-                        &nested_descriptors,
-                        implicit,
-                        out,
-                    );
+                    collect_members(&nested_body, ctx, &nested_descriptors, implicit, out);
                 }
             }
             _ => {}
@@ -411,8 +396,7 @@ fn collect_members(
 ///   field_declaration → variable_declaration → variable_declarator* → identifier
 fn collect_field_declarators(
     field: &Node,
-    bytes: &[u8],
-    file: &str,
+    ctx: &ExtractCtx,
     type_prefix: &[Descriptor],
     visibility: Visibility,
     out: &mut Vec<Symbol>,
@@ -428,22 +412,19 @@ fn collect_field_declarators(
             // First named child that is an identifier is the variable name.
             for id_node in decl.children(&mut decl.walk()) {
                 if id_node.kind() == "identifier" {
-                    let name = node_text(&id_node, bytes);
+                    let name = node_text(&id_node, ctx.bytes).to_owned();
                     let mut descriptors = type_prefix.to_vec();
-                    descriptors.push(Descriptor::Term(name.to_owned()));
-                    out.push(Symbol {
-                        id: SymbolId::global(Language::CSharp.as_str(), descriptors),
-                        name: name.to_owned(),
-                        kind: SymbolKind::Static,
+                    descriptors.push(Descriptor::Term(name.clone()));
+                    let sig = one_line_signature(node_text(field, ctx.bytes), &['{', ';']);
+                    out.push(make_symbol(
+                        ctx,
+                        field,
+                        name,
+                        SymbolKind::Static,
                         visibility,
-                        file: file.to_owned(),
-                        line: (field.start_position().row + 1) as u32,
-                        span: ByteSpan {
-                            start: field.start_byte(),
-                            end: field.end_byte(),
-                        },
-                        signature: one_line_signature(node_text(field, bytes), &['{', ';']),
-                    });
+                        descriptors,
+                        sig,
+                    ));
                     break; // only the first identifier is the name
                 }
             }
