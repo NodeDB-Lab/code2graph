@@ -30,12 +30,13 @@ use crate::graph::types::{
     Symbol, SymbolKind, TypeRefContext, Visibility,
 };
 use crate::lang::Language;
-use crate::symbol::{Descriptor, SymbolId};
+use crate::symbol::Descriptor;
 
 use super::{
-    Extractor, MIN_REF_LEN, attach_reference_scopes, child_text, collect_call_references,
-    definition_bindings, field_text, import_bindings, innermost_scope, node_span, node_text,
-    one_line_signature, push_binding, push_ref, push_scope, push_type_ref,
+    ExtractCtx, Extractor, MIN_REF_LEN, attach_reference_scopes, child_text,
+    collect_call_references, definition_bindings, field_text, import_bindings, innermost_scope,
+    make_symbol, node_span, node_text, one_line_signature, push_binding, push_ref, push_scope,
+    push_type_ref,
 };
 
 /// Tree-sitter query capturing call-callee identifiers.
@@ -74,8 +75,13 @@ impl Extractor for PhpExtractor {
         let bytes = source.as_bytes();
         let namespaces = php_namespaces(&root, bytes, file);
 
+        let ctx = ExtractCtx {
+            bytes,
+            file,
+            lang: Language::Php,
+        };
         let mut defs = Vec::new();
-        collect_defs(&root, &namespaces, bytes, file, &mut defs);
+        collect_defs(&root, &namespaces, &ctx, &mut defs);
         let def_bindings = definition_bindings(&defs);
         let mut symbols = defs;
         symbols.push(super::module_symbol(
@@ -152,13 +158,8 @@ fn php_namespaces(root: &Node, bytes: &[u8], file: &str) -> Vec<String> {
 ///   `namespace_definition` node under the program root.
 /// - Block form: `namespace App { ... }` — the `namespace_definition` has a
 ///   `body` field; we recurse into it.
-fn collect_defs(
-    container: &Node,
-    namespaces: &[String],
-    bytes: &[u8],
-    file: &str,
-    out: &mut Vec<Symbol>,
-) {
+fn collect_defs(container: &Node, namespaces: &[String], ctx: &ExtractCtx, out: &mut Vec<Symbol>) {
+    let bytes = ctx.bytes;
     let base_descriptors: Vec<Descriptor> = namespaces
         .iter()
         .cloned()
@@ -179,12 +180,12 @@ fn collect_defs(
                 // are effectively public within their namespace.
                 push_symbol(
                     out,
+                    ctx,
                     &child,
                     name,
-                    (SymbolKind::Function, Visibility::Public),
+                    SymbolKind::Function,
+                    Visibility::Public,
                     descriptors,
-                    bytes,
-                    file,
                 );
             }
             kind @ ("class_declaration"
@@ -207,25 +208,25 @@ fn collect_defs(
                 // are effectively public within their namespace.
                 push_symbol(
                     out,
+                    ctx,
                     &child,
                     type_name,
-                    (type_sym_kind, Visibility::Public),
+                    type_sym_kind,
+                    Visibility::Public,
                     type_descriptors.clone(),
-                    bytes,
-                    file,
                 );
 
                 // Interface members are implicitly public.
                 let implicit_public = kind == "interface_declaration";
 
                 if let Some(body) = child.child_by_field_name("body") {
-                    collect_members(&body, &type_descriptors, implicit_public, bytes, file, out);
+                    collect_members(&body, &type_descriptors, implicit_public, ctx, out);
                 }
             }
             "namespace_definition" => {
                 // Block-form namespace: recurse into the compound_statement body.
                 if let Some(body) = child.child_by_field_name("body") {
-                    collect_defs(&body, namespaces, bytes, file, out);
+                    collect_defs(&body, namespaces, ctx, out);
                 }
                 // Statement-form namespace has no body; its sibling declarations
                 // are already visited in the outer loop.
@@ -241,10 +242,10 @@ fn collect_members(
     body: &Node,
     type_descriptors: &[Descriptor],
     implicit_public: bool,
-    bytes: &[u8],
-    file: &str,
+    ctx: &ExtractCtx,
     out: &mut Vec<Symbol>,
 ) {
+    let bytes = ctx.bytes;
     for member in body.children(&mut body.walk()) {
         match member.kind() {
             "method_declaration" => {
@@ -263,12 +264,12 @@ fn collect_members(
                 });
                 push_symbol(
                     out,
+                    ctx,
                     &member,
                     name,
-                    (SymbolKind::Method, vis),
+                    SymbolKind::Method,
+                    vis,
                     descriptors,
-                    bytes,
-                    file,
                 );
             }
             "property_declaration" => {
@@ -297,12 +298,12 @@ fn collect_members(
                     descriptors.push(Descriptor::Term(name.clone()));
                     push_symbol(
                         out,
+                        ctx,
                         &member,
                         name,
-                        (SymbolKind::Static, vis),
+                        SymbolKind::Static,
+                        vis,
                         descriptors,
-                        bytes,
-                        file,
                     );
                 }
             }
@@ -324,15 +325,7 @@ fn collect_members(
                     };
                     let mut descriptors = type_descriptors.to_vec();
                     descriptors.push(Descriptor::Term(name.clone()));
-                    push_symbol(
-                        out,
-                        &member,
-                        name,
-                        (SymbolKind::Const, vis),
-                        descriptors,
-                        bytes,
-                        file,
-                    );
+                    push_symbol(out, ctx, &member, name, SymbolKind::Const, vis, descriptors);
                 }
             }
             _ => {}
@@ -893,26 +886,23 @@ fn collect_params(params: &Node, bytes: &[u8], scopes: &[Scope], out: &mut Vec<B
 /// Build a [`Symbol`] and push it onto `out`.
 fn push_symbol(
     out: &mut Vec<Symbol>,
+    ctx: &ExtractCtx,
     node: &Node,
     name: String,
-    (kind, visibility): (SymbolKind, Visibility),
+    kind: SymbolKind,
+    visibility: Visibility,
     descriptors: Vec<Descriptor>,
-    bytes: &[u8],
-    file: &str,
 ) {
-    out.push(Symbol {
-        id: SymbolId::global(Language::Php.as_str(), descriptors),
+    let signature = one_line_signature(node_text(node, ctx.bytes), &['{', ';']);
+    out.push(make_symbol(
+        ctx,
+        node,
         name,
         kind,
         visibility,
-        file: file.to_owned(),
-        line: (node.start_position().row + 1) as u32,
-        span: ByteSpan {
-            start: node.start_byte(),
-            end: node.end_byte(),
-        },
-        signature: one_line_signature(node_text(node, bytes), &['{', ';']),
-    });
+        descriptors,
+        signature,
+    ));
 }
 
 #[cfg(test)]
