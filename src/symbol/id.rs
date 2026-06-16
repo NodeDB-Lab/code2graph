@@ -18,6 +18,7 @@ use super::descriptor::{Descriptor, parse_descriptor};
 
 /// Package coordinates (SCIP `<manager> <package-name> <version>`). Any field
 /// may be empty when unknown — code2graph leaves these to the consumer.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct Package {
     pub manager: String,

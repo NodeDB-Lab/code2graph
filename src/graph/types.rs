@@ -11,6 +11,7 @@ use crate::symbol::SymbolId;
 
 /// A half-open byte range `[start, end)` into a source file. Consumers slice
 /// their own text from this — code2graph never carries source bodies.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ByteSpan {
     pub start: usize,
@@ -33,6 +34,7 @@ impl ByteSpan {
 
 /// A location in a file. 1-based line, 0-based column, plus the byte offset
 /// (used to attribute a reference to its enclosing symbol).
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Occurrence {
     pub file: String,
@@ -43,6 +45,7 @@ pub struct Occurrence {
 
 /// What kind of program element a symbol is. Cross-language superset; not every
 /// variant applies to every language.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SymbolKind {
     Function,
@@ -70,6 +73,7 @@ pub enum SymbolKind {
 }
 
 /// A symbol definition found in a source file.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone)]
 pub struct Symbol {
     /// SCIP-aligned identity.
@@ -90,6 +94,7 @@ pub struct Symbol {
 
 /// The role a reference plays. `Call`, `IsImplementation`, `Import`, `TypeRef`,
 /// and `ModuleRef` are live; `Read`/`Write` arrive with richer extractors.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RefRole {
     /// The reference is a call or object-creation site.
@@ -118,6 +123,7 @@ pub enum RefRole {
 
 /// Sub-type position for a [`RefRole::TypeRef`] reference — lets consumers ask
 /// "what uses T as a return type" without splitting the `TypeRef` role.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TypeRefContext {
     /// The type appears as a function or method parameter type.
@@ -136,6 +142,7 @@ pub enum TypeRefContext {
 
 /// A reference (call site / usage) found in a source file. Pre-resolution it
 /// carries only the written `name`; the resolver links it to a [`Symbol`].
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone)]
 pub struct Reference {
     /// The bare identifier as written at the use site.
@@ -171,6 +178,7 @@ pub type ScopeId = usize;
 
 /// What kind of lexical name-resolution region a scope is. Cross-language
 /// superset; not every variant applies to every language.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ScopeKind {
     /// A file-level or explicit module/namespace scope.
@@ -186,6 +194,7 @@ pub enum ScopeKind {
 }
 
 /// A lexical scope: a nested name-resolution region within one file.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Scope {
     /// The enclosing scope, or `None` for the file/module root scope.
@@ -197,6 +206,7 @@ pub struct Scope {
 }
 
 /// What kind of binding a name introduces — drives lexical visibility rules.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BindingKind {
     /// A local variable introduced by a `let`/`var`/assignment.
@@ -211,6 +221,7 @@ pub enum BindingKind {
 }
 
 /// What a binding resolves to — the target of a name introduced by a [`Binding`].
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BindingTarget {
     /// File-local binding (parameter or `let`/`var`) — no global [`Symbol`].
@@ -224,6 +235,7 @@ pub enum BindingTarget {
 
 /// A name introduced into a scope — a parameter, local variable, import alias,
 /// or a top-level definition that participates in lexical lookup.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Binding {
     /// The scope in which this name is introduced.
@@ -243,6 +255,7 @@ pub struct Binding {
 
 /// How confident the resolver is in an [`Edge`] — the precision marker that lets
 /// consumers (e.g. a quality analyzer) gate on resolution quality.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Confidence {
     /// Type/scope-precise (e.g. stack-graphs or type inference): exactly one binding.
@@ -262,6 +275,7 @@ pub enum Confidence {
 /// — e.g. trust scope-resolved edges over name-matched ones, or treat the
 /// deterministic-but-cross-runtime FFI bridges specially — independently of the
 /// per-edge confidence.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Provenance {
     /// Derived by name-based matching against the global symbol table (the
@@ -281,6 +295,7 @@ pub enum Provenance {
 /// The application binary interface a symbol is exported under for
 /// cross-language linkage. Cross-language superset; grows as binding generators
 /// are recognised.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FfiAbi {
     /// The C ABI — the lingua-franca FFI boundary (`#[no_mangle]` / `extern "C"`
@@ -323,6 +338,7 @@ impl FfiAbi {
 /// [`symbol`]: Self::symbol
 /// [`export_name`]: Self::export_name
 /// [`abi`]: Self::abi
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FfiExport {
     /// The exported definition's SCIP identity.
@@ -334,6 +350,7 @@ pub struct FfiExport {
 }
 
 /// A resolved directed edge between two symbols.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone)]
 pub struct Edge {
     pub from: SymbolId,
@@ -351,6 +368,7 @@ pub struct Edge {
 }
 
 /// The neutral facts extracted from a single file (extractor output, resolver input).
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone)]
 pub struct FileFacts {
     /// File path relative to the project root.
@@ -373,8 +391,85 @@ pub struct FileFacts {
 }
 
 /// The resolved whole-project graph: definitions plus cross-file edges.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Default)]
 pub struct CodeGraph {
     pub symbols: Vec<Symbol>,
     pub edges: Vec<Edge>,
+}
+
+#[cfg(all(test, feature = "serde"))]
+mod serde_tests {
+    use super::*;
+    use crate::symbol::{Descriptor, SymbolId};
+
+    fn make_symbol_id() -> SymbolId {
+        SymbolId::global(
+            "rust",
+            vec![
+                Descriptor::Namespace("auth".into()),
+                Descriptor::Term("validate".into()),
+            ],
+        )
+    }
+
+    #[test]
+    fn symbol_id_serializes_as_scip_string() {
+        let id = make_symbol_id();
+        let json = serde_json::to_string(&id).expect("serialize SymbolId");
+        let expected = format!("\"{}\"", id.to_scip_string());
+        assert_eq!(json, expected);
+    }
+
+    #[test]
+    fn symbol_id_round_trips() {
+        let id = make_symbol_id();
+        let json = serde_json::to_string(&id).expect("serialize");
+        let id2: SymbolId = serde_json::from_str(&json).expect("deserialize");
+        // to_scip_string is the identity; lang is not encoded in the string so
+        // compare via the rendered form rather than structural equality.
+        assert_eq!(id.to_scip_string(), id2.to_scip_string());
+    }
+
+    #[test]
+    fn file_facts_round_trips_via_json() {
+        let id = make_symbol_id();
+        let facts = FileFacts {
+            file: "src/auth.rs".into(),
+            lang: "rust".into(),
+            symbols: vec![Symbol {
+                id: id.clone(),
+                name: "validate".into(),
+                kind: SymbolKind::Function,
+                file: "src/auth.rs".into(),
+                line: 1,
+                span: ByteSpan { start: 0, end: 20 },
+                signature: "pub fn validate()".into(),
+            }],
+            references: vec![Reference {
+                name: "validate".into(),
+                occ: Occurrence {
+                    file: "src/main.rs".into(),
+                    line: 5,
+                    col: 4,
+                    byte: 80,
+                },
+                role: RefRole::Call,
+                source_module: None,
+                from_path: None,
+                qualifier: None,
+                scope: None,
+                type_ref_ctx: None,
+            }],
+            scopes: vec![],
+            bindings: vec![],
+            ffi_exports: vec![],
+        };
+
+        let json = serde_json::to_string(&facts).expect("serialize FileFacts");
+        let facts2: FileFacts = serde_json::from_str(&json).expect("deserialize FileFacts");
+        // FileFacts does not derive PartialEq; assert JSON stability instead.
+        let json2 = serde_json::to_string(&facts2).expect("re-serialize FileFacts");
+        assert_eq!(json, json2);
+    }
 }

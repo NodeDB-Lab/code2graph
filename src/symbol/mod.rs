@@ -4,6 +4,8 @@
 
 pub mod descriptor;
 pub mod id;
+#[cfg(feature = "serde")]
+mod serde_impl;
 
 pub use descriptor::Descriptor;
 pub use id::{Package, SCHEME, SymbolId, SymbolParseError};

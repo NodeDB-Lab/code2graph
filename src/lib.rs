@@ -47,7 +47,7 @@
 //!
 //! ## Coverage
 //!
-//! All 14 languages ([`lang::Language`]) are implemented end-to-end, each
+//! All 23 languages ([`lang::Language`]) are implemented end-to-end, each
 //! behind the [`extract::Extractor`] trait.
 
 pub mod error;

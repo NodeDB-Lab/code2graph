@@ -14,7 +14,8 @@ categories = ["development-tools", "parsing"]
 
 [features]
 default = ["rust","python","typescript","go","java","c","cpp","ruby","php","shell","swift","kotlin","solidity","sql","hcl","csharp","scala","dart","lua","luau","pascal","svelte"]
-manifest = ["dep:toml", "dep:serde", "dep:serde_json"]
+manifest = ["dep:toml", "dep:serde_json", "serde"]
+serde = ["dep:serde"]
 rust = ["dep:tree-sitter-rust"]
 python = ["dep:tree-sitter-python"]
 typescript = ["dep:tree-sitter-typescript"]
@@ -67,6 +68,9 @@ tree-sitter-lua = { version = "0.5.0", optional = true }
 tree-sitter-luau = { version = "1.2.0", optional = true }
 tree-sitter-pascal = { version = "0.10.2", optional = true }
 tree-sitter-svelte-ng = { version = "1.0.2", optional = true }
+
+[dev-dependencies]
+serde_json = "1"
 
 [profile.release]
 opt-level = 3
