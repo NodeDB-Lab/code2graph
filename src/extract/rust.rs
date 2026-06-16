@@ -14,7 +14,7 @@ use tree_sitter::{Language as TsLanguage, Node, Parser, Query, QueryCursor, Stre
 use crate::error::{CodegraphError, Result};
 use crate::graph::types::{
     Binding, BindingKind, ByteSpan, FfiAbi, FfiExport, FileFacts, RefRole, Reference, Scope,
-    ScopeId, ScopeKind, Symbol, SymbolKind,
+    ScopeId, ScopeKind, Symbol, SymbolKind, Visibility,
 };
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
@@ -203,6 +203,7 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
             id: SymbolId::global(Language::Rust.as_str(), descriptors),
             name: leaf.name().to_owned(),
             kind,
+            visibility: Visibility::Public,
             file: file.to_owned(),
             line: (child.start_position().row + 1) as u32,
             span: ByteSpan {
@@ -264,6 +265,7 @@ fn push_member_symbol(
         id: SymbolId::global(Language::Rust.as_str(), descriptors),
         name: sym_name,
         kind,
+        visibility: Visibility::Public,
         file: file.to_owned(),
         line: (member.start_position().row + 1) as u32,
         span: ByteSpan {

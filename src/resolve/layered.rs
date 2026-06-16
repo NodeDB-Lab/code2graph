@@ -143,7 +143,7 @@ mod tests {
     use super::*;
     use crate::graph::types::{
         ByteSpan, CodeGraph, Confidence, Edge, FileFacts, Occurrence, Provenance, RefRole, Symbol,
-        SymbolKind,
+        SymbolKind, Visibility,
     };
     use crate::symbol::{Descriptor, SymbolId};
 
@@ -164,6 +164,7 @@ mod tests {
             id: make_id(ns, name),
             name: name.into(),
             kind: SymbolKind::Function,
+            visibility: Visibility::Public,
             file: format!("src/{ns}.rs"),
             line: 1,
             span: ByteSpan { start: 0, end: 10 },

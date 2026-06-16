@@ -20,7 +20,7 @@ use tree_sitter::{Node, Parser};
 use crate::error::{CodegraphError, Result};
 use crate::graph::types::{
     Binding, BindingKind, ByteSpan, FileFacts, RefRole, Reference, Scope, ScopeId, ScopeKind,
-    Symbol, SymbolKind, TypeRefContext,
+    Symbol, SymbolKind, TypeRefContext, Visibility,
 };
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
@@ -231,6 +231,7 @@ fn collect_types_in(
                     id: SymbolId::global(Language::CSharp.as_str(), type_descriptors.clone()),
                     name: type_name.clone(),
                     kind: type_kind,
+                    visibility: Visibility::Public,
                     file: file.to_owned(),
                     line: (child.start_position().row + 1) as u32,
                     span: ByteSpan {
@@ -280,6 +281,7 @@ fn collect_members(
                     id: SymbolId::global(Language::CSharp.as_str(), descriptors),
                     name,
                     kind: SymbolKind::Method,
+                    visibility: Visibility::Public,
                     file: file.to_owned(),
                     line: (member.start_position().row + 1) as u32,
                     span: ByteSpan {
@@ -308,6 +310,7 @@ fn collect_members(
                     id: SymbolId::global(Language::CSharp.as_str(), descriptors),
                     name,
                     kind: SymbolKind::Const,
+                    visibility: Visibility::Public,
                     file: file.to_owned(),
                     line: (member.start_position().row + 1) as u32,
                     span: ByteSpan {
@@ -342,6 +345,7 @@ fn collect_members(
                     id: SymbolId::global(Language::CSharp.as_str(), nested_descriptors.clone()),
                     name: nested_name.clone(),
                     kind: nested_kind,
+                    visibility: Visibility::Public,
                     file: file.to_owned(),
                     line: (member.start_position().row + 1) as u32,
                     span: ByteSpan {
@@ -395,6 +399,7 @@ fn collect_field_declarators(
                         id: SymbolId::global(Language::CSharp.as_str(), descriptors),
                         name: name.to_owned(),
                         kind: SymbolKind::Static,
+                        visibility: Visibility::Public,
                         file: file.to_owned(),
                         line: (field.start_position().row + 1) as u32,
                         span: ByteSpan {

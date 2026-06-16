@@ -17,7 +17,7 @@ use tree_sitter::{Node, Parser};
 use crate::error::{CodegraphError, Result};
 use crate::graph::types::{
     Binding, BindingKind, ByteSpan, FileFacts, RefRole, Reference, Scope, ScopeId, ScopeKind,
-    Symbol, SymbolKind, TypeRefContext,
+    Symbol, SymbolKind, TypeRefContext, Visibility,
 };
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
@@ -174,6 +174,7 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
             id: SymbolId::global(Language::Java.as_str(), type_descriptors),
             name: type_name.clone(),
             kind: type_sym_kind,
+            visibility: Visibility::Public,
             file: file.to_owned(),
             line: (child.start_position().row + 1) as u32,
             span: ByteSpan {
@@ -257,6 +258,7 @@ fn collect_members(
                     id: SymbolId::global(Language::Java.as_str(), descriptors),
                     name,
                     kind: SymbolKind::Method,
+                    visibility: Visibility::Public,
                     file: file.to_owned(),
                     line: (member.start_position().row + 1) as u32,
                     span: ByteSpan {
@@ -287,6 +289,7 @@ fn collect_members(
                         id: SymbolId::global(Language::Java.as_str(), descriptors),
                         name: var_name,
                         kind: SymbolKind::Static,
+                        visibility: Visibility::Public,
                         file: file.to_owned(),
                         line: (member.start_position().row + 1) as u32,
                         span: ByteSpan {

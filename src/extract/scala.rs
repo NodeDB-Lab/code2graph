@@ -17,7 +17,7 @@ use tree_sitter::{Node, Parser};
 use crate::error::{CodegraphError, Result};
 use crate::graph::types::{
     Binding, BindingKind, ByteSpan, FileFacts, RefRole, Reference, Scope, ScopeId, ScopeKind,
-    Symbol, SymbolKind, TypeRefContext,
+    Symbol, SymbolKind, TypeRefContext, Visibility,
 };
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
@@ -233,6 +233,7 @@ fn emit_type_def(
         id: SymbolId::global(Language::Scala.as_str(), descriptors.clone()),
         name: name.clone(),
         kind,
+        visibility: Visibility::Unknown,
         file: file.to_owned(),
         line: (node.start_position().row + 1) as u32,
         span: ByteSpan {
@@ -265,6 +266,7 @@ fn emit_enum_def(
         id: SymbolId::global(Language::Scala.as_str(), descriptors.clone()),
         name: name.clone(),
         kind: SymbolKind::Enum,
+        visibility: Visibility::Unknown,
         file: file.to_owned(),
         line: (node.start_position().row + 1) as u32,
         span: ByteSpan {
@@ -298,6 +300,7 @@ fn emit_enum_def(
                         id: SymbolId::global(Language::Scala.as_str(), case_desc),
                         name: case_name,
                         kind: SymbolKind::Const,
+                        visibility: Visibility::Unknown,
                         file: file.to_owned(),
                         line: (case.start_position().row + 1) as u32,
                         span: ByteSpan {
@@ -374,6 +377,7 @@ fn emit_function(
         id: SymbolId::global(Language::Scala.as_str(), descriptors),
         name,
         kind: SymbolKind::Method,
+        visibility: Visibility::Unknown,
         file: file.to_owned(),
         line: (node.start_position().row + 1) as u32,
         span: ByteSpan {
@@ -417,6 +421,7 @@ fn emit_val_or_var(
         id: SymbolId::global(Language::Scala.as_str(), descriptors),
         name,
         kind,
+        visibility: Visibility::Unknown,
         file: file.to_owned(),
         line: (node.start_position().row + 1) as u32,
         span: ByteSpan {
@@ -445,6 +450,7 @@ fn emit_type_alias(
         id: SymbolId::global(Language::Scala.as_str(), descriptors),
         name,
         kind: SymbolKind::TypeAlias,
+        visibility: Visibility::Unknown,
         file: file.to_owned(),
         line: (node.start_position().row + 1) as u32,
         span: ByteSpan {

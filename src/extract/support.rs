@@ -15,7 +15,7 @@ use tree_sitter::{Language as TsLanguage, Node, Query, QueryCursor, StreamingIte
 use crate::error::{CodegraphError, Result};
 use crate::graph::types::{
     Binding, BindingKind, BindingTarget, ByteSpan, Occurrence, RefRole, Reference, Scope, ScopeId,
-    ScopeKind, Symbol, SymbolKind, TypeRefContext,
+    ScopeKind, Symbol, SymbolKind, TypeRefContext, Visibility,
 };
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
@@ -107,6 +107,7 @@ pub(crate) fn module_symbol(
         id: SymbolId::global(lang.as_str(), descriptors),
         name,
         kind: SymbolKind::Module,
+        visibility: Visibility::Public,
         file: file.to_owned(),
         line: 1,
         span: ByteSpan {

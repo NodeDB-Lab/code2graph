@@ -59,7 +59,7 @@ mod tests {
     use super::*;
     use crate::graph::types::{
         Binding, BindingKind, BindingTarget, ByteSpan, FfiAbi, FfiExport, FileFacts, Symbol,
-        SymbolKind,
+        SymbolKind, Visibility,
     };
     use crate::symbol::{Descriptor, SymbolId};
 
@@ -68,6 +68,7 @@ mod tests {
             id,
             name: "foo".into(),
             kind: SymbolKind::Function,
+            visibility: Visibility::Public,
             file: "src/lib.rs".into(),
             line: 1,
             span: ByteSpan { start: 0, end: 10 },

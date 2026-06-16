@@ -72,6 +72,26 @@ pub enum SymbolKind {
     Other,
 }
 
+/// The declared visibility of a [`Symbol`] — a neutral fact, not a policy. The
+/// extractor records what the syntax says; the consumer decides what to filter.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Visibility {
+    /// Visible across module/package boundaries (Rust `pub`, Go capitalized,
+    /// Java/PHP/C#/Kotlin `public`, exported, …).
+    Public,
+    /// Module/crate/package-scoped: `pub(crate)`/`pub(super)`, Java package-private,
+    /// Swift/Kotlin/C#/Solidity `internal`, Scala `private[pkg]`.
+    Internal,
+    /// Visible to subclasses only (`protected`).
+    Protected,
+    /// Visible only within the defining scope (`private`, C internal linkage).
+    Private,
+    /// The AST cannot determine visibility syntactically (Ruby runtime visibility,
+    /// dynamic languages, conventions like Dart's `_` prefix). Never guessed.
+    Unknown,
+}
+
 /// A symbol definition found in a source file.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone)]
@@ -82,6 +102,8 @@ pub struct Symbol {
     pub name: String,
     /// Element kind.
     pub kind: SymbolKind,
+    /// Declared visibility (a neutral fact; consumers apply their own public/private policy).
+    pub visibility: Visibility,
     /// File path relative to the project root.
     pub file: String,
     /// 1-based line of the definition.
@@ -470,6 +492,7 @@ mod confidence_tests {
             id: make_id("sym"),
             name: "sym".into(),
             kind: SymbolKind::Function,
+            visibility: Visibility::Public,
             file: "src/a.rs".into(),
             line: 1,
             span: ByteSpan { start: 0, end: 10 },
@@ -564,6 +587,7 @@ mod serde_tests {
                 id: id.clone(),
                 name: "validate".into(),
                 kind: SymbolKind::Function,
+                visibility: Visibility::Public,
                 file: "src/auth.rs".into(),
                 line: 1,
                 span: ByteSpan { start: 0, end: 20 },

@@ -21,7 +21,7 @@ use tree_sitter::{Node, Parser};
 use crate::error::{CodegraphError, Result};
 use crate::graph::types::{
     Binding, BindingKind, ByteSpan, FileFacts, RefRole, Reference, Scope, ScopeId, ScopeKind,
-    Symbol, SymbolKind,
+    Symbol, SymbolKind, Visibility,
 };
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
@@ -242,6 +242,7 @@ fn collect_function_declaration(
                 id: SymbolId::global(lang.as_str(), descriptors),
                 name,
                 kind: SymbolKind::Function,
+                visibility: Visibility::Unknown,
                 file: file.to_owned(),
                 line: (node.start_position().row + 1) as u32,
                 span: ByteSpan {
@@ -276,6 +277,7 @@ fn collect_function_declaration(
                 id: SymbolId::global(lang.as_str(), descriptors),
                 name: method,
                 kind: SymbolKind::Method,
+                visibility: Visibility::Unknown,
                 file: file.to_owned(),
                 line: (node.start_position().row + 1) as u32,
                 span: ByteSpan {
@@ -383,6 +385,7 @@ fn emit_local_symbol(
         id: SymbolId::global(lang.as_str(), descriptors.clone()),
         name,
         kind,
+        visibility: Visibility::Unknown,
         file: file.to_owned(),
         line: (decl_node.start_position().row + 1) as u32,
         span: ByteSpan {
@@ -436,6 +439,7 @@ fn collect_table_fields(
             id: SymbolId::global(lang.as_str(), descriptors),
             name: fname,
             kind,
+            visibility: Visibility::Unknown,
             file: file.to_owned(),
             line: (child.start_position().row + 1) as u32,
             span: ByteSpan {
@@ -471,6 +475,7 @@ fn collect_type_definition(
         id: SymbolId::global(lang.as_str(), descriptors),
         name,
         kind: SymbolKind::TypeAlias,
+        visibility: Visibility::Unknown,
         file: file.to_owned(),
         line: (node.start_position().row + 1) as u32,
         span: ByteSpan {

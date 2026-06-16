@@ -20,7 +20,7 @@ use tree_sitter::{Node, Parser};
 use crate::error::{CodegraphError, Result};
 use crate::graph::types::{
     Binding, BindingKind, BindingTarget, ByteSpan, FileFacts, RefRole, Reference, Scope, ScopeId,
-    ScopeKind, Symbol, SymbolKind,
+    ScopeKind, Symbol, SymbolKind, Visibility,
 };
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
@@ -148,6 +148,7 @@ fn extract_table(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Symbol>) {
         id: SymbolId::global(Language::Sql.as_str(), table_descriptors),
         name: table_name.clone(),
         kind: SymbolKind::Table,
+        visibility: Visibility::Public,
         file: file.to_owned(),
         line: (node.start_position().row + 1) as u32,
         span: ByteSpan {
@@ -180,6 +181,7 @@ fn extract_table(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Symbol>) {
             id: SymbolId::global(Language::Sql.as_str(), col_descriptors),
             name: col_name,
             kind: SymbolKind::Column,
+            visibility: Visibility::Public,
             file: file.to_owned(),
             line: (col_child.start_position().row + 1) as u32,
             span: ByteSpan {
@@ -203,6 +205,7 @@ fn extract_view(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Symbol>) {
         id: SymbolId::global(Language::Sql.as_str(), view_descriptors),
         name: view_name,
         kind: SymbolKind::View,
+        visibility: Visibility::Public,
         file: file.to_owned(),
         line: (node.start_position().row + 1) as u32,
         span: ByteSpan {
@@ -378,6 +381,7 @@ fn collect_cte_symbols_dfs(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<
                     id: SymbolId::global(Language::Sql.as_str(), descriptors),
                     name,
                     kind: SymbolKind::Other,
+                    visibility: Visibility::Public,
                     file: file.to_owned(),
                     line: (node.start_position().row + 1) as u32,
                     span: node_span(node),

@@ -18,7 +18,7 @@ use tree_sitter::{Node, Parser};
 use crate::error::{CodegraphError, Result};
 use crate::graph::types::{
     Binding, BindingKind, ByteSpan, FileFacts, RefRole, Reference, Scope, ScopeId, ScopeKind,
-    Symbol, SymbolKind, TypeRefContext,
+    Symbol, SymbolKind, TypeRefContext, Visibility,
 };
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
@@ -189,6 +189,7 @@ fn collect_class(
         id: SymbolId::global(Language::Dart.as_str(), descriptors.clone()),
         name: name.clone(),
         kind,
+        visibility: Visibility::Unknown,
         file: file.to_owned(),
         line: (node.start_position().row + 1) as u32,
         span: ByteSpan {
@@ -223,6 +224,7 @@ fn collect_mixin(
         id: SymbolId::global(Language::Dart.as_str(), descriptors.clone()),
         name: name.clone(),
         kind: SymbolKind::Trait,
+        visibility: Visibility::Unknown,
         file: file.to_owned(),
         line: (node.start_position().row + 1) as u32,
         span: ByteSpan {
@@ -255,6 +257,7 @@ fn collect_enum(
         id: SymbolId::global(Language::Dart.as_str(), descriptors.clone()),
         name: name.clone(),
         kind: SymbolKind::Enum,
+        visibility: Visibility::Unknown,
         file: file.to_owned(),
         line: (node.start_position().row + 1) as u32,
         span: ByteSpan {
@@ -275,6 +278,7 @@ fn collect_enum(
                         id: SymbolId::global(Language::Dart.as_str(), const_desc),
                         name: const_name,
                         kind: SymbolKind::Const,
+                        visibility: Visibility::Unknown,
                         file: file.to_owned(),
                         line: (member.start_position().row + 1) as u32,
                         span: ByteSpan {
@@ -308,6 +312,7 @@ fn collect_extension(
         id: SymbolId::global(Language::Dart.as_str(), descriptors.clone()),
         name: name.clone(),
         kind: SymbolKind::Class,
+        visibility: Visibility::Unknown,
         file: file.to_owned(),
         line: (node.start_position().row + 1) as u32,
         span: ByteSpan {
@@ -344,6 +349,7 @@ fn collect_type_alias(
         id: SymbolId::global(Language::Dart.as_str(), descriptors),
         name,
         kind: SymbolKind::TypeAlias,
+        visibility: Visibility::Unknown,
         file: file.to_owned(),
         line: (node.start_position().row + 1) as u32,
         span: ByteSpan {
@@ -380,6 +386,7 @@ fn collect_top_function(
         id: SymbolId::global(Language::Dart.as_str(), descriptors),
         name,
         kind: SymbolKind::Function,
+        visibility: Visibility::Unknown,
         file: file.to_owned(),
         line: (node.start_position().row + 1) as u32,
         span: ByteSpan {
@@ -428,6 +435,7 @@ fn emit_initialized_identifiers(
                     id: SymbolId::global(Language::Dart.as_str(), descriptors),
                     name,
                     kind: SymbolKind::Static,
+                    visibility: Visibility::Unknown,
                     file: file.to_owned(),
                     line: (decl_node.start_position().row + 1) as u32,
                     span: ByteSpan {
@@ -535,6 +543,7 @@ fn emit_method(
         id: SymbolId::global(Language::Dart.as_str(), descriptors),
         name,
         kind: SymbolKind::Method,
+        visibility: Visibility::Unknown,
         file: file.to_owned(),
         line: (node.start_position().row + 1) as u32,
         span: ByteSpan {

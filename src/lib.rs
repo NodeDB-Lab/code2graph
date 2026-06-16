@@ -64,7 +64,7 @@ pub use extract::{Extractor, extract_file, extract_path};
 pub use graph::{
     Binding, BindingKind, BindingTarget, ByteSpan, CodeGraph, Confidence, Edge, FfiAbi, FfiExport,
     FileFacts, Occurrence, Provenance, RefRole, Reference, Scope, ScopeId, ScopeKind, Symbol,
-    SymbolKind, TypeRefContext,
+    SymbolKind, TypeRefContext, Visibility,
 };
 pub use lang::Language;
 pub use resolve::{

@@ -17,7 +17,7 @@ use tree_sitter::{Node, Parser};
 use crate::error::{CodegraphError, Result};
 use crate::graph::types::{
     Binding, BindingKind, ByteSpan, FfiAbi, FfiExport, FileFacts, RefRole, Reference, Scope,
-    ScopeId, ScopeKind, Symbol, SymbolKind, TypeRefContext,
+    ScopeId, ScopeKind, Symbol, SymbolKind, TypeRefContext, Visibility,
 };
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
@@ -203,6 +203,7 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
                 id: SymbolId::global(Language::C.as_str(), descriptors),
                 name,
                 kind,
+                visibility: Visibility::Public,
                 file: file.to_owned(),
                 line: (node.start_position().row + 1) as u32,
                 span: ByteSpan {

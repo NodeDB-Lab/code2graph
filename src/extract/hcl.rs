@@ -25,7 +25,7 @@ use tree_sitter::{Node, Parser};
 
 use crate::error::{CodegraphError, Result};
 use crate::graph::types::{
-    ByteSpan, FileFacts, RefRole, Reference, Scope, ScopeKind, Symbol, SymbolKind,
+    ByteSpan, FileFacts, RefRole, Reference, Scope, ScopeKind, Symbol, SymbolKind, Visibility,
 };
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
@@ -225,6 +225,7 @@ fn extract_block_symbol(block: &Node, bytes: &[u8], file: &str) -> Option<Symbol
                 id: SymbolId::global(Language::Hcl.as_str(), descriptors),
                 name: res_name.clone(),
                 kind: SymbolKind::Resource,
+                visibility: Visibility::Public,
                 file: file.to_owned(),
                 line,
                 span,
@@ -250,6 +251,7 @@ fn extract_block_symbol(block: &Node, bytes: &[u8], file: &str) -> Option<Symbol
                 id: SymbolId::global(Language::Hcl.as_str(), descriptors),
                 name: src_name.clone(),
                 kind: SymbolKind::Resource,
+                visibility: Visibility::Public,
                 file: file.to_owned(),
                 line,
                 span,
@@ -271,6 +273,7 @@ fn extract_block_symbol(block: &Node, bytes: &[u8], file: &str) -> Option<Symbol
                 id: SymbolId::global(Language::Hcl.as_str(), descriptors),
                 name: mod_name.clone(),
                 kind: SymbolKind::Module,
+                visibility: Visibility::Public,
                 file: file.to_owned(),
                 line,
                 span,

@@ -21,7 +21,7 @@ use tree_sitter::{Node, Parser};
 use crate::error::{CodegraphError, Result};
 use crate::graph::types::{
     Binding, BindingKind, ByteSpan, FileFacts, RefRole, Reference, Scope, ScopeId, ScopeKind,
-    Symbol, SymbolKind, TypeRefContext,
+    Symbol, SymbolKind, TypeRefContext, Visibility,
 };
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
@@ -248,6 +248,7 @@ fn collect_decl_type(
         id: SymbolId::global(Language::Pascal.as_str(), type_descriptors.clone()),
         name: name.clone(),
         kind,
+        visibility: Visibility::Unknown,
         file: file.to_owned(),
         line: (node.start_position().row + 1) as u32,
         span: ByteSpan {
@@ -315,6 +316,7 @@ fn collect_enum_values(
                     id: SymbolId::global(Language::Pascal.as_str(), descriptors),
                     name: val_name,
                     kind: SymbolKind::Const,
+                    visibility: Visibility::Unknown,
                     file: file.to_owned(),
                     line: (child.start_position().row + 1) as u32,
                     span: ByteSpan {
@@ -394,6 +396,7 @@ fn emit_method(
         id: SymbolId::global(Language::Pascal.as_str(), descriptors),
         name,
         kind: SymbolKind::Method,
+        visibility: Visibility::Unknown,
         file: file.to_owned(),
         line: (node.start_position().row + 1) as u32,
         span: ByteSpan {
@@ -421,6 +424,7 @@ fn emit_field(
         id: SymbolId::global(Language::Pascal.as_str(), descriptors),
         name,
         kind: SymbolKind::Static,
+        visibility: Visibility::Unknown,
         file: file.to_owned(),
         line: (node.start_position().row + 1) as u32,
         span: ByteSpan {
@@ -464,6 +468,7 @@ fn collect_impl_procs(
                                 id: SymbolId::global(Language::Pascal.as_str(), descriptors),
                                 name,
                                 kind: SymbolKind::Function,
+                                visibility: Visibility::Unknown,
                                 file: file.to_owned(),
                                 line: (child.start_position().row + 1) as u32,
                                 span: ByteSpan {
