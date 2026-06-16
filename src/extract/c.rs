@@ -19,8 +19,8 @@ use tree_sitter::{Node, Parser};
 
 use crate::error::{CodegraphError, Result};
 use crate::graph::types::{
-    Binding, BindingKind, ByteSpan, EntryPoint, FfiAbi, FfiExport, FileFacts, RefRole, Reference,
-    Scope, ScopeId, ScopeKind, Symbol, SymbolKind, TypeRefContext, Visibility,
+    Binding, BindingKind, ByteSpan, EntryPoint, FfiExport, FileFacts, RefRole, Reference, Scope,
+    ScopeId, ScopeKind, Symbol, SymbolKind, TypeRefContext, Visibility,
 };
 use crate::lang::Language;
 use crate::symbol::Descriptor;
@@ -118,17 +118,20 @@ fn c_namespaces(file: &str) -> Vec<String> {
         .collect()
 }
 
-/// Emit a JNI [`FfiExport`] for each function whose name follows the `Java_*`
-/// mangling — the common case where a Java `native` method's implementation is
+/// Emit an [`FfiExport`] for each function whose name carries a by-name ABI
+/// classification ([`crate::ffi::c_name_export_abi`]) — today the `Java_*`
+/// mangling, the common case where a Java `native` method's implementation is
 /// written in C. The resolver bridges it to the declaring Java method.
 fn jni_exports(symbols: &[Symbol]) -> Vec<FfiExport> {
     symbols
         .iter()
-        .filter(|s| s.kind == SymbolKind::Function && s.name.starts_with("Java_"))
-        .map(|s| FfiExport {
-            symbol: s.id.clone(),
-            abi: FfiAbi::Jni,
-            export_name: s.name.clone(),
+        .filter(|s| s.kind == SymbolKind::Function)
+        .filter_map(|s| {
+            crate::ffi::c_name_export_abi(&s.name).map(|abi| FfiExport {
+                symbol: s.id.clone(),
+                abi,
+                export_name: s.name.clone(),
+            })
         })
         .collect()
 }

@@ -396,21 +396,6 @@ pub enum FfiAbi {
     Jni,
 }
 
-impl FfiAbi {
-    /// The language tags ([`Language::as_str`](crate::lang::Language::as_str))
-    /// whose call sites can consume an export under this ABI. A bridge is only
-    /// drawn to a consumer in one of these languages — so a C call never binds
-    /// to a Python-only export, and vice versa.
-    pub fn consumers(&self) -> &'static [&'static str] {
-        match self {
-            FfiAbi::C => &["c", "cpp"],
-            FfiAbi::Python => &["python"],
-            FfiAbi::Wasm | FfiAbi::NodeApi => &["javascript", "typescript"],
-            FfiAbi::Jni => &["java"],
-        }
-    }
-}
-
 /// A neutral cross-language export fact: the definition identified by [`symbol`]
 /// is callable from another language under [`export_name`] via [`abi`]. The
 /// extractor records it from a deterministic syntactic marker (e.g. Rust's

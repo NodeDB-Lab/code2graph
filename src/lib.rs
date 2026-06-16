@@ -52,6 +52,7 @@
 
 pub mod error;
 pub mod extract;
+mod ffi;
 pub mod grammar;
 pub mod graph;
 pub mod lang;

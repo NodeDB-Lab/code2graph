@@ -577,104 +577,21 @@ fn collect_ffi_exports(root: &Node, bytes: &[u8], defs: &[Symbol]) -> Vec<FfiExp
 /// The FFI exports a function declares, derived from its attributes.
 ///
 /// In tree-sitter-rust an item's outer attributes are its **preceding siblings**
-/// (not children), so we walk back over the run of `attribute_item` nodes.
-/// Detection reads attribute text, so it is robust to spelling variants
-/// (`#[no_mangle]` vs `#[unsafe(no_mangle)]`).
+/// (not children), so we walk back over the run of `attribute_item` nodes,
+/// collecting their texts. The marker→ABI classification lives in the neutral
+/// per-ABI registry ([`crate::ffi::rust_exports`]); reading attribute text keeps
+/// it robust to spelling variants (`#[no_mangle]` vs `#[unsafe(no_mangle)]`).
 fn fn_ffi_exports(func: &Node, bytes: &[u8], fn_name: &str) -> Vec<(FfiAbi, String)> {
-    let mut c_no_mangle = false;
-    let mut c_override: Option<String> = None;
-    let mut py = false;
-    let mut py_override: Option<String> = None;
-    let mut wasm = false;
-    let mut wasm_override: Option<String> = None;
-    let mut napi = false;
-    let mut napi_override: Option<String> = None;
-
+    let mut attr_texts: Vec<&str> = Vec::new();
     let mut sib = func.prev_sibling();
     while let Some(node) = sib {
         if node.kind() != "attribute_item" {
             break;
         }
-        let text = node_text(&node, bytes);
-        // C ABI markers.
-        if text.contains("export_name") {
-            c_override = first_quoted(text).map(str::to_owned);
-        } else if text.contains("no_mangle") {
-            c_no_mangle = true;
-        }
-        // Python (PyO3) markers — independent of the C markers above.
-        if text.contains("pyfunction") {
-            py = true;
-            if let Some(v) = first_quoted(text) {
-                py_override = Some(v.to_owned()); // `#[pyfunction(name = "…")]`
-            }
-        } else if text.contains("pyo3") {
-            if let Some(v) = first_quoted(text) {
-                py_override = Some(v.to_owned()); // `#[pyo3(name = "…")]`
-            }
-        }
-        // WebAssembly/JS (wasm-bindgen) marker — `#[wasm_bindgen(js_name = "…")]`
-        // overrides the JS-facing name.
-        if text.contains("wasm_bindgen") {
-            wasm = true;
-            if let Some(v) = first_quoted(text) {
-                wasm_override = Some(v.to_owned());
-            }
-        }
-        // Node.js native addon (napi-rs) marker — `#[napi(js_name = "…")]`
-        // overrides the JS-facing name.
-        if text.contains("napi") {
-            napi = true;
-            if let Some(v) = first_quoted(text) {
-                napi_override = Some(v.to_owned());
-            }
-        }
+        attr_texts.push(node_text(&node, bytes));
         sib = node.prev_sibling();
     }
-
-    // A `#[no_mangle]`/`#[export_name]` symbol whose name follows the JNI
-    // mangling convention is a Java Native Interface implementation, not a plain
-    // C export — classify it so it bridges to Java, not C, call sites.
-    let c_abi_for = |name: &str| {
-        if name.starts_with("Java_") {
-            FfiAbi::Jni
-        } else {
-            FfiAbi::C
-        }
-    };
-    let mut out = Vec::new();
-    if let Some(name) = c_override {
-        out.push((c_abi_for(&name), name));
-    } else if c_no_mangle {
-        out.push((c_abi_for(fn_name), fn_name.to_owned()));
-    }
-    if py {
-        out.push((
-            FfiAbi::Python,
-            py_override.unwrap_or_else(|| fn_name.to_owned()),
-        ));
-    }
-    if wasm {
-        out.push((
-            FfiAbi::Wasm,
-            wasm_override.unwrap_or_else(|| fn_name.to_owned()),
-        ));
-    }
-    if napi {
-        out.push((
-            FfiAbi::NodeApi,
-            napi_override.unwrap_or_else(|| fn_name.to_owned()),
-        ));
-    }
-    out
-}
-
-/// The contents of the first double-quoted span in `s`, if any.
-fn first_quoted(s: &str) -> Option<&str> {
-    let start = s.find('"')? + 1;
-    let rest = &s[start..];
-    let end = rest.find('"')?;
-    Some(&rest[..end])
+    crate::ffi::rust_exports(&attr_texts, fn_name)
 }
 
 /// Display name for an `impl` block: the last type identifier before the body.
