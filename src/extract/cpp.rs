@@ -2,8 +2,9 @@
 
 //! C++ extractor — one tree-sitter pass yielding definitions and references.
 //!
-//! Definitions: namespaces, classes/structs/unions and their **visible**
-//! members, free functions and variables, enums, type aliases (`typedef` /
+//! Definitions: namespaces, classes/structs/unions and their members (all
+//! access levels — `Public`, `Private`, `Protected`), free functions and
+//! variables, enums, type aliases (`typedef` /
 //! `using T = X`), and preprocessor macros (`#define`). Qualified identity is
 //! derived from the file path (`src/net/sock.cpp` → namespaces `net`, `sock`),
 //! then extended by `namespace` blocks and class scopes. The same stem is
@@ -179,15 +180,17 @@ fn type_leaf_name(node: &Node, bytes: &[u8]) -> Option<String> {
 
 /// Push a symbol whose leaf descriptor extends `prefix` (a namespace/type chain).
 /// The symbol's display name is derived from `leaf.name()`.
+/// `kv` is `(kind, visibility)` collapsed into a tuple to keep the param count ≤ 7.
 fn push_symbol(
     out: &mut Vec<Symbol>,
     node: &Node,
     prefix: &[Descriptor],
     leaf: Descriptor,
-    kind: SymbolKind,
+    kv: (SymbolKind, Visibility),
     bytes: &[u8],
     file: &str,
 ) {
+    let (kind, visibility) = kv;
     let name = leaf.name().to_owned();
     let mut descriptors = prefix.to_vec();
     descriptors.push(leaf);
@@ -195,7 +198,7 @@ fn push_symbol(
         id: SymbolId::global(Language::Cpp.as_str(), descriptors),
         name,
         kind,
-        visibility: Visibility::Public,
+        visibility,
         file: file.to_owned(),
         line: (node.start_position().row + 1) as u32,
         span: ByteSpan {
@@ -255,9 +258,11 @@ fn process_node(
         }
 
         "function_definition" => {
-            if is_static(node, bytes) {
-                return;
-            }
+            let vis = if is_static(node, bytes) {
+                Visibility::Private
+            } else {
+                Visibility::Public
+            };
             let Some(decl) = node.child_by_field_name("declarator") else {
                 return;
             };
@@ -273,16 +278,18 @@ fn process_node(
                     name,
                     disambiguator: String::new(),
                 },
-                SymbolKind::Function,
+                (SymbolKind::Function, vis),
                 bytes,
                 file,
             );
         }
 
         "declaration" => {
-            if is_static(node, bytes) {
-                return;
-            }
+            let vis = if is_static(node, bytes) {
+                Visibility::Private
+            } else {
+                Visibility::Public
+            };
             // A class/struct/union/enum specifier in the `type` field with a
             // body is an aggregate definition; emit it (and its members).
             if let Some(spec) = node.child_by_field_name("type") {
@@ -303,7 +310,7 @@ fn process_node(
                             name,
                             disambiguator: String::new(),
                         },
-                        SymbolKind::Function,
+                        (SymbolKind::Function, vis),
                         bytes,
                         file,
                     );
@@ -313,7 +320,7 @@ fn process_node(
                         node,
                         &prefix,
                         Descriptor::Term(name),
-                        SymbolKind::Static,
+                        (SymbolKind::Static, vis),
                         bytes,
                         file,
                     );
@@ -342,7 +349,7 @@ fn process_node(
                 node,
                 &prefix,
                 Descriptor::Type(name),
-                SymbolKind::TypeAlias,
+                (SymbolKind::TypeAlias, Visibility::Public),
                 bytes,
                 file,
             );
@@ -359,7 +366,7 @@ fn process_node(
                 node,
                 &prefix,
                 Descriptor::Type(name),
-                SymbolKind::TypeAlias,
+                (SymbolKind::TypeAlias, Visibility::Public),
                 bytes,
                 file,
             );
@@ -390,7 +397,7 @@ fn process_node(
                     node,
                     &prefix,
                     Descriptor::Macro(name),
-                    SymbolKind::Const,
+                    (SymbolKind::Const, Visibility::Public),
                     bytes,
                     file,
                 );
@@ -405,7 +412,7 @@ fn process_node(
                     node,
                     &prefix,
                     Descriptor::Macro(name),
-                    SymbolKind::Function,
+                    (SymbolKind::Function, Visibility::Public),
                     bytes,
                     file,
                 );
@@ -425,12 +432,12 @@ fn emit_aggregate(
     file: &str,
     out: &mut Vec<Symbol>,
 ) {
-    let (kind, default_public, is_enum) = match spec.kind() {
-        "class_specifier" => (SymbolKind::Class, false, false),
-        "struct_specifier" => (SymbolKind::Struct, true, false),
+    let (kind, default_vis, is_enum) = match spec.kind() {
+        "class_specifier" => (SymbolKind::Class, Visibility::Private, false),
+        "struct_specifier" => (SymbolKind::Struct, Visibility::Public, false),
         // NOTE: no Union variant — unions map to Struct.
-        "union_specifier" => (SymbolKind::Struct, true, false),
-        "enum_specifier" => (SymbolKind::Enum, true, true),
+        "union_specifier" => (SymbolKind::Struct, Visibility::Public, false),
+        "enum_specifier" => (SymbolKind::Enum, Visibility::Public, true),
         _ => return,
     };
 
@@ -452,7 +459,7 @@ fn emit_aggregate(
         spec,
         &prefix,
         Descriptor::Type(name.clone()),
-        kind,
+        (kind, Visibility::Public),
         bytes,
         file,
     );
@@ -465,26 +472,37 @@ fn emit_aggregate(
     // The type's own descriptor prefix for nested members.
     let mut type_prefix = prefix;
     type_prefix.push(Descriptor::Type(name));
-    collect_members(&body, &type_prefix, default_public, bytes, file, out);
+    collect_members(&body, &type_prefix, default_vis, bytes, file, out);
 }
 
-/// Collect visible members of a `field_declaration_list`, tracking visibility
+/// Collect all members of a `field_declaration_list`, tracking visibility
 /// statefully via `access_specifier` nodes encountered in order.
+///
+/// All members emit regardless of access level; each is tagged with the
+/// `Visibility` in effect at its declaration site:
+/// - `class` default → `Private`; `struct`/`union` default → `Public`.
+/// - `public:` specifier → `Public`; `private:` → `Private`; `protected:` → `Protected`.
 fn collect_members(
     body: &Node,
     type_prefix: &[Descriptor],
-    default_public: bool,
+    default_vis: Visibility,
     bytes: &[u8],
     file: &str,
     out: &mut Vec<Symbol>,
 ) {
-    let mut current_public = default_public;
+    let mut current_vis = default_vis;
     for member in body.children(&mut body.walk()) {
         match member.kind() {
             "access_specifier" => {
-                current_public = node_text(&member, bytes).starts_with("public");
+                let text = node_text(&member, bytes);
+                current_vis = if text.starts_with("public") {
+                    Visibility::Public
+                } else if text.starts_with("protected") {
+                    Visibility::Protected
+                } else {
+                    Visibility::Private
+                };
             }
-            _ if !current_public => {}
             "function_definition" => {
                 let Some(decl) = member.child_by_field_name("declarator") else {
                     continue;
@@ -500,7 +518,7 @@ fn collect_members(
                         name,
                         disambiguator: String::new(),
                     },
-                    SymbolKind::Method,
+                    (SymbolKind::Method, current_vis),
                     bytes,
                     file,
                 );
@@ -521,7 +539,7 @@ fn collect_members(
                             name,
                             disambiguator: String::new(),
                         },
-                        SymbolKind::Method,
+                        (SymbolKind::Method, current_vis),
                         bytes,
                         file,
                     );
@@ -531,7 +549,7 @@ fn collect_members(
                         &member,
                         type_prefix,
                         Descriptor::Term(name),
-                        SymbolKind::Static,
+                        (SymbolKind::Static, current_vis),
                         bytes,
                         file,
                     );
@@ -1130,15 +1148,23 @@ namespace io {
             "codegraph . . . net/sock/io/Sock#"
         );
 
+        // public: section → Visibility::Public
         let open = by_name(&facts, "open").unwrap();
         assert_eq!(open.kind, SymbolKind::Method);
+        assert_eq!(open.visibility, Visibility::Public);
         assert_eq!(
             open.id.to_scip_string(),
             "codegraph . . . net/sock/io/Sock#open()."
         );
 
-        // private method — must be absent
-        assert!(by_name(&facts, "shutdown").is_none());
+        // private: section — must now emit with Visibility::Private
+        let shutdown = by_name(&facts, "shutdown").unwrap();
+        assert_eq!(shutdown.kind, SymbolKind::Method);
+        assert_eq!(shutdown.visibility, Visibility::Private);
+        assert_eq!(
+            shutdown.id.to_scip_string(),
+            "codegraph . . . net/sock/io/Sock#shutdown()."
+        );
     }
 
     #[test]
@@ -1155,9 +1181,14 @@ struct Point {
         assert_eq!(point.kind, SymbolKind::Struct);
         assert_eq!(point.id.to_scip_string(), "codegraph . . . geo/Point#");
 
+        // struct members default to Public
         let x = by_name(&facts, "x").unwrap();
         assert_eq!(x.kind, SymbolKind::Static);
+        assert_eq!(x.visibility, Visibility::Public);
         assert_eq!(x.id.to_scip_string(), "codegraph . . . geo/Point#x.");
+
+        let y = by_name(&facts, "y").unwrap();
+        assert_eq!(y.visibility, Visibility::Public);
     }
 
     #[test]
@@ -1739,5 +1770,120 @@ void run() {
             int_typerefs.is_empty(),
             "primitive 'int' must NOT produce a TypeRef, got: {int_typerefs:?}"
         );
+    }
+
+    // ── Visibility tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn class_public_member_tagged_public() {
+        // `public:` section → Visibility::Public
+        let src = "class Foo { public: void go(); };\n";
+        let facts = CppExtractor.extract(src, "src/foo.cpp").unwrap();
+        let go = by_name(&facts, "go").unwrap();
+        assert_eq!(
+            go.visibility,
+            Visibility::Public,
+            "public: member must be Public"
+        );
+    }
+
+    #[test]
+    fn class_private_member_emitted_and_tagged_private() {
+        // `private:` section → emitted with Visibility::Private
+        let src = "class Foo { private: void secret(); };\n";
+        let facts = CppExtractor.extract(src, "src/foo.cpp").unwrap();
+        let secret = by_name(&facts, "secret").expect("private member 'secret' must now emit");
+        assert_eq!(
+            secret.visibility,
+            Visibility::Private,
+            "private: member must be Private"
+        );
+    }
+
+    #[test]
+    fn class_protected_member_emitted_and_tagged_protected() {
+        // `protected:` section → emitted with Visibility::Protected
+        let src = "class Foo { protected: void hook(); };\n";
+        let facts = CppExtractor.extract(src, "src/foo.cpp").unwrap();
+        let hook = by_name(&facts, "hook").expect("protected member 'hook' must emit");
+        assert_eq!(
+            hook.visibility,
+            Visibility::Protected,
+            "protected: member must be Protected"
+        );
+    }
+
+    #[test]
+    fn class_default_member_is_private() {
+        // class with no access specifier → default Private
+        let src = "class Foo { void hidden(); };\n";
+        let facts = CppExtractor.extract(src, "src/foo.cpp").unwrap();
+        let hidden = by_name(&facts, "hidden").expect("class member with no specifier must emit");
+        assert_eq!(
+            hidden.visibility,
+            Visibility::Private,
+            "class default must be Private"
+        );
+    }
+
+    #[test]
+    fn struct_default_member_is_public() {
+        // struct with no access specifier → default Public
+        let src = "struct Bar { int val; };\n";
+        let facts = CppExtractor.extract(src, "src/bar.cpp").unwrap();
+        let val = by_name(&facts, "val").expect("struct member with no specifier must emit");
+        assert_eq!(
+            val.visibility,
+            Visibility::Public,
+            "struct default must be Public"
+        );
+    }
+
+    #[test]
+    fn static_file_level_fn_is_private() {
+        // `static void impl(){}` → internal linkage → Visibility::Private
+        let src = "static void impl(){}\n";
+        let facts = CppExtractor.extract(src, "src/util.cpp").unwrap();
+        let impl_sym = by_name(&facts, "impl").expect("static file-level fn must emit");
+        assert_eq!(
+            impl_sym.visibility,
+            Visibility::Private,
+            "static (internal-linkage) fn must be Private"
+        );
+    }
+
+    #[test]
+    fn non_static_file_level_fn_is_public() {
+        // `void pub_fn(){}` → external linkage → Visibility::Public
+        let src = "void pub_fn(){}\n";
+        let facts = CppExtractor.extract(src, "src/util.cpp").unwrap();
+        let f = by_name(&facts, "pub_fn").unwrap();
+        assert_eq!(
+            f.visibility,
+            Visibility::Public,
+            "non-static fn must be Public"
+        );
+    }
+
+    #[test]
+    fn mixed_access_specifiers_all_members_emit() {
+        // Class with public/private/protected sections — all members must emit.
+        let src = r#"
+class Widget {
+public:
+    void show();
+protected:
+    void draw();
+private:
+    void impl();
+};
+"#;
+        let facts = CppExtractor.extract(src, "src/widget.cpp").unwrap();
+        let show = by_name(&facts, "show").expect("show must emit");
+        assert_eq!(show.visibility, Visibility::Public);
+        let draw = by_name(&facts, "draw").expect("draw must emit");
+        assert_eq!(draw.visibility, Visibility::Protected);
+        let impl_m = by_name(&facts, "impl").expect("impl must emit");
+        assert_eq!(impl_m.visibility, Visibility::Private);
     }
 }
