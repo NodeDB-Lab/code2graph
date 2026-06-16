@@ -170,6 +170,7 @@ mod tests {
             name: name.into(),
             kind: SymbolKind::Function,
             visibility: Visibility::Public,
+            entry_points: Vec::new(),
             file: format!("src/{ns}.rs"),
             line: 1,
             span: ByteSpan { start: 0, end: 10 },

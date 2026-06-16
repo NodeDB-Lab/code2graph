@@ -69,6 +69,7 @@ mod tests {
             name: "foo".into(),
             kind: SymbolKind::Function,
             visibility: Visibility::Public,
+            entry_points: Vec::new(),
             file: "src/lib.rs".into(),
             line: 1,
             span: ByteSpan { start: 0, end: 10 },

@@ -50,6 +50,7 @@ pub(crate) fn make_symbol(
         name,
         kind,
         visibility,
+        entry_points: Vec::new(),
         file: ctx.file.to_owned(),
         line: (span_node.start_position().row + 1) as u32,
         span: ByteSpan {
@@ -148,6 +149,7 @@ pub(crate) fn module_symbol(
         name,
         kind: SymbolKind::Module,
         visibility: Visibility::Public,
+        entry_points: Vec::new(),
         file: file.to_owned(),
         line: 1,
         span: ByteSpan {

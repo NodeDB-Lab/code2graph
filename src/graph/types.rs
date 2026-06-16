@@ -72,6 +72,28 @@ pub enum SymbolKind {
     Other,
 }
 
+/// A deterministic syntactic entry-point marker on a definition — a neutral FACT,
+/// never a judgement. code2graph records that a symbol carries the marker (e.g. an
+/// HTTP-route decorator, or the name `main`); deciding whether that constitutes an
+/// "attack surface" is the consumer's policy. Only emitted when the syntax is
+/// unambiguously present — never guessed. The set is intentionally minimal and
+/// additively extensible (event handlers etc. may be added later without breaking
+/// consumers).
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone)]
+pub enum EntryPoint {
+    /// The definition is a language entry point — a function named `main`
+    /// (`fn main`, `func main`, `public static void main`) or a Python
+    /// `if __name__ == "__main__"` module entry.
+    Main,
+    /// An HTTP route / request handler, identified by a framework decorator,
+    /// annotation, or attribute. Carries the raw marker IDENTIFIER as written
+    /// (e.g. `"app.route"`, `"GetMapping"`, `"get"`) — NOT the full call text or
+    /// path argument — so a consumer can distinguish framework/method without
+    /// reparsing. The path/body is recoverable from the symbol's span if needed.
+    HttpRoute(String),
+}
+
 /// The declared visibility of a [`Symbol`] — a neutral fact, not a policy. The
 /// extractor records what the syntax says; the consumer decides what to filter.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -104,6 +126,10 @@ pub struct Symbol {
     pub kind: SymbolKind,
     /// Declared visibility (a neutral fact; consumers apply their own public/private policy).
     pub visibility: Visibility,
+    /// Syntactic entry-point markers on this definition (route handlers, `main`,
+    /// …). A neutral fact set — empty for most symbols; consumers apply their own
+    /// attack-surface policy. See [`EntryPoint`].
+    pub entry_points: Vec<EntryPoint>,
     /// File path relative to the project root.
     pub file: String,
     /// 1-based line of the definition.
@@ -500,6 +526,7 @@ mod confidence_tests {
             name: "sym".into(),
             kind: SymbolKind::Function,
             visibility: Visibility::Public,
+            entry_points: Vec::new(),
             file: "src/a.rs".into(),
             line: 1,
             span: ByteSpan { start: 0, end: 10 },
@@ -585,6 +612,26 @@ mod serde_tests {
     }
 
     #[test]
+    fn entry_point_variants_round_trip() {
+        let id = make_symbol_id();
+        let sym = Symbol {
+            id,
+            name: "handler".into(),
+            kind: SymbolKind::Function,
+            visibility: Visibility::Public,
+            entry_points: vec![EntryPoint::Main, EntryPoint::HttpRoute("app.route".into())],
+            file: "src/main.rs".into(),
+            line: 1,
+            span: ByteSpan { start: 0, end: 10 },
+            signature: "pub fn handler()".into(),
+        };
+        let json = serde_json::to_string(&sym).expect("serialize Symbol");
+        let sym2: Symbol = serde_json::from_str(&json).expect("deserialize Symbol");
+        let json2 = serde_json::to_string(&sym2).expect("re-serialize Symbol");
+        assert_eq!(json, json2);
+    }
+
+    #[test]
     fn file_facts_round_trips_via_json() {
         let id = make_symbol_id();
         let facts = FileFacts {
@@ -595,6 +642,7 @@ mod serde_tests {
                 name: "validate".into(),
                 kind: SymbolKind::Function,
                 visibility: Visibility::Public,
+                entry_points: Vec::new(),
                 file: "src/auth.rs".into(),
                 line: 1,
                 span: ByteSpan { start: 0, end: 20 },
