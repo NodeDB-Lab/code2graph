@@ -28,9 +28,11 @@ use crate::graph::types::{
     ByteSpan, FileFacts, RefRole, Reference, Scope, ScopeKind, Symbol, SymbolKind, Visibility,
 };
 use crate::lang::Language;
-use crate::symbol::{Descriptor, SymbolId};
+use crate::symbol::Descriptor;
 
-use super::{Extractor, attach_reference_scopes, definition_bindings, push_scope};
+use super::{
+    ExtractCtx, Extractor, attach_reference_scopes, definition_bindings, make_symbol, push_scope,
+};
 
 /// Extracts HCL/Terraform symbols and references.
 pub struct HclExtractor;
@@ -56,15 +58,20 @@ impl Extractor for HclExtractor {
 
         let root = tree.root_node();
         let bytes = source.as_bytes();
+        let ctx = ExtractCtx {
+            bytes,
+            file,
+            lang: Language::Hcl,
+        };
 
         // Collect definitions first so we can derive bindings before adding the
         // file-module symbol (the module symbol is not a user-written definition).
-        let defs = collect_symbols(&root, bytes, file);
+        let defs = collect_symbols(&root, &ctx);
         let def_bindings = definition_bindings(&defs);
         let mut symbols = defs;
         symbols.push(super::module_symbol(Language::Hcl, &[], file, source.len()));
 
-        let mut references = collect_references(&root, bytes, file);
+        let mut references = collect_references(&root, ctx.bytes, ctx.file);
 
         // HCL is flat — one Module scope spanning the whole file, no nesting.
         let scopes = collect_scopes(source.len());
@@ -161,7 +168,7 @@ fn block_type_and_labels(block: &Node, bytes: &[u8]) -> Option<(String, Vec<Stri
 ///
 /// `.tfvars` files may parse to an `object` root rather than a `body` — guard:
 /// if the root's first named child is not `body`, emit no block symbols.
-fn collect_symbols(root: &Node, bytes: &[u8], file: &str) -> Vec<Symbol> {
+fn collect_symbols(root: &Node, ctx: &ExtractCtx) -> Vec<Symbol> {
     // Find the `body` child of `config_file`.
     let body = {
         let mut cursor = root.walk();
@@ -183,7 +190,7 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str) -> Vec<Symbol> {
         if block.kind() != "block" {
             continue;
         }
-        if let Some(sym) = extract_block_symbol(block, bytes, file) {
+        if let Some(sym) = extract_block_symbol(block, ctx) {
             out.push(sym);
         }
     }
@@ -199,15 +206,10 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str) -> Vec<Symbol> {
 /// - All others (variable/output/provider/locals/terraform/…) → skipped.
 ///   v1 boundary: these block types are recognised by Terraform but deferred
 ///   until a later unit defines their symbol taxonomy.
-fn extract_block_symbol(block: &Node, bytes: &[u8], file: &str) -> Option<Symbol> {
-    let (block_type, labels) = block_type_and_labels(block, bytes)?;
+fn extract_block_symbol(block: &Node, ctx: &ExtractCtx) -> Option<Symbol> {
+    let (block_type, labels) = block_type_and_labels(block, ctx.bytes)?;
 
-    let sig = super::one_line_signature(super::node_text(block, bytes), &['{']);
-    let line = (block.start_position().row + 1) as u32;
-    let span = ByteSpan {
-        start: block.start_byte(),
-        end: block.end_byte(),
-    };
+    let sig = super::one_line_signature(super::node_text(block, ctx.bytes), &['{']);
 
     match block_type.as_str() {
         "resource" => {
@@ -221,16 +223,15 @@ fn extract_block_symbol(block: &Node, bytes: &[u8], file: &str) -> Option<Symbol
                 Descriptor::Namespace(res_type.clone()),
                 Descriptor::Type(res_name.clone()),
             ];
-            Some(Symbol {
-                id: SymbolId::global(Language::Hcl.as_str(), descriptors),
-                name: res_name.clone(),
-                kind: SymbolKind::Resource,
-                visibility: Visibility::Public,
-                file: file.to_owned(),
-                line,
-                span,
-                signature: sig,
-            })
+            Some(make_symbol(
+                ctx,
+                block,
+                res_name.clone(),
+                SymbolKind::Resource,
+                Visibility::Public,
+                descriptors,
+                sig,
+            ))
         }
         "data" => {
             // Expects exactly 2 labels: data-source type and name.
@@ -247,16 +248,15 @@ fn extract_block_symbol(block: &Node, bytes: &[u8], file: &str) -> Option<Symbol
                 Descriptor::Namespace(src_type.clone()),
                 Descriptor::Type(src_name.clone()),
             ];
-            Some(Symbol {
-                id: SymbolId::global(Language::Hcl.as_str(), descriptors),
-                name: src_name.clone(),
-                kind: SymbolKind::Resource,
-                visibility: Visibility::Public,
-                file: file.to_owned(),
-                line,
-                span,
-                signature: sig,
-            })
+            Some(make_symbol(
+                ctx,
+                block,
+                src_name.clone(),
+                SymbolKind::Resource,
+                Visibility::Public,
+                descriptors,
+                sig,
+            ))
         }
         "module" => {
             // Expects exactly 1 label: the module instance name.
@@ -269,16 +269,15 @@ fn extract_block_symbol(block: &Node, bytes: &[u8], file: &str) -> Option<Symbol
                 Descriptor::Namespace("module".to_owned()),
                 Descriptor::Type(mod_name.clone()),
             ];
-            Some(Symbol {
-                id: SymbolId::global(Language::Hcl.as_str(), descriptors),
-                name: mod_name.clone(),
-                kind: SymbolKind::Module,
-                visibility: Visibility::Public,
-                file: file.to_owned(),
-                line,
-                span,
-                signature: sig,
-            })
+            Some(make_symbol(
+                ctx,
+                block,
+                mod_name.clone(),
+                SymbolKind::Module,
+                Visibility::Public,
+                descriptors,
+                sig,
+            ))
         }
         // v1 boundary: variable, output, provider, locals, terraform, and any
         // other block types are deferred — they are recognised by Terraform but
