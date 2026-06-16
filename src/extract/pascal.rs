@@ -783,9 +783,14 @@ fn collect_bindings(root: &Node, bytes: &[u8], scopes: &[Scope]) -> Vec<Binding>
 
 fn collect_bindings_dfs(node: &Node, bytes: &[u8], scopes: &[Scope], out: &mut Vec<Binding>) {
     // Collect procedure/function parameters from declArg nodes.
+    // A declArg's "name" field is multiple: true (e.g. `Alpha, Bravo: Integer`),
+    // so we iterate every name-field child to bind all parameters, using each
+    // identifier's own start_byte as the intro offset.
     if node.kind() == "declArg" {
-        if let Some(name) = field_text(node, "name", bytes) {
-            let intro = node.start_byte();
+        let mut cursor = node.walk();
+        for name_node in node.children_by_field_name("name", &mut cursor) {
+            let name = node_text(&name_node, bytes).to_owned();
+            let intro = name_node.start_byte();
             if name.len() >= MIN_REF_LEN && innermost_scope(intro, scopes) != Some(0) {
                 push_binding(out, name, intro, BindingKind::Param, scopes);
             }
@@ -1233,6 +1238,37 @@ end.
         assert!(
             !reads.iter().any(|n| n.eq_ignore_ascii_case("Bonus")),
             "declaration name 'Bonus' must NOT appear as a Read ref: {reads:?}"
+        );
+    }
+
+    /// `procedure Foo(Alpha, Bravo: Integer)` — both comma-grouped parameter names
+    /// must each receive a `BindingKind::Param` binding, not just the first.
+    #[test]
+    fn comma_grouped_params_both_get_param_bindings() {
+        let src = r#"
+program Greeter;
+procedure Foo(Alpha, Bravo: Integer);
+begin
+end;
+begin
+end.
+"#;
+        let facts = extract(src, "src/Greeter.dpr");
+
+        let param_names: Vec<&str> = facts
+            .bindings
+            .iter()
+            .filter(|b| b.kind == BindingKind::Param)
+            .map(|b| b.name.as_str())
+            .collect();
+
+        assert!(
+            param_names.iter().any(|n| n.eq_ignore_ascii_case("Alpha")),
+            "expected Param binding for 'Alpha': {param_names:?}"
+        );
+        assert!(
+            param_names.iter().any(|n| n.eq_ignore_ascii_case("Bravo")),
+            "expected Param binding for 'Bravo': {param_names:?}"
         );
     }
 }
