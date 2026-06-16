@@ -2,10 +2,13 @@
 
 //! Rust extractor — one tree-sitter pass yielding definitions and references.
 //!
-//! Definitions: fully-public top-level items (`pub fn/struct/enum/trait/type/
-//! const/static/mod`) plus `impl` blocks. Qualified identity follows the module
-//! path derived from the file path (`src/auth/session.rs` → namespaces
-//! `auth`,`session`). References: callee identifiers of `call_expression` nodes.
+//! Definitions: ALL top-level items (`fn/struct/enum/trait/type/const/static/mod`)
+//! plus `impl` blocks, each tagged with its real [`Visibility`]. `pub` items get
+//! `Visibility::Public`; `pub(crate)` / `pub(super)` / `pub(in …)` get
+//! `Visibility::Internal`; items with no visibility modifier get `Visibility::Private`.
+//! Qualified identity follows the module path derived from the file path
+//! (`src/auth/session.rs` → namespaces `auth`,`session`). References: callee
+//! identifiers of `call_expression` nodes.
 //!
 //! Emits neutral [`FileFacts`] — no storage entries, no source bodies.
 
@@ -131,7 +134,7 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
     let mut out = Vec::new();
     for child in root.children(&mut root.walk()) {
         let (kind, leaf) = match child.kind() {
-            "function_item" if is_fully_pub(&child, bytes) => {
+            "function_item" => {
                 let Some(name) = child_text(&child, "identifier", bytes) else {
                     continue;
                 };
@@ -143,43 +146,51 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
                     },
                 )
             }
-            "struct_item" if is_fully_pub(&child, bytes) => {
+            "struct_item" => {
                 let Some(name) = child_text(&child, "type_identifier", bytes) else {
                     continue;
                 };
                 (SymbolKind::Struct, Descriptor::Type(name))
             }
-            "enum_item" if is_fully_pub(&child, bytes) => {
+            "enum_item" => {
                 let Some(name) = child_text(&child, "type_identifier", bytes) else {
                     continue;
                 };
                 (SymbolKind::Enum, Descriptor::Type(name))
             }
-            "trait_item" if is_fully_pub(&child, bytes) => {
+            "trait_item" => {
                 let Some(name) = child_text(&child, "type_identifier", bytes) else {
                     continue;
                 };
                 (SymbolKind::Trait, Descriptor::Type(name))
             }
-            "type_item" if is_fully_pub(&child, bytes) => {
+            "type_item" => {
                 let Some(name) = child_text(&child, "type_identifier", bytes) else {
                     continue;
                 };
                 (SymbolKind::TypeAlias, Descriptor::Type(name))
             }
-            "const_item" if is_fully_pub(&child, bytes) => {
+            "const_item" => {
                 let Some(name) = child_text(&child, "identifier", bytes) else {
                     continue;
                 };
                 (SymbolKind::Const, Descriptor::Term(name))
             }
-            "static_item" if is_fully_pub(&child, bytes) => {
+            "static_item" => {
                 let Some(name) = child_text(&child, "identifier", bytes) else {
                     continue;
                 };
                 (SymbolKind::Static, Descriptor::Term(name))
             }
-            "mod_item" if is_fully_pub(&child, bytes) => {
+            "mod_item" => {
+                // Only inline modules (`mod foo { … }`) produce a Module symbol.
+                // A body-less declaration (`mod foo;`) is purely a ModuleRef
+                // reference (emitted by `collect_module_decl_refs`) and must NOT
+                // emit a duplicate Module symbol — that would create two `foo`
+                // definitions and break `unique_match` resolution.
+                if child.child_by_field_name("body").is_none() {
+                    continue;
+                }
                 let Some(name) = child_text(&child, "identifier", bytes) else {
                     continue;
                 };
@@ -192,18 +203,29 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
             _ => continue,
         };
 
+        // `impl` blocks carry no visibility modifier in Rust; they are always Public.
+        let visibility = if kind == SymbolKind::Impl {
+            Visibility::Public
+        } else {
+            read_visibility(&child, bytes)
+        };
+
+        // Extract the name before moving `leaf` into `descriptors` so no clone is needed.
+        let sym_name = leaf.name().to_owned();
         let mut descriptors: Vec<Descriptor> = namespaces
             .iter()
             .cloned()
             .map(Descriptor::Namespace)
             .collect();
-        descriptors.push(leaf.clone());
+        descriptors.push(leaf);
 
         out.push(Symbol {
             id: SymbolId::global(Language::Rust.as_str(), descriptors),
-            name: leaf.name().to_owned(),
+            // Cloned because `sym_name` is reused below as the type/trait name
+            // when descending into impl/trait members.
+            name: sym_name.clone(),
             kind,
-            visibility: Visibility::Public,
+            visibility,
             file: file.to_owned(),
             line: (child.start_position().row + 1) as u32,
             span: ByteSpan {
@@ -213,23 +235,21 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
             signature: one_line_signature(node_text(&child, bytes), &['{']),
         });
 
-        // For inherent impl blocks, also emit symbols for their pub members.
-        // Trait-impl members are deferred: the call qualifier is `self`, not the
-        // type, and method extraction risks collisions with inherent methods.
+        // For inherent impl blocks, also emit symbols for their members (all
+        // visibilities). Trait-impl members are deferred: the call qualifier is
+        // `self`, not the type, and method extraction risks collisions with
+        // inherent methods.
         if kind == SymbolKind::Impl && child.child_by_field_name("trait").is_none() {
-            let type_name = leaf.name().to_owned();
-            collect_impl_members(&child, bytes, file, namespaces, &type_name, &mut out);
+            collect_impl_members(&child, bytes, file, namespaces, &sym_name, &mut out);
         }
 
         // For trait definitions, emit symbols for their member methods and
         // associated consts so the conformance resolver can link inherited-method
-        // calls to the trait's own definition.  Visibility is NOT checked per
-        // member: trait items have no `pub` modifier — they inherit the trait's
-        // visibility, and the `is_fully_pub` guard above already ensures we only
-        // reach here for public traits.
+        // calls to the trait's own definition. Trait items have no `pub` modifier
+        // — they are implicitly public whenever the trait is public, so we pass
+        // `Visibility::Public` for all trait members.
         if kind == SymbolKind::Trait {
-            let trait_name = leaf.name().to_owned();
-            collect_trait_members(&child, bytes, file, namespaces, &trait_name, &mut out);
+            collect_trait_members(&child, bytes, file, namespaces, &sym_name, &mut out);
         }
     }
     out
@@ -240,15 +260,16 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
 /// Shared by [`collect_impl_members`] and [`collect_trait_members`] to avoid
 /// duplicating the descriptor-construction + `Symbol` push.
 ///
-/// `member` is the tree-sitter node for the member item; the `(kind, leaf)` pair
-/// comes from the caller's match arm; `type_name` is the enclosing type/trait name.
+/// `member` is the tree-sitter node for the member item; the `(kind, leaf, visibility)`
+/// triple carries the symbol kind, descriptor, and caller-computed [`Visibility`];
+/// `type_name` is the enclosing type/trait name.
 fn push_member_symbol(
     member: &Node,
     bytes: &[u8],
     file: &str,
     namespaces: &[String],
     type_name: &str,
-    (kind, leaf): (SymbolKind, Descriptor),
+    (kind, leaf, visibility): (SymbolKind, Descriptor, Visibility),
     out: &mut Vec<Symbol>,
 ) {
     // Extract the name before moving `leaf` into `descriptors` so no clone is needed.
@@ -265,7 +286,7 @@ fn push_member_symbol(
         id: SymbolId::global(Language::Rust.as_str(), descriptors),
         name: sym_name,
         kind,
-        visibility: Visibility::Public,
+        visibility,
         file: file.to_owned(),
         line: (member.start_position().row + 1) as u32,
         span: ByteSpan {
@@ -276,11 +297,12 @@ fn push_member_symbol(
     });
 }
 
-/// Walk an inherent `impl_item` node and emit `pub` member symbols.
+/// Walk an inherent `impl_item` node and emit member symbols (all visibilities).
 ///
 /// Covers `function_item` members (→ [`SymbolKind::Method`]) and `const_item`
 /// members (→ [`SymbolKind::Const`]) found in the `declaration_list` body.
-/// Non-`pub` members are skipped (consistent with the top-level extractor policy).
+/// Each member's real [`Visibility`] is read from its own `visibility_modifier`
+/// child via [`read_visibility`] and recorded on the emitted symbol.
 ///
 /// Descriptors: `namespaces.map(Namespace) ++ [Type(type_name), Method/Term(member_name)]`.
 /// SCIP renders e.g. `…/Foo#new().` for a method and `…/Foo#MAX.` for a const.
@@ -300,7 +322,7 @@ fn collect_impl_members(
 
     for member in body.children(&mut body.walk()) {
         let (kind, leaf) = match member.kind() {
-            "function_item" if is_fully_pub(&member, bytes) => {
+            "function_item" => {
                 // Reuse the same name-extraction the top-level function_item arm uses.
                 let Some(name) = child_text(&member, "identifier", bytes) else {
                     continue;
@@ -313,7 +335,7 @@ fn collect_impl_members(
                     },
                 )
             }
-            "const_item" if is_fully_pub(&member, bytes) => {
+            "const_item" => {
                 // Reuse the same name-extraction the top-level const_item arm uses.
                 let Some(name) = child_text(&member, "identifier", bytes) else {
                     continue;
@@ -329,7 +351,7 @@ fn collect_impl_members(
             file,
             namespaces,
             type_name,
-            (kind, leaf),
+            (kind, leaf, read_visibility(&member, bytes)),
             out,
         );
     }
@@ -345,9 +367,9 @@ fn collect_impl_members(
 ///   (e.g. `fn greet(&self) { … }`) → [`SymbolKind::Method`].
 /// - `const_item` — an associated constant → [`SymbolKind::Const`].
 ///
-/// Visibility is intentionally **not** checked: trait items carry no `pub`
-/// modifier (they are implicitly public whenever the trait is public), and the
-/// caller already gated on `is_fully_pub` for the `trait_item` itself.
+/// Trait items carry no `pub` visibility modifier — their effective visibility
+/// follows the trait itself. All trait members are therefore emitted with
+/// [`Visibility::Public`].
 ///
 /// Descriptors: `namespaces.map(Namespace) ++ [Type(trait_name), Method/Term(member)]`.
 /// SCIP renders e.g. `…/Greet#hello().` for a method and `…/Greet#MAX.` for a const.
@@ -390,23 +412,36 @@ fn collect_trait_members(
             _ => continue,
         };
 
+        // Trait items have no visibility modifier; their visibility follows the
+        // trait, so we tag them Public.
         push_member_symbol(
             &member,
             bytes,
             file,
             namespaces,
             trait_name,
-            (kind, leaf),
+            (kind, leaf, Visibility::Public),
             out,
         );
     }
 }
 
-/// True if the node's first `visibility_modifier` child is bare `pub`.
-fn is_fully_pub(node: &Node, bytes: &[u8]) -> bool {
-    node.children(&mut node.walk())
-        .find_map(|c| (c.kind() == "visibility_modifier").then(|| node_text(&c, bytes)))
-        == Some("pub")
+/// Read the real [`Visibility`] from a node's `visibility_modifier` child.
+///
+/// - `"pub"` (bare) → [`Visibility::Public`].
+/// - Any `pub(…)` restricted form (`pub(crate)`, `pub(super)`, `pub(self)`,
+///   `pub(in …)`) → [`Visibility::Internal`]: restricted but not fully private.
+/// - No `visibility_modifier` child → [`Visibility::Private`] (Rust default).
+fn read_visibility(node: &Node, bytes: &[u8]) -> Visibility {
+    let modifier = node
+        .children(&mut node.walk())
+        .find(|c| c.kind() == "visibility_modifier")
+        .map(|c| node_text(&c, bytes));
+    match modifier {
+        Some("pub") => Visibility::Public,
+        Some(text) if text.starts_with("pub(") => Visibility::Internal,
+        _ => Visibility::Private,
+    }
 }
 
 /// Collect cross-language export markers from top-level functions.
@@ -437,7 +472,7 @@ fn collect_ffi_exports(root: &Node, bytes: &[u8], defs: &[Symbol]) -> Vec<FfiExp
             .iter()
             .find(|s| s.kind == SymbolKind::Function && s.span.start == child.start_byte())
         else {
-            continue; // not a (public) extracted symbol — no identity to bridge
+            continue; // not an extracted symbol — no identity to bridge
         };
         for (abi, export_name) in fn_ffi_exports(&child, bytes, &sym.name) {
             out.push(FfiExport {
@@ -616,9 +651,11 @@ fn collect_inheritance(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Refe
 /// Recursively walk `node` and emit a [`RefRole::ModuleRef`] reference for every
 /// `mod x;` / `pub mod x;` declaration (`mod_item`), regardless of visibility.
 ///
-/// This is a *reference* (a module-dependency fact), distinct from the
-/// module-defining [`Symbol`] that `collect_symbols` emits for `pub mod` items —
-/// the resolver connects the two; the extractor only states the facts. The
+/// This is a *reference* (a module-dependency fact). A body-less `mod x;`
+/// declaration does NOT produce a Module [`Symbol`] — its defining symbol is
+/// the file `x.rs` (emitted there via [`super::module_symbol`]). An inline
+/// `mod x { … }` DOES produce a Module symbol from `collect_symbols`.
+/// The resolver connects the two; the extractor only states the facts. The
 /// occurrence is positioned at the module-name identifier (the `name` field) so
 /// location-based oracle matching lines up with the `mod x;` site. Recurses into
 /// `mod` blocks so nested declarations are also captured.
@@ -1252,7 +1289,8 @@ pub struct Config { pub value: u32 }
         let names: Vec<&str> = facts.symbols.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"validate_token"));
         assert!(names.contains(&"Config"));
-        assert!(!names.contains(&"private_helper")); // not `pub`
+        // private_helper is now emitted (all visibilities are extracted)
+        assert!(names.contains(&"private_helper"));
 
         let vt = facts
             .symbols
@@ -1264,6 +1302,14 @@ pub struct Config { pub value: u32 }
             "codegraph . . . auth/session/validate_token()."
         );
         assert_eq!(vt.kind, SymbolKind::Function);
+        assert_eq!(vt.visibility, Visibility::Public);
+
+        let ph = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "private_helper")
+            .unwrap();
+        assert_eq!(ph.visibility, Visibility::Private);
     }
 
     #[test]
@@ -2561,16 +2607,22 @@ impl std::fmt::Display for Point {
     }
 
     #[test]
-    fn non_pub_member_excluded() {
-        // `fn secret(&self) {}` (no `pub`) → NO symbol named "secret"
+    fn non_pub_member_emitted_with_private_visibility() {
+        // `fn secret(&self) {}` (no `pub`) → symbol IS emitted, tagged Private.
         let src = "pub struct Foo; impl Foo { fn secret(&self) {} }";
         let facts = RustExtractor.extract(src, "src/foo.rs").unwrap();
-        let secret = facts.symbols.iter().find(|s| s.name == "secret");
-        assert!(
-            secret.is_none(),
-            "private method 'secret' must NOT be emitted as a symbol, got: {:?}",
-            secret.map(|s| s.id.to_scip_string())
+        let secret = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "secret")
+            .expect("private method 'secret' must now be emitted as a symbol");
+        assert_eq!(
+            secret.visibility,
+            Visibility::Private,
+            "private method 'secret' must have Visibility::Private, got {:?}",
+            secret.visibility
         );
+        assert_eq!(secret.kind, SymbolKind::Method);
     }
 
     #[test]
@@ -2605,6 +2657,81 @@ impl std::fmt::Display for Point {
                 .iter()
                 .map(|s| s.id.to_scip_string())
                 .collect::<Vec<_>>()
+        );
+    }
+
+    // ── Visibility tests (unit F2) ────────────────────────────────────────────
+
+    #[test]
+    fn pub_fn_has_public_visibility() {
+        // `pub fn f() {}` → symbol with Visibility::Public.
+        let src = "pub fn f() {}";
+        let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
+        let sym = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "f" && s.kind == SymbolKind::Function)
+            .expect("expected a Function symbol named 'f'");
+        assert_eq!(
+            sym.visibility,
+            Visibility::Public,
+            "pub fn should have Visibility::Public, got {:?}",
+            sym.visibility
+        );
+    }
+
+    #[test]
+    fn private_fn_has_private_visibility() {
+        // `fn g() {}` (no modifier) → symbol IS emitted with Visibility::Private.
+        let src = "fn g() {}";
+        let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
+        let sym = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "g" && s.kind == SymbolKind::Function)
+            .expect("expected a Function symbol named 'g'");
+        assert_eq!(
+            sym.visibility,
+            Visibility::Private,
+            "fn with no modifier should have Visibility::Private, got {:?}",
+            sym.visibility
+        );
+    }
+
+    #[test]
+    fn pub_crate_fn_has_internal_visibility() {
+        // `pub(crate) fn h() {}` → symbol with Visibility::Internal.
+        let src = "pub(crate) fn h() {}";
+        let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
+        let sym = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "h" && s.kind == SymbolKind::Function)
+            .expect("expected a Function symbol named 'h'");
+        assert_eq!(
+            sym.visibility,
+            Visibility::Internal,
+            "pub(crate) fn should have Visibility::Internal, got {:?}",
+            sym.visibility
+        );
+    }
+
+    #[test]
+    fn private_impl_method_emitted_with_private_visibility() {
+        // `fn inner(&self) {}` in an inherent impl (no `pub`) →
+        // symbol IS emitted with Visibility::Private.
+        let src = "pub struct Bar; impl Bar { fn inner(&self) {} }";
+        let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
+        let sym = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "inner" && s.kind == SymbolKind::Method)
+            .expect("expected a Method symbol named 'inner'");
+        assert_eq!(
+            sym.visibility,
+            Visibility::Private,
+            "private impl method should have Visibility::Private, got {:?}",
+            sym.visibility
         );
     }
 
