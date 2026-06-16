@@ -11,9 +11,11 @@ planned. One table; only languages we'll **never** support are kept out of it (s
 
 **Resolution tiers** (both behind the `Resolver` trait — see [README](../README.md#resolution-tiers)):
 
-- **Tier A** (`SymbolTableResolver`) — name-based, recall-first, **available for _every_ language**.
-  An ambiguous name links to all same-named definitions (`NameOnly`, or `Scoped` when globally
-  unique). The universal floor under every row below.
+- **Tier A** (`SymbolTableResolver`) — name-based, recall-first; the floor under **every
+  _supported_ language** (the ⭐/🟢/🟣 rows). An ambiguous name links to all same-named definitions
+  (`NameOnly`, or `Scoped` when globally unique). It only needs symbols + references, which every
+  extractor emits — so 🟠 planned / 🔴 blocked languages get *nothing* (no extractor → no facts → no
+  resolution at all, Tier-A included) until an extractor is written.
 - **Tier B** (`ScopeGraphResolver`) — scope-aware (lexical scopes, imports, qualified paths),
   `Scoped`/`Exact`, never fakes precision. Available where the extractor emits `scopes` + `bindings`.
 
