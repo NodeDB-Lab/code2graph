@@ -86,18 +86,28 @@ fn layered_recall_at_heuristic_beats_each_single_tier() {
 }
 
 /// Precision is non-decreasing as the cutoff tightens: the strict end (Exact)
-/// is at least as precise as the dense end (Heuristic). Only compared when the
-/// Exact tier has predicted edges; if there are none, `Scorecard::precision()`
-/// returns `1.0` for an empty claim (no false positives possible), which already
-/// satisfies the invariant against any Heuristic precision ≤ 1.0.
+/// is at least as precise as the dense end (Heuristic).
+///
+/// Made non-vacuous by first requiring the Exact tier to actually make claims:
+/// `Scorecard::precision()` returns `1.0` for an empty claim set, so without this
+/// precondition the monotonicity check passes for free whenever the Exact tier
+/// emits nothing. The corpus does produce Exact edges today, so the precondition
+/// holds; if it ever stops, this test should fail loudly rather than pass
+/// vacuously. We then assert the strict end fakes nothing (zero false positives)
+/// before checking the monotonicity itself.
 #[test]
 fn layered_precision_improves_toward_exact() {
     let cases = corpus();
     let t = corpus_total_tiered(&cases);
 
-    // `Scorecard::precision()` returns `1.0` when TP+FP == 0 (empty claim set).
-    // This is the library's convention: an empty claim is perfectly precise.
-    // So the comparison is always valid — we never need to guard against NaN.
+    assert!(
+        t.exact.true_positives + t.exact.false_positives > 0,
+        "corpus must produce Exact-tier edges for this precision invariant to be meaningful"
+    );
+    assert_eq!(
+        t.exact.false_positives, 0,
+        "Exact tier must never fake precision"
+    );
     assert!(
         t.exact.precision() >= t.heuristic.precision(),
         "precision@Exact ({:.4}) must be >= precision@Heuristic ({:.4})",

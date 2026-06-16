@@ -13,7 +13,7 @@
 //! golden fixtures today, a SCIP precision oracle (rust-analyzer / scip-java)
 //! later. Both project into the same located-edge space.
 
-use code2graph::{CodeGraph, RefRole};
+use code2graph::{CodeGraph, Provenance, RefRole};
 use std::collections::HashSet;
 
 /// A ground-truth ref→def edge, located by file + line at both ends.
@@ -125,8 +125,12 @@ impl TieredScorecard {
 /// against the expected set.
 ///
 /// An emitted edge whose target [`code2graph::SymbolId`] has no matching symbol in
-/// the graph (which should not happen for a well-formed graph) is skipped — it
-/// cannot be located, so it is neither credited nor penalised.
+/// the graph is an over-connection and counts as a **false positive** — a resolver
+/// claiming an intra-graph resolution to a definition that does not exist. The one
+/// exception is a [`Provenance::External`] edge, which deliberately points outside
+/// the corpus (a call into a dependency whose body isn't extracted); the oracle
+/// can't enumerate external defs, so those are skipped — neither credited nor
+/// penalised. Edges whose role isn't asserted by this case stay invisible.
 pub fn score(graph: &CodeGraph, expected: &[ExpectedEdge]) -> Scorecard {
     // Locate every definition by its SCIP identity.
     let mut def_loc = std::collections::HashMap::new();
@@ -140,6 +144,10 @@ pub fn score(graph: &CodeGraph, expected: &[ExpectedEdge]) -> Scorecard {
     let expected_roles: std::collections::HashSet<RefRole> =
         expected.iter().map(|e| e.role).collect();
 
+    // Edges that pass the role filter but whose target can't be located: a
+    // genuine over-connection unless they are honestly `External`.
+    let mut unlocatable_fp = 0usize;
+
     let emitted: HashSet<ExpectedEdge> = graph
         .edges
         .iter()
@@ -147,7 +155,12 @@ pub fn score(graph: &CodeGraph, expected: &[ExpectedEdge]) -> Scorecard {
             if !expected_roles.contains(&e.role) {
                 return None;
             }
-            let (def_file, def_line) = def_loc.get(&e.to.to_scip_string())?;
+            let Some((def_file, def_line)) = def_loc.get(&e.to.to_scip_string()) else {
+                if e.provenance != Provenance::External {
+                    unlocatable_fp += 1;
+                }
+                return None;
+            };
             Some(ExpectedEdge {
                 ref_file: e.occ.file.clone(),
                 ref_line: e.occ.line,
@@ -163,7 +176,7 @@ pub fn score(graph: &CodeGraph, expected: &[ExpectedEdge]) -> Scorecard {
     let true_positives = emitted.intersection(&expected).count();
     Scorecard {
         true_positives,
-        false_positives: emitted.len() - true_positives,
+        false_positives: (emitted.len() - true_positives) + unlocatable_fp,
         false_negatives: expected.len() - true_positives,
     }
 }
@@ -209,6 +222,12 @@ fn local_def_loc(
 /// `sources` maps each file basename to its full source text, used to
 /// resolve the definition line of local-symbol targets (synthesized locals
 /// carry a byte-offset rather than appearing in `graph.symbols`).
+///
+/// An emitted edge whose target is locatable by neither `graph.symbols` nor
+/// [`local_def_loc`] counts as a **false positive** — an over-connection to a
+/// definition that does not exist. The exception is a [`Provenance::External`]
+/// edge, which honestly points outside the corpus the oracle can verify; those
+/// are skipped (neither credited nor penalised).
 pub fn score_oracle(
     graph: &CodeGraph,
     oracle: &[(String, u32, String, u32)],
@@ -220,15 +239,25 @@ pub fn score_oracle(
         def_loc.insert(sym.id.to_scip_string(), (sym.file.clone(), sym.line));
     }
 
+    // Emitted edges whose target is locatable by neither path: an over-connection
+    // unless honestly `External`.
+    let mut unlocatable_fp = 0usize;
+
     let emitted: HashSet<(String, u32, String, u32)> = graph
         .edges
         .iter()
         .filter_map(|e| {
             let scip = e.to.to_scip_string();
-            let (def_file, def_line) = def_loc
+            let Some((def_file, def_line)) = def_loc
                 .get(&scip)
                 .cloned()
-                .or_else(|| local_def_loc(&scip, sources))?;
+                .or_else(|| local_def_loc(&scip, sources))
+            else {
+                if e.provenance != Provenance::External {
+                    unlocatable_fp += 1;
+                }
+                return None;
+            };
             Some((e.occ.file.clone(), e.occ.line, def_file, def_line))
         })
         .collect();
@@ -238,7 +267,7 @@ pub fn score_oracle(
     let true_positives = emitted.intersection(&expected).count();
     Scorecard {
         true_positives,
-        false_positives: emitted.len() - true_positives,
+        false_positives: (emitted.len() - true_positives) + unlocatable_fp,
         false_negatives: expected.len() - true_positives,
     }
 }
@@ -292,5 +321,75 @@ mod tests {
         assert_eq!(a.true_positives, 5);
         assert_eq!(a.false_positives, 7);
         assert_eq!(a.false_negatives, 9);
+    }
+
+    use code2graph::{Confidence, Descriptor, Edge, Occurrence, SymbolId};
+
+    fn unlocatable_id(name: &str) -> SymbolId {
+        SymbolId::global(
+            "rust",
+            vec![
+                Descriptor::Namespace("pkg".into()),
+                Descriptor::Term(name.into()),
+            ],
+        )
+    }
+
+    fn call_edge_to(to: SymbolId, provenance: Provenance) -> Edge {
+        Edge {
+            from: unlocatable_id("caller"),
+            to,
+            role: RefRole::Call,
+            confidence: Confidence::NameOnly,
+            provenance,
+            occ: Occurrence {
+                file: "main.rs".into(),
+                line: 3,
+                col: 0,
+                byte: 0,
+            },
+        }
+    }
+
+    /// An edge to a target absent from `graph.symbols` is an over-connection: a
+    /// `SymbolTable` (non-External) edge counts as a false positive, while an
+    /// honest `External` edge to the same unlocatable target does not.
+    #[test]
+    fn unlocatable_non_external_target_is_a_false_positive() {
+        // The graph has no symbols at all, so every edge target is unlocatable.
+        let expected = [ExpectedEdge {
+            ref_file: "main.rs".into(),
+            ref_line: 3,
+            role: RefRole::Call,
+            def_file: "lib.rs".into(),
+            def_line: 1,
+        }];
+
+        // (a) non-External target → counted as a false positive.
+        let non_external = CodeGraph {
+            symbols: vec![],
+            edges: vec![call_edge_to(
+                unlocatable_id("ghost"),
+                Provenance::SymbolTable,
+            )],
+        };
+        let s = score(&non_external, &expected);
+        assert_eq!(s.true_positives, 0);
+        assert_eq!(
+            s.false_positives, 1,
+            "junk intra-graph edge must be penalised"
+        );
+
+        // (b) External target → exempt, neither TP nor FP.
+        let external = CodeGraph {
+            symbols: vec![],
+            edges: vec![call_edge_to(unlocatable_id("dep"), Provenance::External)],
+        };
+        let s = score(&external, &expected);
+        assert_eq!(s.true_positives, 0);
+        assert_eq!(
+            s.false_positives, 0,
+            "honest External edge must not be penalised"
+        );
     }
 }
