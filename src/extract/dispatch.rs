@@ -9,6 +9,8 @@ use crate::lang::Language;
 
 #[cfg(feature = "c")]
 use super::CExtractor;
+#[cfg(feature = "csharp")]
+use super::CSharpExtractor;
 #[cfg(feature = "cpp")]
 use super::CppExtractor;
 #[cfg(feature = "go")]
@@ -60,6 +62,8 @@ pub fn extract_file(lang: Language, source: &str, file: &str) -> Result<FileFact
     match lang {
         #[cfg(feature = "c")]
         Language::C => CExtractor.extract(source, file),
+        #[cfg(feature = "csharp")]
+        Language::CSharp => CSharpExtractor.extract(source, file),
         #[cfg(feature = "cpp")]
         Language::Cpp => CppExtractor.extract(source, file),
         #[cfg(feature = "go")]

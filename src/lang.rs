@@ -24,6 +24,7 @@ pub enum Language {
     Solidity,   // .sol
     Sql,        // .sql
     Hcl,        // .tf, .hcl, .tfvars
+    CSharp,     // .cs
 }
 
 impl Language {
@@ -46,6 +47,7 @@ impl Language {
             Language::Solidity => "solidity",
             Language::Sql => "sql",
             Language::Hcl => "hcl",
+            Language::CSharp => "csharp",
         }
     }
 
@@ -68,6 +70,7 @@ impl Language {
             "sol" => Some(Self::Solidity),
             "sql" => Some(Self::Sql),
             "tf" | "hcl" | "tfvars" => Some(Self::Hcl),
+            "cs" => Some(Self::CSharp),
             _ => None,
         }
     }

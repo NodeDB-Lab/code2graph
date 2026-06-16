@@ -39,7 +39,7 @@ Out of scope (belongs in the consumer):
 
 ## Status
 
-🚧 **Early, pre-`0.1`.** Extractors for 14 languages work end-to-end, plus a baseline name/scope
+🚧 **Early, pre-`0.1`.** Extractors for a broad set of languages work end-to-end, plus a baseline name/scope
 resolver: `extract` source into per-file facts, then `resolve` them into a `CodeGraph` of symbols
 and confidence-tagged edges (`calls`, `imports`, `inherits`). Symbol identity is SCIP-aligned — a
 descriptor path rendering to a stable string, so cross-file matching is string equality.

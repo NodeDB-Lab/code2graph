@@ -16,6 +16,8 @@ mod support;
 pub mod c;
 #[cfg(feature = "cpp")]
 pub mod cpp;
+#[cfg(feature = "csharp")]
+pub mod csharp;
 #[cfg(feature = "go")]
 pub mod go;
 #[cfg(feature = "hcl")]
@@ -51,6 +53,8 @@ pub use dispatch::{Extractor, extract_file, extract_path};
 pub use c::CExtractor;
 #[cfg(feature = "cpp")]
 pub use cpp::CppExtractor;
+#[cfg(feature = "csharp")]
+pub use csharp::CSharpExtractor;
 #[cfg(feature = "go")]
 pub use go::GoExtractor;
 #[cfg(feature = "hcl")]

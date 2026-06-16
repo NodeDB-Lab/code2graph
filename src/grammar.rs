@@ -105,6 +105,12 @@ pub fn hcl() -> Language {
     tree_sitter_hcl::LANGUAGE.into()
 }
 
+#[cfg(feature = "csharp")]
+/// Returns the tree-sitter grammar for C#.
+pub fn csharp() -> Language {
+    tree_sitter_c_sharp::LANGUAGE.into()
+}
+
 #[cfg(test)]
 mod tests {
     use tree_sitter::{LANGUAGE_VERSION, MIN_COMPATIBLE_LANGUAGE_VERSION};
@@ -151,5 +157,7 @@ mod tests {
         check("sql", super::sql());
         #[cfg(feature = "hcl")]
         check("hcl", super::hcl());
+        #[cfg(feature = "csharp")]
+        check("csharp", super::csharp());
     }
 }
