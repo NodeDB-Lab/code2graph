@@ -2,9 +2,9 @@
 
 //! Solidity extractor — one tree-sitter pass yielding definitions and references.
 //!
-//! Definitions: declarations whose visibility is not `private`. Qualified
-//! identity is derived from the file path (all directory segments kept, `.sol`
-//! stripped from the last segment).
+//! Definitions: all declarations, tagged with their real [`Visibility`].
+//! Qualified identity is derived from the file path (all directory segments
+//! kept, `.sol` stripped from the last segment).
 //!
 //! Covered declaration kinds:
 //! - `contract_declaration` → Class; `interface_declaration` → Interface;
@@ -147,22 +147,29 @@ fn solidity_namespaces(file: &str) -> Vec<String> {
         .collect()
 }
 
-// ── Visibility gate ──────────────────────────────────────────────────────────
+// ── Visibility reader ────────────────────────────────────────────────────────
 
-/// Returns `true` if a declaration should be emitted (not `private`).
+/// Read the Solidity visibility keyword from a `visibility` child node.
 ///
-/// Scans direct children for a node of kind `visibility`. If that node's text
-/// is `"private"` the declaration is suppressed; any other value (public,
-/// external, internal) or the absence of a visibility node → emit.
-/// Recall-first — only `private` is filtered.
-fn is_visible(node: &Node, bytes: &[u8]) -> bool {
+/// Scans direct children for a node of kind `"visibility"` and maps its text:
+/// - `"public"` or `"external"` → [`Visibility::Public`] (externally callable)
+/// - `"internal"` → [`Visibility::Internal`]
+/// - `"private"` → [`Visibility::Private`]
+/// - absent (no `visibility` child) → [`Visibility::Internal`] (Solidity's
+///   implicit default for both functions and state variables)
+fn read_visibility(node: &Node, bytes: &[u8]) -> Visibility {
     for child in node.children(&mut node.walk()) {
         if child.kind() == "visibility" {
-            return node_text(&child, bytes) != "private";
+            return match node_text(&child, bytes) {
+                "public" | "external" => Visibility::Public,
+                "internal" => Visibility::Internal,
+                "private" => Visibility::Private,
+                _ => Visibility::Unknown,
+            };
         }
     }
-    // No visibility child → default visibility → emit.
-    true
+    // No visibility keyword → Solidity's default is internal.
+    Visibility::Internal
 }
 
 // ── Symbol builder ───────────────────────────────────────────────────────────
@@ -172,7 +179,7 @@ fn push_symbol(
     out: &mut Vec<Symbol>,
     node: &Node,
     name: String,
-    kind: SymbolKind,
+    (kind, visibility): (SymbolKind, Visibility),
     descriptors: Vec<Descriptor>,
     bytes: &[u8],
     file: &str,
@@ -181,7 +188,7 @@ fn push_symbol(
         id: SymbolId::global(Language::Solidity.as_str(), descriptors),
         name,
         kind,
-        visibility: Visibility::Public,
+        visibility,
         file: file.to_owned(),
         line: (node.start_position().row + 1) as u32,
         span: ByteSpan {
@@ -204,11 +211,13 @@ fn emit_container_and_body(
 ) {
     let mut type_descriptors = prefix.to_vec();
     type_descriptors.push(Descriptor::Type(type_name.clone()));
+    // Contracts/interfaces/libraries have no visibility keyword; they are
+    // always accessible at the file level → Public.
     push_symbol(
         out,
         &node,
         type_name,
-        kind,
+        (kind, Visibility::Public),
         type_descriptors.clone(),
         bytes,
         file,
@@ -302,6 +311,8 @@ fn handle_container(
 /// `inside_type` → SymbolKind::Method with Descriptor::Method; otherwise
 /// SymbolKind::Function with Descriptor::Method (Solidity free functions are
 /// still callable, so Method descriptor is correct).
+/// All functions are emitted regardless of visibility; the [`Visibility`] tag
+/// reflects the actual keyword (or the Solidity default of `internal`).
 fn handle_function(
     node: Node,
     prefix: &[Descriptor],
@@ -310,9 +321,6 @@ fn handle_function(
     file: &str,
     out: &mut Vec<Symbol>,
 ) {
-    if !is_visible(&node, bytes) {
-        return;
-    }
     let name = match field_text(&node, "name", bytes) {
         Some(n) => n,
         None => return,
@@ -322,12 +330,21 @@ fn handle_function(
     } else {
         SymbolKind::Function
     };
+    let visibility = read_visibility(&node, bytes);
     let mut descriptors = prefix.to_vec();
     descriptors.push(Descriptor::Method {
         name: name.clone(),
         disambiguator: String::new(),
     });
-    push_symbol(out, &node, name, kind, descriptors, bytes, file);
+    push_symbol(
+        out,
+        &node,
+        name,
+        (kind, visibility),
+        descriptors,
+        bytes,
+        file,
+    );
 }
 
 /// Handle `constructor_definition` (no name field → always "constructor").
@@ -338,7 +355,8 @@ fn handle_constructor(
     file: &str,
     out: &mut Vec<Symbol>,
 ) {
-    // Constructors are always emitted; no visibility gate.
+    // Constructors are always emitted; they have no visibility keyword and are
+    // effectively public (they can only be called at deployment time).
     let mut descriptors = prefix.to_vec();
     descriptors.push(Descriptor::Method {
         name: "constructor".to_owned(),
@@ -348,7 +366,7 @@ fn handle_constructor(
         out,
         &node,
         "constructor".to_owned(),
-        SymbolKind::Method,
+        (SymbolKind::Method, Visibility::Public),
         descriptors,
         bytes,
         file,
@@ -356,6 +374,9 @@ fn handle_constructor(
 }
 
 /// Handle `modifier_definition`.
+///
+/// Modifiers have no explicit visibility keyword in Solidity; they are
+/// accessible only within the contract hierarchy → [`Visibility::Internal`].
 fn handle_modifier(
     node: Node,
     prefix: &[Descriptor],
@@ -376,7 +397,7 @@ fn handle_modifier(
         out,
         &node,
         name,
-        SymbolKind::Method,
+        (SymbolKind::Method, Visibility::Internal),
         descriptors,
         bytes,
         file,
@@ -388,6 +409,8 @@ fn handle_modifier(
 /// There is no name field; the leading keyword in the raw text determines the
 /// name: starts with "fallback" → "fallback", "receive" → "receive".
 /// If neither can be determined the node is skipped.
+/// Solidity requires these functions to be `external`; they are tagged
+/// [`Visibility::Public`] (the externally-callable tier).
 fn handle_fallback_receive(
     node: Node,
     prefix: &[Descriptor],
@@ -412,7 +435,7 @@ fn handle_fallback_receive(
         out,
         &node,
         name.to_owned(),
-        SymbolKind::Method,
+        (SymbolKind::Method, Visibility::Public),
         descriptors,
         bytes,
         file,
@@ -421,7 +444,9 @@ fn handle_fallback_receive(
 
 /// Handle `state_variable_declaration`.
 ///
-/// Visibility is the named field `visibility`. If its text is `"private"`, skip.
+/// All state variables are emitted; visibility is read from the named field
+/// `visibility` and mapped to [`Visibility`]. Absent → `Internal` (Solidity's
+/// default for state variables).
 /// Kind: Const if node has an `immutable` child or the text contains the word
 /// `constant`; otherwise Static.
 fn handle_state_variable(
@@ -431,12 +456,18 @@ fn handle_state_variable(
     file: &str,
     out: &mut Vec<Symbol>,
 ) {
-    // Visibility gate: use the named field `visibility` on this node type.
-    if let Some(vis) = node.child_by_field_name("visibility") {
-        if node_text(&vis, bytes) == "private" {
-            return;
-        }
-    }
+    // Read visibility from the named field (state_variable_declaration uses a
+    // field rather than a plain child kind, but the text values are the same).
+    let visibility = match node.child_by_field_name("visibility") {
+        Some(vis_node) => match node_text(&vis_node, bytes) {
+            "public" | "external" => Visibility::Public,
+            "internal" => Visibility::Internal,
+            "private" => Visibility::Private,
+            _ => Visibility::Unknown,
+        },
+        // No visibility field → Solidity's default is internal.
+        None => Visibility::Internal,
+    };
 
     let name = match field_text(&node, "name", bytes) {
         Some(n) => n,
@@ -458,10 +489,21 @@ fn handle_state_variable(
 
     let mut descriptors = prefix.to_vec();
     descriptors.push(Descriptor::Term(name.clone()));
-    push_symbol(out, &node, name, kind, descriptors, bytes, file);
+    push_symbol(
+        out,
+        &node,
+        name,
+        (kind, visibility),
+        descriptors,
+        bytes,
+        file,
+    );
 }
 
 /// Handle `constant_variable_declaration` (file-level `uint constant X = 1;`).
+///
+/// File-level constants have no visibility keyword; they are accessible from
+/// any importing file → [`Visibility::Public`].
 fn handle_constant_variable(
     node: Node,
     prefix: &[Descriptor],
@@ -479,7 +521,7 @@ fn handle_constant_variable(
         out,
         &node,
         name,
-        SymbolKind::Const,
+        (SymbolKind::Const, Visibility::Public),
         descriptors,
         bytes,
         file,
@@ -487,6 +529,9 @@ fn handle_constant_variable(
 }
 
 /// Handle `event_definition` and `error_declaration` (both → Term / Other).
+///
+/// Events and errors have no visibility keyword; they are part of the
+/// contract's public ABI → [`Visibility::Public`].
 fn handle_event_or_error(
     node: Node,
     prefix: &[Descriptor],
@@ -504,7 +549,7 @@ fn handle_event_or_error(
         out,
         &node,
         name,
-        SymbolKind::Other,
+        (SymbolKind::Other, Visibility::Public),
         descriptors,
         bytes,
         file,
@@ -529,11 +574,13 @@ fn handle_struct(
 
     let mut type_descriptors = prefix.to_vec();
     type_descriptors.push(Descriptor::Type(type_name.clone()));
+    // Structs have no visibility keyword; they follow the container's
+    // accessibility → Public.
     push_symbol(
         out,
         &node,
         type_name,
-        SymbolKind::Struct,
+        (SymbolKind::Struct, Visibility::Public),
         type_descriptors.clone(),
         bytes,
         file,
@@ -555,11 +602,13 @@ fn handle_struct(
         };
         let mut member_descriptors = type_descriptors.clone();
         member_descriptors.push(Descriptor::Term(member_name.clone()));
+        // Struct members have no visibility keyword → Public (accessible via
+        // the struct itself).
         push_symbol(
             out,
             &member,
             member_name,
-            SymbolKind::Static,
+            (SymbolKind::Static, Visibility::Public),
             member_descriptors,
             bytes,
             file,
@@ -579,11 +628,12 @@ fn handle_enum(node: Node, prefix: &[Descriptor], bytes: &[u8], file: &str, out:
 
     let mut type_descriptors = prefix.to_vec();
     type_descriptors.push(Descriptor::Type(type_name.clone()));
+    // Enums have no visibility keyword; they follow container accessibility → Public.
     push_symbol(
         out,
         &node,
         type_name,
-        SymbolKind::Enum,
+        (SymbolKind::Enum, Visibility::Public),
         type_descriptors.clone(),
         bytes,
         file,
@@ -606,11 +656,12 @@ fn handle_enum(node: Node, prefix: &[Descriptor], bytes: &[u8], file: &str, out:
         }
         let mut value_descriptors = type_descriptors.clone();
         value_descriptors.push(Descriptor::Term(value_name.clone()));
+        // Enum values inherit the enum's public accessibility.
         push_symbol(
             out,
             &value_node,
             value_name,
-            SymbolKind::Const,
+            (SymbolKind::Const, Visibility::Public),
             value_descriptors,
             bytes,
             file,
@@ -619,6 +670,9 @@ fn handle_enum(node: Node, prefix: &[Descriptor], bytes: &[u8], file: &str, out:
 }
 
 /// Handle `user_defined_type_definition` (`type X is uint;`).
+///
+/// Type aliases have no visibility keyword; they are accessible wherever
+/// they are in scope → [`Visibility::Public`].
 fn handle_typedef(
     node: Node,
     prefix: &[Descriptor],
@@ -636,7 +690,7 @@ fn handle_typedef(
         out,
         &node,
         name,
-        SymbolKind::TypeAlias,
+        (SymbolKind::TypeAlias, Visibility::Public),
         descriptors,
         bytes,
         file,
@@ -1225,9 +1279,9 @@ mod tests {
         facts.symbols.iter().find(|s| s.name == name).cloned()
     }
 
-    // Test 1: contract with public function and private function → visibility gate.
+    // Test 1: contract with public function and private function → both emitted with correct visibility.
     #[test]
-    fn contract_visibility_gate() {
+    fn contract_function_visibility_tagged() {
         let src = r#"
 pragma solidity ^0.8.0;
 contract Token {
@@ -1246,13 +1300,131 @@ contract Token {
 
         let mint = by_name(&facts, "mint").unwrap();
         assert_eq!(mint.kind, SymbolKind::Method);
+        assert_eq!(mint.visibility, Visibility::Public);
         assert_eq!(
             mint.id.to_scip_string(),
             "codegraph . . . contracts/Token/Token#mint()."
         );
 
-        // private function must NOT be emitted
-        assert!(by_name(&facts, "_secret").is_none());
+        // private function must NOW be emitted with Visibility::Private
+        let secret = by_name(&facts, "_secret").expect("private function must be emitted");
+        assert_eq!(secret.kind, SymbolKind::Method);
+        assert_eq!(
+            secret.visibility,
+            Visibility::Private,
+            "private function must carry Visibility::Private"
+        );
+        assert_eq!(
+            secret.id.to_scip_string(),
+            "codegraph . . . contracts/Token/Token#_secret()."
+        );
+    }
+
+    // Test: public fn → Visibility::Public.
+    #[test]
+    fn function_public_visibility() {
+        let src = "contract C { function foo() public {} }";
+        let facts = extract(src, "contracts/C.sol");
+        let foo = by_name(&facts, "foo").expect("public fn must be emitted");
+        assert_eq!(
+            foo.visibility,
+            Visibility::Public,
+            "public function must carry Visibility::Public"
+        );
+    }
+
+    // Test: external fn → Visibility::Public.
+    #[test]
+    fn function_external_visibility() {
+        let src = "contract C { function foo() external {} }";
+        let facts = extract(src, "contracts/C.sol");
+        let foo = by_name(&facts, "foo").expect("external fn must be emitted");
+        assert_eq!(
+            foo.visibility,
+            Visibility::Public,
+            "external function must carry Visibility::Public"
+        );
+    }
+
+    // Test: internal fn → Visibility::Internal.
+    #[test]
+    fn function_internal_visibility() {
+        let src = "contract C { function foo() internal {} }";
+        let facts = extract(src, "contracts/C.sol");
+        let foo = by_name(&facts, "foo").expect("internal fn must be emitted");
+        assert_eq!(
+            foo.visibility,
+            Visibility::Internal,
+            "internal function must carry Visibility::Internal"
+        );
+    }
+
+    // Test: private fn → emitted with Visibility::Private.
+    #[test]
+    fn function_private_visibility_emitted() {
+        let src = "contract C { function foo() private {} }";
+        let facts = extract(src, "contracts/C.sol");
+        let foo = by_name(&facts, "foo").expect("private fn must be emitted");
+        assert_eq!(
+            foo.visibility,
+            Visibility::Private,
+            "private function must carry Visibility::Private"
+        );
+    }
+
+    // Test: fn with no visibility keyword → Internal (Solidity default).
+    #[test]
+    fn function_no_visibility_defaults_to_internal() {
+        // A function inside a contract with no visibility keyword; tree-sitter-solidity
+        // allows this syntactically (validity is the compiler's concern).
+        let src = "contract C { function helper() pure returns (uint) { return 0; } }";
+        let facts = extract(src, "contracts/C.sol");
+        let helper = by_name(&facts, "helper").expect("fn with no visibility must be emitted");
+        assert_eq!(
+            helper.visibility,
+            Visibility::Internal,
+            "function with no visibility keyword must default to Visibility::Internal"
+        );
+    }
+
+    // Test: private state variable → emitted with Visibility::Private.
+    #[test]
+    fn state_variable_private_visibility_emitted() {
+        let src = "contract C { uint256 private _balance; }";
+        let facts = extract(src, "contracts/C.sol");
+        let bal = by_name(&facts, "_balance").expect("private state var must be emitted");
+        assert_eq!(
+            bal.visibility,
+            Visibility::Private,
+            "private state variable must carry Visibility::Private"
+        );
+    }
+
+    // Test: public state variable → Visibility::Public.
+    #[test]
+    fn state_variable_public_visibility() {
+        let src = "contract C { uint256 public supply; }";
+        let facts = extract(src, "contracts/C.sol");
+        let supply = by_name(&facts, "supply").expect("public state var must be emitted");
+        assert_eq!(
+            supply.visibility,
+            Visibility::Public,
+            "public state variable must carry Visibility::Public"
+        );
+    }
+
+    // Test: state variable with no visibility keyword → Internal (Solidity default).
+    #[test]
+    fn state_variable_no_visibility_defaults_to_internal() {
+        let src = "contract C { uint256 counter; }";
+        let facts = extract(src, "contracts/C.sol");
+        let counter =
+            by_name(&facts, "counter").expect("state var with no visibility must be emitted");
+        assert_eq!(
+            counter.visibility,
+            Visibility::Internal,
+            "state variable with no visibility keyword must default to Visibility::Internal"
+        );
     }
 
     // Test 2: interface → SymbolKind::Interface; library → SymbolKind::Class.
