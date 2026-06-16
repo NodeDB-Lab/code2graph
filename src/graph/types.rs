@@ -255,16 +255,20 @@ pub struct Binding {
 
 /// How confident the resolver is in an [`Edge`] — the precision marker that lets
 /// consumers (e.g. a quality analyzer) gate on resolution quality.
+///
+/// Variants are ordered from least to most precise: `NameOnly < Scoped < Exact`.
+/// More-precise compares greater, so consumers can write threshold filters such
+/// as `edge.confidence >= Confidence::Scoped` to drop `NameOnly` edges.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Confidence {
-    /// Type/scope-precise (e.g. stack-graphs or type inference): exactly one binding.
-    Exact,
+    /// Matched by name only — may be one of several same-named symbols.
+    NameOnly,
     /// Narrowed by lexical scope / imports, or the referenced name has a unique
     /// global candidate — not type-checked.
     Scoped,
-    /// Matched by name only — may be one of several same-named symbols.
-    NameOnly,
+    /// Type/scope-precise (e.g. stack-graphs or type inference): exactly one binding.
+    Exact,
 }
 
 /// Which analysis derived an [`Edge`] — its provenance.
@@ -396,6 +400,111 @@ pub struct FileFacts {
 pub struct CodeGraph {
     pub symbols: Vec<Symbol>,
     pub edges: Vec<Edge>,
+}
+
+impl CodeGraph {
+    /// Borrowing iterator over edges whose confidence is at or above `threshold`
+    /// (the zero-alloc tiered-retrieval primitive). E.g. `Confidence::Scoped`
+    /// yields `Scoped` and `Exact` edges, dropping `NameOnly`.
+    pub fn edges_min_confidence(&self, threshold: Confidence) -> impl Iterator<Item = &Edge> {
+        self.edges.iter().filter(move |e| e.confidence >= threshold)
+    }
+
+    /// A new graph keeping only edges at or above `threshold` (dense-by-default,
+    /// dial precision up). Symbols are retained unchanged. Pure filtering, no policy.
+    pub fn min_confidence(&self, threshold: Confidence) -> CodeGraph {
+        CodeGraph {
+            symbols: self.symbols.clone(),
+            edges: self.edges_min_confidence(threshold).cloned().collect(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod confidence_tests {
+    use super::*;
+    use crate::symbol::{Descriptor, SymbolId};
+
+    fn make_id(name: &str) -> SymbolId {
+        SymbolId::global(
+            "rust",
+            vec![
+                Descriptor::Namespace("pkg".into()),
+                Descriptor::Term(name.into()),
+            ],
+        )
+    }
+
+    fn make_edge(from: &str, to: &str, confidence: Confidence) -> Edge {
+        Edge {
+            from: make_id(from),
+            to: make_id(to),
+            role: RefRole::Call,
+            confidence,
+            provenance: Provenance::SymbolTable,
+            occ: Occurrence {
+                file: "src/a.rs".into(),
+                line: 1,
+                col: 0,
+                byte: 0,
+            },
+        }
+    }
+
+    fn make_graph_with_one_of_each() -> (CodeGraph, Vec<Symbol>) {
+        let symbols = vec![Symbol {
+            id: make_id("sym"),
+            name: "sym".into(),
+            kind: SymbolKind::Function,
+            file: "src/a.rs".into(),
+            line: 1,
+            span: ByteSpan { start: 0, end: 10 },
+            signature: "pub fn sym()".into(),
+        }];
+        let graph = CodeGraph {
+            symbols: symbols.clone(),
+            edges: vec![
+                make_edge("a", "b", Confidence::NameOnly),
+                make_edge("c", "d", Confidence::Scoped),
+                make_edge("e", "f", Confidence::Exact),
+            ],
+        };
+        (graph, symbols)
+    }
+
+    #[test]
+    fn confidence_ordering_exact_gt_scoped() {
+        assert!(Confidence::Exact > Confidence::Scoped);
+    }
+
+    #[test]
+    fn confidence_ordering_scoped_gt_name_only() {
+        assert!(Confidence::Scoped > Confidence::NameOnly);
+    }
+
+    #[test]
+    fn confidence_ordering_exact_gt_name_only() {
+        assert!(Confidence::Exact > Confidence::NameOnly);
+    }
+
+    #[test]
+    fn edges_min_confidence_scoped_yields_two() {
+        let (graph, _) = make_graph_with_one_of_each();
+        let result: Vec<&Edge> = graph.edges_min_confidence(Confidence::Scoped).collect();
+        assert_eq!(result.len(), 2);
+        assert!(result.iter().all(|e| e.confidence >= Confidence::Scoped));
+        assert!(result.iter().any(|e| e.confidence == Confidence::Scoped));
+        assert!(result.iter().any(|e| e.confidence == Confidence::Exact));
+    }
+
+    #[test]
+    fn min_confidence_exact_keeps_one_edge_and_all_symbols() {
+        let (graph, symbols) = make_graph_with_one_of_each();
+        let filtered = graph.min_confidence(Confidence::Exact);
+        assert_eq!(filtered.edges.len(), 1);
+        assert_eq!(filtered.edges[0].confidence, Confidence::Exact);
+        assert_eq!(filtered.symbols.len(), symbols.len());
+    }
 }
 
 #[cfg(all(test, feature = "serde"))]
