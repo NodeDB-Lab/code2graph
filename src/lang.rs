@@ -27,6 +27,7 @@ pub enum Language {
     CSharp,     // .cs
     Scala,      // .scala, .sc
     Dart,       // .dart
+    Lua,        // .lua
 }
 
 impl Language {
@@ -52,6 +53,7 @@ impl Language {
             Language::CSharp => "csharp",
             Language::Scala => "scala",
             Language::Dart => "dart",
+            Language::Lua => "lua",
         }
     }
 
@@ -77,6 +79,7 @@ impl Language {
             "cs" => Some(Self::CSharp),
             "scala" | "sc" => Some(Self::Scala),
             "dart" => Some(Self::Dart),
+            "lua" => Some(Self::Lua),
             _ => None,
         }
     }
