@@ -14,7 +14,7 @@
 //! Emits neutral [`FileFacts`] — no storage entries, no source bodies.
 //!
 //! The core extraction logic is shared with the Luau extractor via
-//! [`extract_lua_family`], which is parameterized by [`Language`] and grammar.
+//! `extract_lua_family`, which is parameterized by [`Language`] and grammar.
 
 use tree_sitter::{Node, Parser};
 

@@ -4,7 +4,7 @@
 //!
 //! Parses the `.svelte` file with tree-sitter-svelte-ng, locates every
 //! `<script>` block, delegates the inner source to the existing TypeScript /
-//! JavaScript extraction core ([`extract_ecmascript`]), then remaps all byte
+//! JavaScript extraction core (`extract_ecmascript`), then remaps all byte
 //! offsets back into the full `.svelte` file.  Two script blocks may be
 //! present: the normal instance block and `<script context="module">`;
 //! symbols and references from both are merged into a single [`FileFacts`].
@@ -13,8 +13,6 @@
 //! block are local Vec indices — appending a second block's scopes shifts its
 //! base, so bindings and references that reference scope indices are adjusted
 //! by the scope-base offset before extending the merged Vec.
-//!
-//! [`extract_ecmascript`]: super::typescript::extract_ecmascript
 
 use tree_sitter::{Node, Parser};
 

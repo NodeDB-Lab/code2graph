@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Luau extractor — reuses the Lua-family core ([`super::lua::extract_lua_family`]).
+//! Luau extractor — reuses the Lua-family core (`extract_lua_family`).
 //!
 //! Luau is a typed superset of Lua whose tree-sitter AST is identical to Lua's
 //! for every construct the Lua extractor already handles. The only Luau additions
