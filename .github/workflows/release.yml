@@ -146,6 +146,10 @@ jobs:
           manylinux: ${{ matrix.manylinux || 'auto' }}
           args: --release --out dist -m bindings/python/Cargo.toml
           sccache: "true"
+          # tree-sitter grammars' generated parser.c uses C99 for-loop init and
+          # some scanners use C11 static_assert; the manylinux cross-GCC defaults
+          # to C89. Force C11 inside the build container (linux/docker only).
+          docker-options: ${{ contains(matrix.target, 'linux') && '-e CFLAGS=-std=gnu11' || '' }}
       - uses: actions/upload-artifact@v7
         with:
           name: wheels-${{ matrix.target }}
@@ -216,6 +220,11 @@ jobs:
         run: npm ci
       - name: Build addon
         working-directory: bindings/node
+        # tree-sitter grammars need C11 (for-loop init / static_assert); the napi
+        # aarch64 cross-GCC defaults to C89. Harmless on the modern gnu/clang/zig
+        # targets; omitted on Windows, whose MSVC rejects -std=gnu11.
+        env:
+          CFLAGS: ${{ !contains(matrix.target, 'windows') && '-std=gnu11' || '' }}
         run: npx napi build --platform --release --target ${{ matrix.target }} ${{ matrix.zig && '-x' || '' }} ${{ matrix.napi_cross && '--use-napi-cross' || '' }}
       - uses: actions/upload-artifact@v7
         with:
