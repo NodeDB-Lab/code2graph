@@ -328,6 +328,13 @@ pub enum Provenance {
     /// recall tier that catches references differing from the definition only by
     /// case. Never fuzzy beyond case folding (no edit-distance/LSH).
     NormalizedName,
+    /// Edge to a symbol OUTSIDE the analyzed set — an unresolved reference into a
+    /// dependency, identified via import metadata. The call name was found in the
+    /// file's import map (`RefRole::Import` with a `from_path`) but has no matching
+    /// definition in the extracted files. The target's package coordinate is left
+    /// empty for the consumer to enrich (e.g. a software-composition-analysis tool
+    /// that maps `from_path` to a CVE advisory).
+    External,
 }
 
 // ── FFI / cross-language boundary facts ──────────────────────────────────────

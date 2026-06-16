@@ -14,6 +14,7 @@
 //! [`CodeGraph`]: crate::graph::CodeGraph
 
 pub mod conformance;
+pub mod external;
 pub mod ffi_bridge;
 mod incremental;
 pub mod layered;
@@ -24,6 +25,7 @@ mod support;
 pub mod symbol_table;
 
 pub use conformance::ConformanceResolver;
+pub use external::ExternalResolver;
 pub use ffi_bridge::FfiBridgeResolver;
 pub use incremental::{FileSubgraph, IncrementalGraph};
 pub use layered::LayeredResolver;

@@ -10,8 +10,8 @@ use std::collections::{HashMap, HashSet};
 use crate::graph::types::{CodeGraph, Confidence, Edge, FileFacts, Provenance, RefRole, Symbol};
 
 use super::{
-    ConformanceResolver, FfiBridgeResolver, NormalizedNameResolver, Resolver, ScopeGraphResolver,
-    SymbolTableResolver,
+    ConformanceResolver, ExternalResolver, FfiBridgeResolver, NormalizedNameResolver, Resolver,
+    ScopeGraphResolver, SymbolTableResolver,
 };
 
 /// A resolver that runs a stack of inner resolvers in order and merges their
@@ -47,7 +47,11 @@ impl LayeredResolver {
     /// 3. [`FfiBridgeResolver`] — cross-language FFI edges.
     /// 4. [`ConformanceResolver`] — inherited/implemented-member recall over the
     ///    type hierarchy (additive `Scoped` edges, `Provenance::Conformance`).
-    /// 5. [`NormalizedNameResolver`] — case-folded name matching, lowest-tier
+    /// 5. [`ExternalResolver`] — SCA reachability: import-backed calls into
+    ///    dependency code become edges to minted external symbols
+    ///    (`NameOnly`, `Provenance::External`). More grounded than case-fold
+    ///    heuristics; placed before `NormalizedNameResolver`.
+    /// 6. [`NormalizedNameResolver`] — case-folded name matching, lowest-tier
     ///    recall (`Heuristic`). Adds only references that differ from the
     ///    definition by case; exact-case matches are already covered above.
     pub fn default_dense() -> Self {
@@ -56,6 +60,7 @@ impl LayeredResolver {
             Box::new(ScopeGraphResolver),
             Box::new(FfiBridgeResolver),
             Box::new(ConformanceResolver),
+            Box::new(ExternalResolver),
             Box::new(NormalizedNameResolver),
         ])
     }
