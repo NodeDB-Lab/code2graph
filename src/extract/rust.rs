@@ -20,12 +20,12 @@ use crate::graph::types::{
     ScopeId, ScopeKind, Symbol, SymbolKind, Visibility,
 };
 use crate::lang::Language;
-use crate::symbol::{Descriptor, SymbolId};
+use crate::symbol::Descriptor;
 
 use super::{
-    Extractor, MIN_REF_LEN, attach_reference_scopes, child_text, collect_call_references,
-    definition_bindings, import_bindings, node_occurrence, node_span, node_text,
-    one_line_signature, push_binding, push_ref, push_scope,
+    ExtractCtx, Extractor, MIN_REF_LEN, attach_reference_scopes, child_text,
+    collect_call_references, definition_bindings, import_bindings, make_symbol, node_occurrence,
+    node_span, node_text, one_line_signature, push_binding, push_ref, push_scope,
 };
 
 /// Tree-sitter query capturing call-callee identifiers (and optional qualifier).
@@ -79,7 +79,12 @@ impl Extractor for RustExtractor {
         let bytes = source.as_bytes();
         let namespaces = rust_namespaces(file);
 
-        let defs = collect_symbols(&root, bytes, file, &namespaces);
+        let ctx = ExtractCtx {
+            bytes,
+            file,
+            lang: Language::Rust,
+        };
+        let defs = collect_symbols(&root, &ctx, &namespaces);
         let def_bindings = definition_bindings(&defs);
         let ffi_exports = collect_ffi_exports(&root, bytes, &defs);
         let mut symbols = defs;
@@ -130,7 +135,8 @@ fn rust_namespaces(file: &str) -> Vec<String> {
     segs
 }
 
-fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String]) -> Vec<Symbol> {
+fn collect_symbols(root: &Node, ctx: &ExtractCtx, namespaces: &[String]) -> Vec<Symbol> {
+    let bytes = ctx.bytes;
     let mut out = Vec::new();
     for child in root.children(&mut root.walk()) {
         let (kind, leaf) = match child.kind() {
@@ -219,28 +225,25 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
             .collect();
         descriptors.push(leaf);
 
-        out.push(Symbol {
-            id: SymbolId::global(Language::Rust.as_str(), descriptors),
+        let signature = one_line_signature(node_text(&child, bytes), &['{']);
+        out.push(make_symbol(
+            ctx,
+            &child,
             // Cloned because `sym_name` is reused below as the type/trait name
             // when descending into impl/trait members.
-            name: sym_name.clone(),
+            sym_name.clone(),
             kind,
             visibility,
-            file: file.to_owned(),
-            line: (child.start_position().row + 1) as u32,
-            span: ByteSpan {
-                start: child.start_byte(),
-                end: child.end_byte(),
-            },
-            signature: one_line_signature(node_text(&child, bytes), &['{']),
-        });
+            descriptors,
+            signature,
+        ));
 
         // For inherent impl blocks, also emit symbols for their members (all
         // visibilities). Trait-impl members are deferred: the call qualifier is
         // `self`, not the type, and method extraction risks collisions with
         // inherent methods.
         if kind == SymbolKind::Impl && child.child_by_field_name("trait").is_none() {
-            collect_impl_members(&child, bytes, file, namespaces, &sym_name, &mut out);
+            collect_impl_members(&child, ctx, namespaces, &sym_name, &mut out);
         }
 
         // For trait definitions, emit symbols for their member methods and
@@ -249,31 +252,19 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
         // — they are implicitly public whenever the trait is public, so we pass
         // `Visibility::Public` for all trait members.
         if kind == SymbolKind::Trait {
-            collect_trait_members(&child, bytes, file, namespaces, &sym_name, &mut out);
+            collect_trait_members(&child, ctx, namespaces, &sym_name, &mut out);
         }
     }
     out
 }
 
-/// Build and push a [`Symbol`] for one member of an `impl` or `trait` body.
+/// Build the descriptor path for one member of an `impl` or `trait` body:
+/// `namespaces.map(Namespace) ++ [Type(type_name), leaf]`.
 ///
-/// Shared by [`collect_impl_members`] and [`collect_trait_members`] to avoid
-/// duplicating the descriptor-construction + `Symbol` push.
-///
-/// `member` is the tree-sitter node for the member item; the `(kind, leaf, visibility)`
-/// triple carries the symbol kind, descriptor, and caller-computed [`Visibility`];
-/// `type_name` is the enclosing type/trait name.
-fn push_member_symbol(
-    member: &Node,
-    bytes: &[u8],
-    file: &str,
-    namespaces: &[String],
-    type_name: &str,
-    (kind, leaf, visibility): (SymbolKind, Descriptor, Visibility),
-    out: &mut Vec<Symbol>,
-) {
-    // Extract the name before moving `leaf` into `descriptors` so no clone is needed.
-    let sym_name = leaf.name().to_owned();
+/// Shared by [`collect_impl_members`] and [`collect_trait_members`] so the two
+/// call sites don't duplicate the prefix construction. The `Symbol` itself is
+/// built by [`make_symbol`] at the call site.
+fn member_descriptors(namespaces: &[String], type_name: &str, leaf: Descriptor) -> Vec<Descriptor> {
     let mut descriptors: Vec<Descriptor> = namespaces
         .iter()
         .cloned()
@@ -281,20 +272,7 @@ fn push_member_symbol(
         .collect();
     descriptors.push(Descriptor::Type(type_name.to_owned()));
     descriptors.push(leaf);
-
-    out.push(Symbol {
-        id: SymbolId::global(Language::Rust.as_str(), descriptors),
-        name: sym_name,
-        kind,
-        visibility,
-        file: file.to_owned(),
-        line: (member.start_position().row + 1) as u32,
-        span: ByteSpan {
-            start: member.start_byte(),
-            end: member.end_byte(),
-        },
-        signature: one_line_signature(node_text(member, bytes), &['{']),
-    });
+    descriptors
 }
 
 /// Walk an inherent `impl_item` node and emit member symbols (all visibilities).
@@ -308,12 +286,12 @@ fn push_member_symbol(
 /// SCIP renders e.g. `…/Foo#new().` for a method and `…/Foo#MAX.` for a const.
 fn collect_impl_members(
     impl_node: &Node,
-    bytes: &[u8],
-    file: &str,
+    ctx: &ExtractCtx,
     namespaces: &[String],
     type_name: &str,
     out: &mut Vec<Symbol>,
 ) {
+    let bytes = ctx.bytes;
     // The `body` field is the `declaration_list` — use the field accessor
     // (idiomatic here; `scope_dfs` / `collect_bindings_dfs` do the same).
     let Some(body) = impl_node.child_by_field_name("body") else {
@@ -345,15 +323,19 @@ fn collect_impl_members(
             _ => continue,
         };
 
-        push_member_symbol(
+        let visibility = read_visibility(&member, bytes);
+        let member_name = leaf.name().to_owned();
+        let descriptors = member_descriptors(namespaces, type_name, leaf);
+        let signature = one_line_signature(node_text(&member, bytes), &['{']);
+        out.push(make_symbol(
+            ctx,
             &member,
-            bytes,
-            file,
-            namespaces,
-            type_name,
-            (kind, leaf, read_visibility(&member, bytes)),
-            out,
-        );
+            member_name,
+            kind,
+            visibility,
+            descriptors,
+            signature,
+        ));
     }
 }
 
@@ -375,12 +357,12 @@ fn collect_impl_members(
 /// SCIP renders e.g. `…/Greet#hello().` for a method and `…/Greet#MAX.` for a const.
 fn collect_trait_members(
     trait_node: &Node,
-    bytes: &[u8],
-    file: &str,
+    ctx: &ExtractCtx,
     namespaces: &[String],
     trait_name: &str,
     out: &mut Vec<Symbol>,
 ) {
+    let bytes = ctx.bytes;
     let Some(body) = trait_node.child_by_field_name("body") else {
         return;
     };
@@ -414,15 +396,18 @@ fn collect_trait_members(
 
         // Trait items have no visibility modifier; their visibility follows the
         // trait, so we tag them Public.
-        push_member_symbol(
+        let member_name = leaf.name().to_owned();
+        let descriptors = member_descriptors(namespaces, trait_name, leaf);
+        let signature = one_line_signature(node_text(&member, bytes), &['{']);
+        out.push(make_symbol(
+            ctx,
             &member,
-            bytes,
-            file,
-            namespaces,
-            trait_name,
-            (kind, leaf, Visibility::Public),
-            out,
-        );
+            member_name,
+            kind,
+            Visibility::Public,
+            descriptors,
+            signature,
+        ));
     }
 }
 
