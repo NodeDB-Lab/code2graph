@@ -20,12 +20,12 @@ use crate::graph::types::{
     Symbol, SymbolKind, Visibility,
 };
 use crate::lang::Language;
-use crate::symbol::{Descriptor, SymbolId};
+use crate::symbol::Descriptor;
 
 use super::{
-    Extractor, MIN_REF_LEN, attach_reference_scopes, collect_call_references, definition_bindings,
-    field_text, innermost_scope, node_span, node_text, one_line_signature, push_binding, push_ref,
-    push_scope,
+    ExtractCtx, Extractor, MIN_REF_LEN, attach_reference_scopes, collect_call_references,
+    definition_bindings, field_text, innermost_scope, make_symbol, node_span, node_text,
+    one_line_signature, push_binding, push_ref, push_scope,
 };
 
 /// Tree-sitter query capturing command-name identifiers as call references.
@@ -60,8 +60,13 @@ impl Extractor for ShellExtractor {
         let root = tree.root_node();
         let bytes = source.as_bytes();
         let namespaces = shell_namespaces(file);
+        let ctx = ExtractCtx {
+            bytes,
+            file,
+            lang: Language::Shell,
+        };
 
-        let defs = collect_symbols(&root, bytes, file, &namespaces);
+        let defs = collect_symbols(&root, &ctx, &namespaces);
         let def_bindings = definition_bindings(&defs);
         let mut symbols = defs;
         symbols.push(super::module_symbol(
@@ -75,16 +80,16 @@ impl Extractor for ShellExtractor {
             &ts_language,
             CALL_QUERY,
             Language::Shell,
-            bytes,
-            file,
+            ctx.bytes,
+            ctx.file,
         )?;
 
-        collect_read_references(&root, bytes, file, &mut references);
-        collect_write_references(&root, bytes, file, &mut references);
+        collect_read_references(&root, ctx.bytes, ctx.file, &mut references);
+        collect_write_references(&root, ctx.bytes, ctx.file, &mut references);
 
         let scopes = collect_scopes(&root, source.len());
         attach_reference_scopes(&mut references, &scopes);
-        let mut bindings = collect_bindings(&root, bytes, &scopes);
+        let mut bindings = collect_bindings(&root, ctx.bytes, &scopes);
         bindings.extend(def_bindings);
 
         Ok(FileFacts {
@@ -123,8 +128,7 @@ fn shell_namespaces(file: &str) -> Vec<String> {
 
 fn collect_symbols(
     root: &tree_sitter::Node,
-    bytes: &[u8],
-    file: &str,
+    ctx: &ExtractCtx<'_>,
     namespaces: &[String],
 ) -> Vec<Symbol> {
     let mut out = Vec::new();
@@ -133,7 +137,7 @@ fn collect_symbols(
         if child.kind() != "function_definition" {
             continue;
         }
-        let Some(name) = field_text(&child, "name", bytes) else {
+        let Some(name) = field_text(&child, "name", ctx.bytes) else {
             continue;
         };
         let mut descriptors: Vec<Descriptor> = namespaces
@@ -145,19 +149,16 @@ fn collect_symbols(
             name: name.clone(),
             disambiguator: String::new(),
         });
-        out.push(Symbol {
-            id: SymbolId::global(Language::Shell.as_str(), descriptors),
+        let signature = one_line_signature(node_text(&child, ctx.bytes), &['{']);
+        out.push(make_symbol(
+            ctx,
+            &child,
             name,
-            kind: SymbolKind::Function,
-            visibility: Visibility::Unknown,
-            file: file.to_owned(),
-            line: (child.start_position().row + 1) as u32,
-            span: ByteSpan {
-                start: child.start_byte(),
-                end: child.end_byte(),
-            },
-            signature: one_line_signature(node_text(&child, bytes), &['{']),
-        });
+            SymbolKind::Function,
+            Visibility::Unknown,
+            descriptors,
+            signature,
+        ));
     }
     out
 }
