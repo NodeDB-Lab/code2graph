@@ -135,6 +135,12 @@ pub fn luau() -> Language {
     tree_sitter_luau::LANGUAGE.into()
 }
 
+#[cfg(feature = "pascal")]
+/// Returns the tree-sitter grammar for Pascal / Delphi.
+pub fn pascal() -> Language {
+    tree_sitter_pascal::LANGUAGE.into()
+}
+
 #[cfg(test)]
 mod tests {
     use tree_sitter::{LANGUAGE_VERSION, MIN_COMPATIBLE_LANGUAGE_VERSION};
@@ -191,5 +197,7 @@ mod tests {
         check("lua", super::lua());
         #[cfg(feature = "luau")]
         check("luau", super::luau());
+        #[cfg(feature = "pascal")]
+        check("pascal", super::pascal());
     }
 }

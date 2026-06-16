@@ -29,6 +29,7 @@ pub enum Language {
     Dart,       // .dart
     Lua,        // .lua
     Luau,       // .luau
+    Pascal,     // .pas, .dpr, .dpk, .lpr
 }
 
 impl Language {
@@ -56,6 +57,7 @@ impl Language {
             Language::Dart => "dart",
             Language::Lua => "lua",
             Language::Luau => "luau",
+            Language::Pascal => "pascal",
         }
     }
 
@@ -83,6 +85,7 @@ impl Language {
             "dart" => Some(Self::Dart),
             "lua" => Some(Self::Lua),
             "luau" => Some(Self::Luau),
+            "pas" | "dpr" | "dpk" | "lpr" => Some(Self::Pascal),
             _ => None,
         }
     }

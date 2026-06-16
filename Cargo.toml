@@ -13,7 +13,7 @@ keywords = ["code-graph", "tree-sitter", "static-analysis", "symbols", "cpg"]
 categories = ["development-tools", "parsing"]
 
 [features]
-default = ["rust","python","typescript","go","java","c","cpp","ruby","php","shell","swift","kotlin","solidity","sql","hcl","csharp","scala","dart","lua","luau"]
+default = ["rust","python","typescript","go","java","c","cpp","ruby","php","shell","swift","kotlin","solidity","sql","hcl","csharp","scala","dart","lua","luau","pascal"]
 manifest = ["dep:toml", "dep:serde", "dep:serde_json"]
 rust = ["dep:tree-sitter-rust"]
 python = ["dep:tree-sitter-python"]
@@ -35,6 +35,7 @@ scala = ["dep:tree-sitter-scala"]
 dart = ["dep:tree-sitter-dart"]
 lua = ["dep:tree-sitter-lua"]
 luau = ["dep:tree-sitter-luau"]
+pascal = ["dep:tree-sitter-pascal"]
 
 [dependencies]
 thiserror = "2"
@@ -63,6 +64,7 @@ tree-sitter-scala = { version = "0.26.0", optional = true }
 tree-sitter-dart = { version = "0.2.0", optional = true }
 tree-sitter-lua = { version = "0.5.0", optional = true }
 tree-sitter-luau = { version = "1.2.0", optional = true }
+tree-sitter-pascal = { version = "0.10.2", optional = true }
 
 [profile.release]
 opt-level = 3
