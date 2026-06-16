@@ -21,12 +21,13 @@ use crate::graph::types::{
     Symbol, SymbolKind, TypeRefContext, Visibility,
 };
 use crate::lang::Language;
-use crate::symbol::{Descriptor, SymbolId};
+use crate::symbol::Descriptor;
 
 use super::{
-    Extractor, MIN_REF_LEN, attach_reference_scopes, collect_call_references, definition_bindings,
-    field_text, import_bindings, innermost_scope, node_span, node_text, one_line_signature,
-    push_binding, push_import_ref, push_ref, push_scope, push_type_ref, simple_type_name,
+    ExtractCtx, Extractor, MIN_REF_LEN, attach_reference_scopes, collect_call_references,
+    definition_bindings, field_text, import_bindings, innermost_scope, make_symbol, node_span,
+    node_text, one_line_signature, push_binding, push_import_ref, push_ref, push_scope,
+    push_type_ref, simple_type_name,
 };
 
 /// Tree-sitter query capturing call-callee identifiers.
@@ -66,8 +67,13 @@ impl Extractor for DartExtractor {
         let root = tree.root_node();
         let bytes = source.as_bytes();
         let namespaces = dart_namespaces(file);
+        let ctx = ExtractCtx {
+            bytes,
+            file,
+            lang: Language::Dart,
+        };
 
-        let defs = collect_symbols(&root, bytes, file, &namespaces);
+        let defs = collect_symbols(&root, &ctx, &namespaces);
         let def_bindings = definition_bindings(&defs);
         let mut symbols = defs;
         let mod_sym = super::module_symbol(Language::Dart, &namespaces, file, source.len());
@@ -124,47 +130,41 @@ fn dart_namespaces(file: &str) -> Vec<String> {
 
 // ── Symbol collection ────────────────────────────────────────────────────────
 
-fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String]) -> Vec<Symbol> {
+fn collect_symbols(root: &Node, ctx: &ExtractCtx, namespaces: &[String]) -> Vec<Symbol> {
     let ns_descriptors: Vec<Descriptor> = namespaces
         .iter()
         .cloned()
         .map(Descriptor::Namespace)
         .collect();
     let mut out = Vec::new();
-    collect_top_level(root, bytes, file, &ns_descriptors, &mut out);
+    collect_top_level(root, ctx, &ns_descriptors, &mut out);
     out
 }
 
 /// Walk the `source_file` node and collect top-level definitions.
-fn collect_top_level(
-    node: &Node,
-    bytes: &[u8],
-    file: &str,
-    prefix: &[Descriptor],
-    out: &mut Vec<Symbol>,
-) {
+fn collect_top_level(node: &Node, ctx: &ExtractCtx, prefix: &[Descriptor], out: &mut Vec<Symbol>) {
     for child in node.children(&mut node.walk()) {
         match child.kind() {
             "class_declaration" => {
-                collect_class(&child, bytes, file, prefix, SymbolKind::Class, out);
+                collect_class(&child, ctx, prefix, SymbolKind::Class, out);
             }
             "mixin_declaration" => {
-                collect_mixin(&child, bytes, file, prefix, out);
+                collect_mixin(&child, ctx, prefix, out);
             }
             "enum_declaration" => {
-                collect_enum(&child, bytes, file, prefix, out);
+                collect_enum(&child, ctx, prefix, out);
             }
             "extension_declaration" => {
-                collect_extension(&child, bytes, file, prefix, out);
+                collect_extension(&child, ctx, prefix, out);
             }
             "type_alias" => {
-                collect_type_alias(&child, bytes, file, prefix, out);
+                collect_type_alias(&child, ctx, prefix, out);
             }
             "function_declaration" => {
-                collect_top_function(&child, bytes, file, prefix, out);
+                collect_top_function(&child, ctx, prefix, out);
             }
             "top_level_variable_declaration" => {
-                collect_top_level_vars(&child, bytes, file, prefix, out);
+                collect_top_level_vars(&child, ctx, prefix, out);
             }
             _ => {}
         }
@@ -174,119 +174,90 @@ fn collect_top_level(
 /// Emit a class or extension symbol and recurse into its `class_body` for members.
 fn collect_class(
     node: &Node,
-    bytes: &[u8],
-    file: &str,
+    ctx: &ExtractCtx,
     prefix: &[Descriptor],
     kind: SymbolKind,
     out: &mut Vec<Symbol>,
 ) {
-    let Some(name) = field_text(node, "name", bytes) else {
+    let Some(name) = field_text(node, "name", ctx.bytes) else {
         return;
     };
     let mut descriptors = prefix.to_vec();
     descriptors.push(Descriptor::Type(name.clone()));
-    out.push(Symbol {
-        id: SymbolId::global(Language::Dart.as_str(), descriptors.clone()),
-        name: name.clone(),
+    out.push(make_symbol(
+        ctx,
+        node,
+        name,
         kind,
-        visibility: Visibility::Unknown,
-        file: file.to_owned(),
-        line: (node.start_position().row + 1) as u32,
-        span: ByteSpan {
-            start: node.start_byte(),
-            end: node.end_byte(),
-        },
-        signature: one_line_signature(node_text(node, bytes), &['{', ';']),
-    });
+        Visibility::Unknown,
+        descriptors.clone(),
+        one_line_signature(node_text(node, ctx.bytes), &['{', ';']),
+    ));
 
     // Recurse into class_body for members.
     if let Some(body) = node.child_by_field_name("body") {
-        collect_class_members(&body, bytes, file, &descriptors, out);
+        collect_class_members(&body, ctx, &descriptors, out);
     }
 }
 
 /// Emit a mixin declaration and its body members.
 ///
 /// Mixins are trait-like constructs: `mixin Foo on Bar { ... }`.
-fn collect_mixin(
-    node: &Node,
-    bytes: &[u8],
-    file: &str,
-    prefix: &[Descriptor],
-    out: &mut Vec<Symbol>,
-) {
-    let Some(name) = field_text(node, "name", bytes) else {
+fn collect_mixin(node: &Node, ctx: &ExtractCtx, prefix: &[Descriptor], out: &mut Vec<Symbol>) {
+    let Some(name) = field_text(node, "name", ctx.bytes) else {
         return;
     };
     let mut descriptors = prefix.to_vec();
     descriptors.push(Descriptor::Type(name.clone()));
-    out.push(Symbol {
-        id: SymbolId::global(Language::Dart.as_str(), descriptors.clone()),
-        name: name.clone(),
-        kind: SymbolKind::Trait,
-        visibility: Visibility::Unknown,
-        file: file.to_owned(),
-        line: (node.start_position().row + 1) as u32,
-        span: ByteSpan {
-            start: node.start_byte(),
-            end: node.end_byte(),
-        },
-        signature: one_line_signature(node_text(node, bytes), &['{', ';']),
-    });
+    out.push(make_symbol(
+        ctx,
+        node,
+        name,
+        SymbolKind::Trait,
+        Visibility::Unknown,
+        descriptors.clone(),
+        one_line_signature(node_text(node, ctx.bytes), &['{', ';']),
+    ));
 
     // Recurse into class_body (mixins share the same body shape as classes).
     if let Some(body) = node.child_by_field_name("body") {
-        collect_class_members(&body, bytes, file, &descriptors, out);
+        collect_class_members(&body, ctx, &descriptors, out);
     }
 }
 
 /// Emit an enum and its constants.
-fn collect_enum(
-    node: &Node,
-    bytes: &[u8],
-    file: &str,
-    prefix: &[Descriptor],
-    out: &mut Vec<Symbol>,
-) {
-    let Some(name) = field_text(node, "name", bytes) else {
+fn collect_enum(node: &Node, ctx: &ExtractCtx, prefix: &[Descriptor], out: &mut Vec<Symbol>) {
+    let Some(name) = field_text(node, "name", ctx.bytes) else {
         return;
     };
     let mut descriptors = prefix.to_vec();
     descriptors.push(Descriptor::Type(name.clone()));
-    out.push(Symbol {
-        id: SymbolId::global(Language::Dart.as_str(), descriptors.clone()),
-        name: name.clone(),
-        kind: SymbolKind::Enum,
-        visibility: Visibility::Unknown,
-        file: file.to_owned(),
-        line: (node.start_position().row + 1) as u32,
-        span: ByteSpan {
-            start: node.start_byte(),
-            end: node.end_byte(),
-        },
-        signature: one_line_signature(node_text(node, bytes), &['{', ';']),
-    });
+    out.push(make_symbol(
+        ctx,
+        node,
+        name,
+        SymbolKind::Enum,
+        Visibility::Unknown,
+        descriptors.clone(),
+        one_line_signature(node_text(node, ctx.bytes), &['{', ';']),
+    ));
 
     // Collect enum constants from enum_body.
     if let Some(body) = node.child_by_field_name("body") {
         for member in body.children(&mut body.walk()) {
             if member.kind() == "enum_constant" {
-                if let Some(const_name) = field_text(&member, "name", bytes) {
+                if let Some(const_name) = field_text(&member, "name", ctx.bytes) {
                     let mut const_desc = descriptors.clone();
                     const_desc.push(Descriptor::Term(const_name.clone()));
-                    out.push(Symbol {
-                        id: SymbolId::global(Language::Dart.as_str(), const_desc),
-                        name: const_name,
-                        kind: SymbolKind::Const,
-                        visibility: Visibility::Unknown,
-                        file: file.to_owned(),
-                        line: (member.start_position().row + 1) as u32,
-                        span: ByteSpan {
-                            start: member.start_byte(),
-                            end: member.end_byte(),
-                        },
-                        signature: one_line_signature(node_text(&member, bytes), &['{', ';', ',']),
-                    });
+                    out.push(make_symbol(
+                        ctx,
+                        &member,
+                        const_name,
+                        SymbolKind::Const,
+                        Visibility::Unknown,
+                        const_desc,
+                        one_line_signature(node_text(&member, ctx.bytes), &['{', ';', ',']),
+                    ));
                 }
             }
         }
@@ -296,68 +267,48 @@ fn collect_enum(
 /// Emit an extension declaration and its body members.
 ///
 /// Extensions extend an existing type: `extension FooExt on Foo { ... }`.
-fn collect_extension(
-    node: &Node,
-    bytes: &[u8],
-    file: &str,
-    prefix: &[Descriptor],
-    out: &mut Vec<Symbol>,
-) {
-    let Some(name) = field_text(node, "name", bytes) else {
+fn collect_extension(node: &Node, ctx: &ExtractCtx, prefix: &[Descriptor], out: &mut Vec<Symbol>) {
+    let Some(name) = field_text(node, "name", ctx.bytes) else {
         return;
     };
     let mut descriptors = prefix.to_vec();
     descriptors.push(Descriptor::Type(name.clone()));
-    out.push(Symbol {
-        id: SymbolId::global(Language::Dart.as_str(), descriptors.clone()),
-        name: name.clone(),
-        kind: SymbolKind::Class,
-        visibility: Visibility::Unknown,
-        file: file.to_owned(),
-        line: (node.start_position().row + 1) as u32,
-        span: ByteSpan {
-            start: node.start_byte(),
-            end: node.end_byte(),
-        },
-        signature: one_line_signature(node_text(node, bytes), &['{', ';']),
-    });
+    out.push(make_symbol(
+        ctx,
+        node,
+        name,
+        SymbolKind::Class,
+        Visibility::Unknown,
+        descriptors.clone(),
+        one_line_signature(node_text(node, ctx.bytes), &['{', ';']),
+    ));
 
     // Recurse into extension_body for members (same shape as class_body).
     if let Some(body) = node.child_by_field_name("body") {
-        collect_class_members(&body, bytes, file, &descriptors, out);
+        collect_class_members(&body, ctx, &descriptors, out);
     }
 }
 
 /// Emit a type alias: `typedef MyType = SomeOtherType;`
-fn collect_type_alias(
-    node: &Node,
-    bytes: &[u8],
-    file: &str,
-    prefix: &[Descriptor],
-    out: &mut Vec<Symbol>,
-) {
+fn collect_type_alias(node: &Node, ctx: &ExtractCtx, prefix: &[Descriptor], out: &mut Vec<Symbol>) {
     // The name is the FIRST type_identifier child (no field name in the grammar).
     let name_node = node
         .children(&mut node.walk())
         .find(|c| c.kind() == "type_identifier");
     let Some(name_node) = name_node else { return };
-    let name = node_text(&name_node, bytes).to_owned();
+    let name = node_text(&name_node, ctx.bytes).to_owned();
 
     let mut descriptors = prefix.to_vec();
     descriptors.push(Descriptor::Type(name.clone()));
-    out.push(Symbol {
-        id: SymbolId::global(Language::Dart.as_str(), descriptors),
+    out.push(make_symbol(
+        ctx,
+        node,
         name,
-        kind: SymbolKind::TypeAlias,
-        visibility: Visibility::Unknown,
-        file: file.to_owned(),
-        line: (node.start_position().row + 1) as u32,
-        span: ByteSpan {
-            start: node.start_byte(),
-            end: node.end_byte(),
-        },
-        signature: one_line_signature(node_text(node, bytes), &['{', ';']),
-    });
+        SymbolKind::TypeAlias,
+        Visibility::Unknown,
+        descriptors,
+        one_line_signature(node_text(node, ctx.bytes), &['{', ';']),
+    ));
 }
 
 /// Emit a top-level function: `void foo() { ... }`
@@ -365,8 +316,7 @@ fn collect_type_alias(
 /// The name lives on the inner `function_signature` child via its `name` field.
 fn collect_top_function(
     node: &Node,
-    bytes: &[u8],
-    file: &str,
+    ctx: &ExtractCtx,
     prefix: &[Descriptor],
     out: &mut Vec<Symbol>,
 ) {
@@ -374,7 +324,7 @@ fn collect_top_function(
     let name_opt = node
         .child_by_field_name("signature")
         .and_then(|sig| sig.child_by_field_name("name"))
-        .map(|n| node_text(&n, bytes).to_owned());
+        .map(|n| node_text(&n, ctx.bytes).to_owned());
     let Some(name) = name_opt else { return };
 
     let mut descriptors = prefix.to_vec();
@@ -382,19 +332,15 @@ fn collect_top_function(
         name: name.clone(),
         disambiguator: String::new(),
     });
-    out.push(Symbol {
-        id: SymbolId::global(Language::Dart.as_str(), descriptors),
+    out.push(make_symbol(
+        ctx,
+        node,
         name,
-        kind: SymbolKind::Function,
-        visibility: Visibility::Unknown,
-        file: file.to_owned(),
-        line: (node.start_position().row + 1) as u32,
-        span: ByteSpan {
-            start: node.start_byte(),
-            end: node.end_byte(),
-        },
-        signature: one_line_signature(node_text(node, bytes), &['{', ';', '=']),
-    });
+        SymbolKind::Function,
+        Visibility::Unknown,
+        descriptors,
+        one_line_signature(node_text(node, ctx.bytes), &['{', ';', '=']),
+    ));
 }
 
 /// Emit top-level variable declarations.
@@ -404,14 +350,13 @@ fn collect_top_function(
 /// Each `initialized_identifier` has a `name` field (identifier).
 fn collect_top_level_vars(
     node: &Node,
-    bytes: &[u8],
-    file: &str,
+    ctx: &ExtractCtx,
     prefix: &[Descriptor],
     out: &mut Vec<Symbol>,
 ) {
     for child in node.children(&mut node.walk()) {
         if child.kind() == "initialized_identifier_list" {
-            emit_initialized_identifiers(&child, node, bytes, file, prefix, out);
+            emit_initialized_identifiers(&child, node, ctx, prefix, out);
         }
     }
 }
@@ -421,29 +366,24 @@ fn collect_top_level_vars(
 fn emit_initialized_identifiers(
     list_node: &Node,
     decl_node: &Node,
-    bytes: &[u8],
-    file: &str,
+    ctx: &ExtractCtx,
     prefix: &[Descriptor],
     out: &mut Vec<Symbol>,
 ) {
     for item in list_node.children(&mut list_node.walk()) {
         if item.kind() == "initialized_identifier" {
-            if let Some(name) = field_text(&item, "name", bytes) {
+            if let Some(name) = field_text(&item, "name", ctx.bytes) {
                 let mut descriptors = prefix.to_vec();
                 descriptors.push(Descriptor::Term(name.clone()));
-                out.push(Symbol {
-                    id: SymbolId::global(Language::Dart.as_str(), descriptors),
+                out.push(make_symbol(
+                    ctx,
+                    decl_node,
                     name,
-                    kind: SymbolKind::Static,
-                    visibility: Visibility::Unknown,
-                    file: file.to_owned(),
-                    line: (decl_node.start_position().row + 1) as u32,
-                    span: ByteSpan {
-                        start: decl_node.start_byte(),
-                        end: decl_node.end_byte(),
-                    },
-                    signature: one_line_signature(node_text(decl_node, bytes), &['{', ';']),
-                });
+                    SymbolKind::Static,
+                    Visibility::Unknown,
+                    descriptors,
+                    one_line_signature(node_text(decl_node, ctx.bytes), &['{', ';']),
+                ));
             }
         }
     }
@@ -452,8 +392,7 @@ fn emit_initialized_identifiers(
 /// Walk a `class_body` or `extension_body` and emit member symbols.
 fn collect_class_members(
     body: &Node,
-    bytes: &[u8],
-    file: &str,
+    ctx: &ExtractCtx,
     type_prefix: &[Descriptor],
     out: &mut Vec<Symbol>,
 ) {
@@ -474,16 +413,16 @@ fn collect_class_members(
                                 .find(|c| c.kind() == "function_signature")
                         })
                         .and_then(|fs| fs.child_by_field_name("name"))
-                        .map(|n| node_text(&n, bytes).to_owned())
+                        .map(|n| node_text(&n, ctx.bytes).to_owned())
                         // Fallback: getter_signature has its name directly
                         .or_else(|| {
                             member
                                 .child_by_field_name("signature")
                                 .and_then(|ms| ms.child_by_field_name("name"))
-                                .map(|n| node_text(&n, bytes).to_owned())
+                                .map(|n| node_text(&n, ctx.bytes).to_owned())
                         });
                     if let Some(name) = name_opt {
-                        emit_method(name, &member, bytes, file, type_prefix, out);
+                        emit_method(name, &member, ctx, type_prefix, out);
                     }
                 }
                 "declaration" => {
@@ -498,8 +437,8 @@ fn collect_class_members(
                         // Find constructor_signature → name
                         for child in member.children(&mut member.walk()) {
                             if child.kind() == "constructor_signature" {
-                                if let Some(name) = field_text(&child, "name", bytes) {
-                                    emit_method(name, &child, bytes, file, type_prefix, out);
+                                if let Some(name) = field_text(&child, "name", ctx.bytes) {
+                                    emit_method(name, &child, ctx, type_prefix, out);
                                 }
                             }
                         }
@@ -510,8 +449,7 @@ fn collect_class_members(
                                 emit_initialized_identifiers(
                                     &child,
                                     &member,
-                                    bytes,
-                                    file,
+                                    ctx,
                                     type_prefix,
                                     out,
                                 );
@@ -529,8 +467,7 @@ fn collect_class_members(
 fn emit_method(
     name: String,
     node: &Node,
-    bytes: &[u8],
-    file: &str,
+    ctx: &ExtractCtx,
     prefix: &[Descriptor],
     out: &mut Vec<Symbol>,
 ) {
@@ -539,19 +476,15 @@ fn emit_method(
         name: name.clone(),
         disambiguator: String::new(),
     });
-    out.push(Symbol {
-        id: SymbolId::global(Language::Dart.as_str(), descriptors),
+    out.push(make_symbol(
+        ctx,
+        node,
         name,
-        kind: SymbolKind::Method,
-        visibility: Visibility::Unknown,
-        file: file.to_owned(),
-        line: (node.start_position().row + 1) as u32,
-        span: ByteSpan {
-            start: node.start_byte(),
-            end: node.end_byte(),
-        },
-        signature: one_line_signature(node_text(node, bytes), &['{', ';', '=']),
-    });
+        SymbolKind::Method,
+        Visibility::Unknown,
+        descriptors,
+        one_line_signature(node_text(node, ctx.bytes), &['{', ';', '=']),
+    ));
 }
 
 // ── Inheritance ──────────────────────────────────────────────────────────────
