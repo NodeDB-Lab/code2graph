@@ -248,7 +248,8 @@ fn collect_decl_type(
         id: SymbolId::global(Language::Pascal.as_str(), type_descriptors.clone()),
         name: name.clone(),
         kind,
-        visibility: Visibility::Unknown,
+        // Unit-level type declarations are in the interface section — always public.
+        visibility: Visibility::Public,
         file: file.to_owned(),
         line: (node.start_position().row + 1) as u32,
         span: ByteSpan {
@@ -316,7 +317,8 @@ fn collect_enum_values(
                     id: SymbolId::global(Language::Pascal.as_str(), descriptors),
                     name: val_name,
                     kind: SymbolKind::Const,
-                    visibility: Visibility::Unknown,
+                    // Enum values are part of a unit-level type — always public.
+                    visibility: Visibility::Public,
                     file: file.to_owned(),
                     line: (child.start_position().row + 1) as u32,
                     span: ByteSpan {
@@ -327,6 +329,38 @@ fn collect_enum_values(
                 });
             }
         }
+    }
+}
+
+/// Derive the `Visibility` for a `declSection` node by inspecting its keyword children.
+///
+/// Grammar: `declSection = optional(kStrict) + (kPublished | kPublic | kProtected | kPrivate)`
+///
+/// Mapping:
+/// - `published` / `public`           → `Visibility::Public`
+/// - `protected` / `strict protected` → `Visibility::Protected`
+/// - `private`   / `strict private`   → `Visibility::Private`
+fn section_visibility(node: &Node) -> Visibility {
+    let mut has_strict = false;
+    let mut vis_kw: Option<&str> = None;
+
+    for child in node.children(&mut node.walk()) {
+        match child.kind() {
+            "kStrict" => has_strict = true,
+            "kPublished" | "kPublic" => vis_kw = Some("public"),
+            "kProtected" => vis_kw = Some("protected"),
+            "kPrivate" => vis_kw = Some("private"),
+            _ => {}
+        }
+    }
+
+    match vis_kw {
+        Some("public") => Visibility::Public,
+        Some("protected") => Visibility::Protected,
+        Some("private") => Visibility::Private,
+        // `strict` without a recognised keyword is unusual; treat as Private (strictest default).
+        None if has_strict => Visibility::Private,
+        _ => Visibility::Public, // `published` / bare section → public
     }
 }
 
@@ -342,7 +376,8 @@ fn collect_members(
     if !emit {
         return;
     }
-    collect_members_in(body, bytes, file, type_prefix, out);
+    // Pascal class default (before any section keyword) is `published`, which maps to Public.
+    collect_members_in(body, bytes, file, type_prefix, Visibility::Public, out);
 }
 
 fn collect_members_in(
@@ -350,19 +385,21 @@ fn collect_members_in(
     bytes: &[u8],
     file: &str,
     type_prefix: &[Descriptor],
+    current_vis: Visibility,
     out: &mut Vec<Symbol>,
 ) {
     for child in node.children(&mut node.walk()) {
         match child.kind() {
             "declSection" => {
-                // Visibility section (kPublic, kPrivate, …); recurse into it.
-                collect_members_in(&child, bytes, file, type_prefix, out);
+                // Visibility section (kPublic, kPrivate, …); determine its visibility and recurse.
+                let vis = section_visibility(&child);
+                collect_members_in(&child, bytes, file, type_prefix, vis, out);
             }
             "declProc" => {
-                emit_method(&child, bytes, file, type_prefix, out);
+                emit_method(&child, bytes, file, type_prefix, current_vis, out);
             }
             "declField" => {
-                emit_field(&child, bytes, file, type_prefix, out);
+                emit_field(&child, bytes, file, type_prefix, current_vis, out);
             }
             _ => {}
         }
@@ -375,6 +412,7 @@ fn emit_method(
     bytes: &[u8],
     file: &str,
     type_prefix: &[Descriptor],
+    vis: Visibility,
     out: &mut Vec<Symbol>,
 ) {
     let Some(name) = field_text(node, "name", bytes) else {
@@ -396,7 +434,7 @@ fn emit_method(
         id: SymbolId::global(Language::Pascal.as_str(), descriptors),
         name,
         kind: SymbolKind::Method,
-        visibility: Visibility::Unknown,
+        visibility: vis,
         file: file.to_owned(),
         line: (node.start_position().row + 1) as u32,
         span: ByteSpan {
@@ -413,6 +451,7 @@ fn emit_field(
     bytes: &[u8],
     file: &str,
     type_prefix: &[Descriptor],
+    vis: Visibility,
     out: &mut Vec<Symbol>,
 ) {
     let Some(name) = field_text(node, "name", bytes) else {
@@ -424,7 +463,7 @@ fn emit_field(
         id: SymbolId::global(Language::Pascal.as_str(), descriptors),
         name,
         kind: SymbolKind::Static,
-        visibility: Visibility::Unknown,
+        visibility: vis,
         file: file.to_owned(),
         line: (node.start_position().row + 1) as u32,
         span: ByteSpan {
@@ -468,7 +507,8 @@ fn collect_impl_procs(
                                 id: SymbolId::global(Language::Pascal.as_str(), descriptors),
                                 name,
                                 kind: SymbolKind::Function,
-                                visibility: Visibility::Unknown,
+                                // Standalone top-level procedures/functions are public.
+                                visibility: Visibility::Public,
                                 file: file.to_owned(),
                                 line: (child.start_position().row + 1) as u32,
                                 span: ByteSpan {
@@ -1035,6 +1075,221 @@ end.
             run_count, 1,
             "Run should appear exactly once (the declaration, not the impl)"
         );
+    }
+
+    // ── Visibility ───────────────────────────────────────────────────────────
+
+    /// Standalone procedure in the implementation section → `Visibility::Public`.
+    #[test]
+    fn standalone_proc_visibility_is_public() {
+        let src = r#"
+unit MyUnit;
+interface
+implementation
+procedure Greet;
+begin
+end;
+end.
+"#;
+        let facts = extract(src, "src/MyUnit.pas");
+        let greet = by_name(&facts, "Greet").unwrap();
+        assert_eq!(greet.visibility, Visibility::Public);
+    }
+
+    /// Unit-level type declaration → `Visibility::Public`.
+    #[test]
+    fn top_level_type_visibility_is_public() {
+        let src = r#"
+unit MyUnit;
+interface
+type
+  TPoint = record
+    X: Integer;
+  end;
+implementation
+end.
+"#;
+        let facts = extract(src, "src/MyUnit.pas");
+        let tp = by_name(&facts, "TPoint").unwrap();
+        assert_eq!(tp.visibility, Visibility::Public);
+    }
+
+    /// Enum value at unit level → `Visibility::Public`.
+    #[test]
+    fn enum_value_visibility_is_public() {
+        let src = r#"
+unit MyUnit;
+interface
+type
+  TColor = (Red, Green);
+implementation
+end.
+"#;
+        let facts = extract(src, "src/MyUnit.pas");
+        let red = by_name(&facts, "Red").unwrap();
+        assert_eq!(red.visibility, Visibility::Public);
+    }
+
+    /// Class member under `public` section → `Visibility::Public`.
+    #[test]
+    fn class_member_under_public_section_is_public() {
+        let src = r#"
+unit MyUnit;
+interface
+type
+  TFoo = class
+  public
+    procedure Run;
+  end;
+implementation
+end.
+"#;
+        let facts = extract(src, "src/MyUnit.pas");
+        let run = by_name(&facts, "Run").unwrap();
+        assert_eq!(run.visibility, Visibility::Public);
+    }
+
+    /// Class member under `published` section → `Visibility::Public`.
+    #[test]
+    fn class_member_under_published_section_is_public() {
+        let src = r#"
+unit MyUnit;
+interface
+type
+  TFoo = class
+  published
+    procedure Run;
+  end;
+implementation
+end.
+"#;
+        let facts = extract(src, "src/MyUnit.pas");
+        let run = by_name(&facts, "Run").unwrap();
+        assert_eq!(run.visibility, Visibility::Public);
+    }
+
+    /// Class member under `protected` section → `Visibility::Protected`.
+    #[test]
+    fn class_member_under_protected_section_is_protected() {
+        let src = r#"
+unit MyUnit;
+interface
+type
+  TFoo = class
+  protected
+    procedure InternalRun;
+  end;
+implementation
+end.
+"#;
+        let facts = extract(src, "src/MyUnit.pas");
+        let m = by_name(&facts, "InternalRun").unwrap();
+        assert_eq!(m.visibility, Visibility::Protected);
+    }
+
+    /// Class member under `private` section → `Visibility::Private`.
+    #[test]
+    fn class_member_under_private_section_is_private() {
+        let src = r#"
+unit MyUnit;
+interface
+type
+  TFoo = class
+  private
+    FValue: Integer;
+  end;
+implementation
+end.
+"#;
+        let facts = extract(src, "src/MyUnit.pas");
+        let f = by_name(&facts, "FValue").unwrap();
+        assert_eq!(f.visibility, Visibility::Private);
+    }
+
+    /// Class member under `strict private` section → `Visibility::Private`.
+    #[test]
+    fn class_member_under_strict_private_section_is_private() {
+        let src = r#"
+unit MyUnit;
+interface
+type
+  TFoo = class
+  strict private
+    FSecret: Integer;
+  end;
+implementation
+end.
+"#;
+        let facts = extract(src, "src/MyUnit.pas");
+        let f = by_name(&facts, "FSecret").unwrap();
+        assert_eq!(f.visibility, Visibility::Private);
+    }
+
+    /// Class member under `strict protected` section → `Visibility::Protected`.
+    #[test]
+    fn class_member_under_strict_protected_section_is_protected() {
+        let src = r#"
+unit MyUnit;
+interface
+type
+  TFoo = class
+  strict protected
+    procedure HalfHidden;
+  end;
+implementation
+end.
+"#;
+        let facts = extract(src, "src/MyUnit.pas");
+        let m = by_name(&facts, "HalfHidden").unwrap();
+        assert_eq!(m.visibility, Visibility::Protected);
+    }
+
+    /// Class member before any section keyword → Pascal default (published) → `Visibility::Public`.
+    #[test]
+    fn class_member_before_any_section_keyword_is_public() {
+        let src = r#"
+unit MyUnit;
+interface
+type
+  TFoo = class
+    DefaultField: Integer;
+  end;
+implementation
+end.
+"#;
+        let facts = extract(src, "src/MyUnit.pas");
+        let f = by_name(&facts, "DefaultField").unwrap();
+        assert_eq!(f.visibility, Visibility::Public);
+    }
+
+    /// Multi-section class: members track their own section independently.
+    #[test]
+    fn class_members_track_sections_independently() {
+        let src = r#"
+unit MyUnit;
+interface
+type
+  TFoo = class
+  public
+    procedure PubMethod;
+  private
+    FField: Integer;
+  protected
+    procedure ProMethod;
+  end;
+implementation
+end.
+"#;
+        let facts = extract(src, "src/MyUnit.pas");
+
+        let pub_m = by_name(&facts, "PubMethod").unwrap();
+        assert_eq!(pub_m.visibility, Visibility::Public);
+
+        let priv_f = by_name(&facts, "FField").unwrap();
+        assert_eq!(priv_f.visibility, Visibility::Private);
+
+        let pro_m = by_name(&facts, "ProMethod").unwrap();
+        assert_eq!(pro_m.visibility, Visibility::Protected);
     }
 
     // ── Read / write references ──────────────────────────────────────────────
