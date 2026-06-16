@@ -2,9 +2,9 @@
 
 //! Kotlin extractor — one tree-sitter pass yielding definitions and references.
 //!
-//! Definitions: declarations whose visibility is not `private`. Qualified
-//! identity follows the `package_header` declaration, falling back to a
-//! path-derived namespace when none is present.
+//! Definitions: all declarations, each tagged with its real [`Visibility`].
+//! Qualified identity follows the `package_header` declaration, falling back to
+//! a path-derived namespace when none is present.
 //!
 //! Covered declaration kinds:
 //! - `class_declaration` (class/data class/sealed class/annotation class → Class;
@@ -169,48 +169,63 @@ fn kotlin_namespaces(root: &Node, bytes: &[u8], file: &str) -> Vec<String> {
         .collect()
 }
 
-// ── Visibility gate ──────────────────────────────────────────────────────────
+// ── Visibility reader ────────────────────────────────────────────────────────
 
-/// Returns `true` if a declaration should be emitted (not `private`).
+/// Read the declared [`Visibility`] of a declaration node.
 ///
-/// Scans the `modifiers` child for a `visibility_modifier`. If the modifier text
-/// is `"private"` the symbol is suppressed; everything else (public, internal,
-/// protected, or no modifier at all → implicit public/internal) is emitted.
-/// Recall-first, matches the project stance.
-fn is_visible(node: &Node, bytes: &[u8]) -> bool {
+/// Scans the `modifiers` child for a `visibility_modifier`. The text of that
+/// modifier is mapped to the appropriate [`Visibility`] variant:
+/// - `"public"` → [`Visibility::Public`]
+/// - `"internal"` → [`Visibility::Internal`]
+/// - `"protected"` → [`Visibility::Protected`]
+/// - `"private"` → [`Visibility::Private`]
+/// - no `visibility_modifier` (modifier node present but no visibility keyword)
+///   → [`Visibility::Public`] (Kotlin's default is public)
+/// - no `modifiers` child at all → [`Visibility::Public`] (implicit public)
+fn read_visibility(node: &Node, bytes: &[u8]) -> Visibility {
     for child in node.children(&mut node.walk()) {
         if child.kind() != "modifiers" {
             continue;
         }
         for modifier in child.children(&mut child.walk()) {
             if modifier.kind() == "visibility_modifier" {
-                return node_text(&modifier, bytes) != "private";
+                return match node_text(&modifier, bytes) {
+                    "public" => Visibility::Public,
+                    "internal" => Visibility::Internal,
+                    "protected" => Visibility::Protected,
+                    "private" => Visibility::Private,
+                    _ => Visibility::Public,
+                };
             }
         }
-        // modifiers node present but no visibility_modifier → implicit → emit
-        return true;
+        // modifiers node present but no visibility_modifier → implicit public
+        return Visibility::Public;
     }
-    // No modifiers node → implicit → emit
-    true
+    // No modifiers node → implicit public
+    Visibility::Public
 }
 
 // ── Symbol builder ───────────────────────────────────────────────────────────
 
 /// Build a [`Symbol`] and push it onto `out`.
+///
+/// `kind_vis` bundles `(SymbolKind, Visibility)` into one parameter to keep
+/// the total argument count within clippy's `too_many_arguments` limit (≤ 7).
 fn push_symbol(
     out: &mut Vec<Symbol>,
     node: &Node,
     name: String,
-    kind: SymbolKind,
+    kind_vis: (SymbolKind, Visibility),
     descriptors: Vec<Descriptor>,
     bytes: &[u8],
     file: &str,
 ) {
+    let (kind, visibility) = kind_vis;
     out.push(Symbol {
         id: SymbolId::global(Language::Kotlin.as_str(), descriptors),
         name,
         kind,
-        visibility: Visibility::Public,
+        visibility,
         file: file.to_owned(),
         line: (node.start_position().row + 1) as u32,
         span: ByteSpan {
@@ -228,11 +243,13 @@ fn push_symbol(
 /// recurse into the body. Both `class_body` and `enum_class_body` are treated
 /// as bodies — an `enum_class_body` only ever appears under a class, so checking
 /// for it unconditionally is harmless for objects/companions.
+///
+/// `kind_vis` bundles `(SymbolKind, Visibility)` to keep argument count ≤ 7.
 fn emit_type_and_body(
     out: &mut Vec<Symbol>,
     node: Node,
     type_name: String,
-    kind: SymbolKind,
+    kind_vis: (SymbolKind, Visibility),
     prefix: &[Descriptor],
     bytes: &[u8],
     file: &str,
@@ -243,7 +260,7 @@ fn emit_type_and_body(
         out,
         &node,
         type_name,
-        kind,
+        kind_vis,
         type_descriptors.clone(),
         bytes,
         file,
@@ -300,9 +317,6 @@ fn handle_class(
     file: &str,
     out: &mut Vec<Symbol>,
 ) {
-    if !is_visible(&node, bytes) {
-        return;
-    }
     let name_node = match node.child_by_field_name("name") {
         Some(n) => n,
         None => return,
@@ -326,7 +340,8 @@ fn handle_class(
         }
     };
 
-    emit_type_and_body(out, node, type_name, sym_kind, prefix, bytes, file);
+    let vis = read_visibility(&node, bytes);
+    emit_type_and_body(out, node, type_name, (sym_kind, vis), prefix, bytes, file);
 }
 
 /// Handle `object_declaration` (singleton object → SymbolKind::Class).
@@ -337,15 +352,21 @@ fn handle_object(
     file: &str,
     out: &mut Vec<Symbol>,
 ) {
-    if !is_visible(&node, bytes) {
-        return;
-    }
     let type_name = match field_text(&node, "name", bytes) {
         Some(n) => n,
         None => return,
     };
 
-    emit_type_and_body(out, node, type_name, SymbolKind::Class, prefix, bytes, file);
+    let vis = read_visibility(&node, bytes);
+    emit_type_and_body(
+        out,
+        node,
+        type_name,
+        (SymbolKind::Class, vis),
+        prefix,
+        bytes,
+        file,
+    );
 }
 
 /// Handle `companion_object` (nested companion → SymbolKind::Class).
@@ -359,12 +380,18 @@ fn handle_companion(
     file: &str,
     out: &mut Vec<Symbol>,
 ) {
-    if !is_visible(&node, bytes) {
-        return;
-    }
     let type_name = field_text(&node, "name", bytes).unwrap_or_else(|| "Companion".to_owned());
 
-    emit_type_and_body(out, node, type_name, SymbolKind::Class, prefix, bytes, file);
+    let vis = read_visibility(&node, bytes);
+    emit_type_and_body(
+        out,
+        node,
+        type_name,
+        (SymbolKind::Class, vis),
+        prefix,
+        bytes,
+        file,
+    );
 }
 
 /// Handle `function_declaration`.
@@ -378,9 +405,6 @@ fn handle_function(
     file: &str,
     out: &mut Vec<Symbol>,
 ) {
-    if !is_visible(&node, bytes) {
-        return;
-    }
     let name = match field_text(&node, "name", bytes) {
         Some(n) => n,
         None => return,
@@ -390,12 +414,13 @@ fn handle_function(
     } else {
         SymbolKind::Function
     };
+    let vis = read_visibility(&node, bytes);
     let mut descriptors = prefix.to_vec();
     descriptors.push(Descriptor::Method {
         name: name.clone(),
         disambiguator: String::new(),
     });
-    push_symbol(out, &node, name, kind, descriptors, bytes, file);
+    push_symbol(out, &node, name, (kind, vis), descriptors, bytes, file);
 }
 
 /// Handle `property_declaration`.
@@ -410,10 +435,6 @@ fn handle_property(
     file: &str,
     out: &mut Vec<Symbol>,
 ) {
-    if !is_visible(&node, bytes) {
-        return;
-    }
-
     // Find name from variable_declaration → identifier.
     let var_name: Option<String> = {
         let mut found = None;
@@ -449,10 +470,11 @@ fn handle_property(
     } else {
         SymbolKind::Const
     };
+    let vis = read_visibility(&node, bytes);
 
     let mut descriptors = prefix.to_vec();
     descriptors.push(Descriptor::Term(var_name.clone()));
-    push_symbol(out, &node, var_name, kind, descriptors, bytes, file);
+    push_symbol(out, &node, var_name, (kind, vis), descriptors, bytes, file);
 }
 
 /// Handle `type_alias`.
@@ -465,20 +487,18 @@ fn handle_typealias(
     file: &str,
     out: &mut Vec<Symbol>,
 ) {
-    if !is_visible(&node, bytes) {
-        return;
-    }
     let name = match field_text(&node, "type", bytes) {
         Some(n) => n,
         None => return,
     };
+    let vis = read_visibility(&node, bytes);
     let mut descriptors = prefix.to_vec();
     descriptors.push(Descriptor::Type(name.clone()));
     push_symbol(
         out,
         &node,
         name,
-        SymbolKind::TypeAlias,
+        (SymbolKind::TypeAlias, vis),
         descriptors,
         bytes,
         file,
@@ -495,21 +515,20 @@ fn handle_enum_entry(
     file: &str,
     out: &mut Vec<Symbol>,
 ) {
-    if !is_visible(&node, bytes) {
-        return;
-    }
     // enum_entry has an identifier child (the case name).
     let name = match child_text(&node, "identifier", bytes) {
         Some(n) => n,
         None => return,
     };
+    // Enum entries do not carry a visibility modifier; they are always public.
+    let vis = read_visibility(&node, bytes);
     let mut descriptors = prefix.to_vec();
     descriptors.push(Descriptor::Term(name.clone()));
     push_symbol(
         out,
         &node,
         name,
-        SymbolKind::Const,
+        (SymbolKind::Const, vis),
         descriptors,
         bytes,
         file,
@@ -526,9 +545,7 @@ fn handle_secondary_constructor(
     file: &str,
     out: &mut Vec<Symbol>,
 ) {
-    if !is_visible(&node, bytes) {
-        return;
-    }
+    let vis = read_visibility(&node, bytes);
     let mut descriptors = prefix.to_vec();
     descriptors.push(Descriptor::Method {
         name: "constructor".to_owned(),
@@ -538,7 +555,7 @@ fn handle_secondary_constructor(
         out,
         &node,
         "constructor".to_owned(),
-        SymbolKind::Method,
+        (SymbolKind::Method, vis),
         descriptors,
         bytes,
         file,
@@ -1230,9 +1247,9 @@ mod tests {
         facts.symbols.iter().find(|s| s.name == name).cloned()
     }
 
-    // Test 1: class with public fun + private fun; visibility gate
+    // Test 1: class with public fun + private fun; all emit with correct Visibility.
     #[test]
-    fn class_visibility_gate() {
+    fn class_visibility_all_emit() {
         let src = r#"package com.ex
 class Session {
     fun open() {}
@@ -1243,6 +1260,7 @@ class Session {
 
         let session = by_name(&facts, "Session").unwrap();
         assert_eq!(session.kind, SymbolKind::Class);
+        assert_eq!(session.visibility, Visibility::Public);
         assert_eq!(
             session.id.to_scip_string(),
             "codegraph . . . com/ex/Session#"
@@ -1250,13 +1268,24 @@ class Session {
 
         let open = by_name(&facts, "open").unwrap();
         assert_eq!(open.kind, SymbolKind::Method);
+        assert_eq!(open.visibility, Visibility::Public);
         assert_eq!(
             open.id.to_scip_string(),
             "codegraph . . . com/ex/Session#open()."
         );
 
-        // private method must NOT be emitted
-        assert!(by_name(&facts, "secret").is_none());
+        // private method MUST be emitted, tagged Private
+        let secret = by_name(&facts, "secret").expect("private method 'secret' must be emitted");
+        assert_eq!(secret.kind, SymbolKind::Method);
+        assert_eq!(
+            secret.visibility,
+            Visibility::Private,
+            "private fun must have Visibility::Private"
+        );
+        assert_eq!(
+            secret.id.to_scip_string(),
+            "codegraph . . . com/ex/Session#secret()."
+        );
     }
 
     // Test 2: interface → SymbolKind::Interface
@@ -1994,5 +2023,98 @@ fun main() {
         .id
         .to_scip_string();
         assert_eq!(import.source_module, Some(expected_module_id));
+    }
+
+    // ── Visibility tests ──────────────────────────────────────────────────────
+
+    // Test V1: explicit `public` modifier → Visibility::Public.
+    #[test]
+    fn explicit_public_modifier_yields_public() {
+        let src = "package com.ex\npublic fun doWork() {}";
+        let facts = extract(src, "src/com/ex/Work.kt");
+        let sym = by_name(&facts, "doWork").expect("expected 'doWork'");
+        assert_eq!(
+            sym.visibility,
+            Visibility::Public,
+            "explicit 'public' must yield Visibility::Public"
+        );
+    }
+
+    // Test V2: no modifier → Visibility::Public (Kotlin default).
+    #[test]
+    fn no_modifier_yields_public() {
+        let src = "package com.ex\nfun compute() {}";
+        let facts = extract(src, "src/com/ex/Comp.kt");
+        let sym = by_name(&facts, "compute").expect("expected 'compute'");
+        assert_eq!(
+            sym.visibility,
+            Visibility::Public,
+            "missing modifier must default to Visibility::Public"
+        );
+    }
+
+    // Test V3: `private` → emitted with Visibility::Private.
+    #[test]
+    fn private_modifier_emits_private_visibility() {
+        let src = "package com.ex\nclass Foo {\n    private fun hidden() {}\n}";
+        let facts = extract(src, "src/com/ex/Foo.kt");
+        let sym = by_name(&facts, "hidden").expect("private method 'hidden' must be emitted");
+        assert_eq!(
+            sym.visibility,
+            Visibility::Private,
+            "private fun must have Visibility::Private"
+        );
+    }
+
+    // Test V4: `internal` → Visibility::Internal.
+    #[test]
+    fn internal_modifier_yields_internal() {
+        let src = "package com.ex\ninternal class Cache {}";
+        let facts = extract(src, "src/com/ex/Cache.kt");
+        let sym = by_name(&facts, "Cache").expect("expected 'Cache'");
+        assert_eq!(
+            sym.visibility,
+            Visibility::Internal,
+            "internal class must have Visibility::Internal"
+        );
+    }
+
+    // Test V5: `protected` → Visibility::Protected.
+    #[test]
+    fn protected_modifier_yields_protected() {
+        let src = "package com.ex\nopen class Base {\n    protected fun hook() {}\n}";
+        let facts = extract(src, "src/com/ex/Base.kt");
+        let sym = by_name(&facts, "hook").expect("expected 'hook'");
+        assert_eq!(
+            sym.visibility,
+            Visibility::Protected,
+            "protected fun must have Visibility::Protected"
+        );
+    }
+
+    // Test V6: private top-level property → emitted with Visibility::Private.
+    #[test]
+    fn private_property_emits_private_visibility() {
+        let src = "package com.ex\nprivate val secret: Int = 42";
+        let facts = extract(src, "src/com/ex/Secrets.kt");
+        let sym = by_name(&facts, "secret").expect("private property 'secret' must be emitted");
+        assert_eq!(
+            sym.visibility,
+            Visibility::Private,
+            "private val must have Visibility::Private"
+        );
+    }
+
+    // Test V7: private class → emitted with Visibility::Private.
+    #[test]
+    fn private_class_emits_private_visibility() {
+        let src = "package com.ex\nprivate class Impl {}";
+        let facts = extract(src, "src/com/ex/Impl.kt");
+        let sym = by_name(&facts, "Impl").expect("private class 'Impl' must be emitted");
+        assert_eq!(
+            sym.visibility,
+            Visibility::Private,
+            "private class must have Visibility::Private"
+        );
     }
 }
