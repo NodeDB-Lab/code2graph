@@ -93,6 +93,8 @@ impl Extractor for CSharpExtractor {
         collect_inheritance(&root, bytes, file, &mut references);
         collect_imports(&root, bytes, file, &mut references, &module_id);
         collect_type_references(&root, bytes, file, &mut references);
+        collect_read_references(&root, bytes, file, &mut references);
+        collect_write_references(&root, bytes, file, &mut references);
 
         let scopes = collect_scopes(&root, source.len());
         attach_reference_scopes(&mut references, &scopes);
@@ -497,6 +499,104 @@ fn collect_imports(
     }
     for child in node.children(&mut node.walk()) {
         collect_imports(&child, bytes, file, out, module_id);
+    }
+}
+
+// ── Read / Write references ──────────────────────────────────────────────────
+
+/// Returns `true` when `node` (an `identifier`) is in a position already
+/// captured by another collector (call callee, declaration name, parameter
+/// name, import binding, assignment LHS, or member-access leaf) so it must
+/// NOT also be emitted as a Read reference.
+fn is_non_read_position(node: &Node) -> bool {
+    let parent = match node.parent() {
+        Some(p) => p,
+        None => return true, // root — not a read
+    };
+    // General type-field exclusion: if this identifier IS the `type` field of
+    // its parent (covers variable_declaration, parameter, field_declaration →
+    // variable_declaration, property_declaration, object_creation_expression,
+    // etc.) it is a type-annotation position, not a value read.
+    if parent.child_by_field_name("type").as_ref() == Some(node) {
+        return true;
+    }
+    // Method return-type uses the `returns` field (not `type`), also type-position.
+    if parent.child_by_field_name("returns").as_ref() == Some(node) {
+        return true;
+    }
+    match parent.kind() {
+        // Call callee: `Foo()` — `function:` field of invocation_expression.
+        "invocation_expression" => parent.child_by_field_name("function").as_ref() == Some(node),
+        // Declaration names: method/constructor/class/struct/interface/enum/record.
+        "method_declaration"
+        | "constructor_declaration"
+        | "property_declaration"
+        | "class_declaration"
+        | "struct_declaration"
+        | "interface_declaration"
+        | "enum_declaration"
+        | "record_declaration"
+        | "enum_member_declaration" => parent.child_by_field_name("name").as_ref() == Some(node),
+        // Local variable declarator: the `name:` field is the binding introduction.
+        "variable_declarator" => parent.child_by_field_name("name").as_ref() == Some(node),
+        // Parameter binding name.
+        "parameter" => parent.child_by_field_name("name").as_ref() == Some(node),
+        // Using-directive — already Import refs.
+        "using_directive" => true,
+        // Member-access leaf (`obj.Field` — skip `Field`, keep `obj`).
+        "member_access_expression" => parent.child_by_field_name("name").as_ref() == Some(node),
+        // Qualified name — type-position names (e.g. in base_list or generic types).
+        "qualified_name" => true,
+        // Generic name — the type identifier inside `List<T>`.
+        "generic_name" => parent.child_by_field_name("name").as_ref() == Some(node),
+        // Assignment LHS — handled by collect_write_references.
+        "assignment_expression" => parent.child_by_field_name("left").as_ref() == Some(node),
+        _ => false,
+    }
+}
+
+/// Recursively walk `node` and emit [`RefRole::Read`] references for bare
+/// `identifier` nodes used in value/expression positions.
+///
+/// Skips identifiers already captured by other collectors (call callees,
+/// declaration names, parameter names, import bindings, assignment LHS,
+/// member-access leaf names, type-annotation positions).
+/// Applies [`MIN_REF_LEN`] (same threshold as calls).
+fn collect_read_references(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    if node.kind() == "identifier" {
+        let name = node_text(node, bytes);
+        if name.len() >= MIN_REF_LEN && !is_non_read_position(node) {
+            push_ref(out, name, node, file, RefRole::Read);
+        }
+        // identifiers have no meaningful children; return early.
+        return;
+    }
+    for child in node.children(&mut node.walk()) {
+        collect_read_references(&child, bytes, file, out);
+    }
+}
+
+/// Recursively walk `node` and emit [`RefRole::Write`] references for the
+/// bare-identifier LHS of `assignment_expression` nodes
+/// (e.g. `x = 5`, `total += bonus`).
+///
+/// C# uses `assignment_expression` for both plain (`=`) and compound
+/// (`+=`, `-=`, …) assignments — both are covered here.
+/// Member / subscript LHS (`obj.Field = …`, `arr[i] = …`) are out of scope
+/// in v1 — bare identifiers only.  Applies [`MIN_REF_LEN`].
+fn collect_write_references(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    if node.kind() == "assignment_expression" {
+        if let Some(lhs) = node.child_by_field_name("left") {
+            if lhs.kind() == "identifier" {
+                let name = node_text(&lhs, bytes);
+                if name.len() >= MIN_REF_LEN {
+                    push_ref(out, name, &lhs, file, RefRole::Write);
+                }
+            }
+        }
+    }
+    for child in node.children(&mut node.walk()) {
+        collect_write_references(&child, bytes, file, out);
     }
 }
 
@@ -934,5 +1034,163 @@ namespace Svc {
         assert_eq!(read.kind, SymbolKind::Method);
         let close = by_name("Close").unwrap();
         assert_eq!(close.kind, SymbolKind::Method);
+    }
+
+    // ── Read / Write references ──────────────────────────────────────────────
+
+    #[test]
+    fn reassignment_emits_write_for_lhs_and_read_for_rhs() {
+        // `total = total + bonus;` — Write for the LHS `total`, Read for the
+        // RHS `total` and for `bonus`.
+        let src = r#"
+public class Calc {
+    public int Run(int total, int bonus) {
+        total = total + bonus;
+        return total;
+    }
+}
+"#;
+        let facts = CSharpExtractor.extract(src, "src/Calc.cs").unwrap();
+
+        let writes: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Write)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(
+            writes.contains(&"total"),
+            "expected Write for 'total', got: {writes:?}",
+        );
+
+        let reads: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Read)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(
+            reads.contains(&"bonus"),
+            "expected Read for 'bonus', got: {reads:?}",
+        );
+        // The RHS `total` should also be a Read.
+        assert!(
+            reads.contains(&"total"),
+            "expected Read for RHS 'total', got: {reads:?}",
+        );
+    }
+
+    #[test]
+    fn local_declaration_does_not_emit_write() {
+        // `var result = Compute();` — `result` is a binding introduction, NOT a Write.
+        let src = r#"
+public class Worker {
+    public int Run() {
+        var result = Compute();
+        return result;
+    }
+    private int Compute() { return 42; }
+}
+"#;
+        let facts = CSharpExtractor.extract(src, "src/Worker.cs").unwrap();
+
+        let writes: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Write)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(
+            !writes.contains(&"result"),
+            "declaration binding must NOT produce a Write ref; got writes: {writes:?}",
+        );
+    }
+
+    #[test]
+    fn call_argument_emits_read_but_not_callee() {
+        // `Log(config);` — `config` is a Read; `Log` is a Call, NOT a Read.
+        let src = r#"
+public class App {
+    public void Run(object config) {
+        Log(config);
+    }
+    private void Log(object msg) {}
+}
+"#;
+        let facts = CSharpExtractor.extract(src, "src/App.cs").unwrap();
+
+        let reads: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Read)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(
+            reads.contains(&"config"),
+            "expected Read for 'config', got: {reads:?}",
+        );
+        assert!(
+            !reads.contains(&"Log"),
+            "callee 'Log' must NOT appear as a Read ref; reads: {reads:?}",
+        );
+    }
+
+    #[test]
+    fn member_access_emits_read_for_base_not_leaf() {
+        // `value = source.Field;` — Read for `source` (base), NOT for `Field` (leaf).
+        let src = r#"
+public class Copier {
+    public int Run(DataObj source) {
+        int value = source.Field;
+        return value;
+    }
+}
+public class DataObj { public int Field; }
+"#;
+        let facts = CSharpExtractor.extract(src, "src/Copier.cs").unwrap();
+
+        let reads: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Read)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(
+            reads.contains(&"source"),
+            "expected Read for 'source', got: {reads:?}",
+        );
+        assert!(
+            !reads.contains(&"Field"),
+            "member-access leaf 'Field' must NOT be a Read ref; reads: {reads:?}",
+        );
+    }
+
+    #[test]
+    fn type_name_in_typed_local_is_not_a_read() {
+        // `Helper result = source;` — `Helper` is a type annotation (TypeRef),
+        // NOT a value read. `source` IS a value read.
+        let src = r#"
+class C {
+    void M(Helper source) {
+        Helper result = source;
+    }
+}
+"#;
+        let facts = CSharpExtractor.extract(src, "src/C.cs").unwrap();
+
+        let reads: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Read)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(
+            !reads.contains(&"Helper"),
+            "type name 'Helper' must NOT appear as a Read ref; reads: {reads:?}",
+        );
+        assert!(
+            reads.contains(&"source"),
+            "initializer value 'source' must appear as a Read ref; reads: {reads:?}",
+        );
     }
 }
