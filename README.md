@@ -105,18 +105,11 @@ Language is inferred from the file extension — there's nothing to configure. S
 
 ## Languages
 
-Coverage spans systems, JVM, scripting, web, and DSL languages, including embedded single-file components (Svelte) whose `<script>` blocks are extracted as real TS/JS:
+Coverage spans systems, JVM, scripting, web (incl. embedded single-file components like Svelte, whose `<script>` blocks are extracted as real TS/JS), and declarative DSLs (SQL, HCL/Terraform) — at varying depth.
 
-| Group        | Languages                            |
-| ------------ | ------------------------------------ |
-| Systems      | Rust, C, C++, Go, Swift              |
-| JVM          | Java, Kotlin, Scala                  |
-| Scripting    | Python, Ruby, PHP, Lua, Luau, Shell  |
-| Web / app    | TypeScript, JavaScript, Dart, Svelte |
-| .NET         | C#                                   |
-| DSL / config | Solidity, SQL, HCL, Pascal / Delphi  |
-
-> The **canonical, always-current set** is the `Language` enum and extension dispatch in [`src/lang.rs`](src/lang.rs) — read that, never a list cached in prose. Each language is a Cargo feature (all on by default). Adding one follows a mechanical recipe — see [CONTRIBUTING.md](CONTRIBUTING.md#adding-a-language).
+> **Full coverage, honestly:** [`docs/supported-languages.md`](docs/supported-languages.md) — the per-language matrix (extraction depth, what each emits, and the candidate / not-feasible / out-of-scope lists). Cross-language FFI boundaries: [`docs/ffi-support-matrix.md`](docs/ffi-support-matrix.md).
+>
+> The **canonical, always-current set** is the `Language` enum + extension dispatch in [`src/lang.rs`](src/lang.rs) — read that, never a list cached in prose. Each language is a Cargo feature (all on by default). Adding one follows a mechanical recipe — see [CONTRIBUTING.md](CONTRIBUTING.md#adding-a-language).
 
 ## Resolution tiers
 

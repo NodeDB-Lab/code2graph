@@ -90,6 +90,8 @@ Every public-facing file starts with `// SPDX-License-Identifier: Apache-2.0`.
 
 This is the most common contribution and it's mechanical once a grammar exists. The resolver is language-agnostic, so **cross-file edges work for free** once extraction emits correct facts.
 
+> **Before you start:** check [`docs/supported-languages.md`](docs/supported-languages.md) for what's already covered (plus the candidate, not-feasible, and out-of-scope lists), and [`docs/ffi-support-matrix.md`](docs/ffi-support-matrix.md) for cross-language FFI boundaries. Both are hand-maintained against the code (`src/lang.rs` is the canonical language set) — update them in the same PR when you add a language or an FFI boundary.
+
 > **First: is there a usable grammar?** code2graph pins `tree-sitter` to `>=0.24, <0.27`. A grammar crate must be compatible with that range. If no compatible grammar exists, read [When a language has no usable grammar](#when-a-language-has-no-usable-grammar) before writing any code.
 
 ### The recipe
