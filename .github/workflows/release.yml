@@ -124,7 +124,9 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             manylinux: musllinux_1_2
-          - os: macos-13
+          # Intel macOS hosted runners (macos-13) are retired; cross-compile the
+          # x86_64 wheel on an Apple Silicon runner (the target is set above).
+          - os: macos-latest
             target: x86_64-apple-darwin
           - os: macos-latest
             target: aarch64-apple-darwin
@@ -189,8 +191,9 @@ jobs:
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-latest
             zig: true
+          # Intel macOS runners are retired; cross-compile x86_64 on Apple Silicon.
           - target: x86_64-apple-darwin
-            runner: macos-13
+            runner: macos-latest
           - target: aarch64-apple-darwin
             runner: macos-latest
           - target: x86_64-pc-windows-msvc
