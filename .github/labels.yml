@@ -1,0 +1,87 @@
+# NodeDB-Lab org-wide CORE label taxonomy.
+# Every repo syncs these four axes so issues filter identically across the org.
+# Repos add their own domain labels (e.g. nodedb's engine:* / area:*) on top.
+#
+#   type:*      what kind of issue it is
+#   sev:*       TECHNICAL impact — reporter proposes, triage confirms
+#   priority:*  urgency/scheduling — MAINTAINERS ONLY, set at triage
+#   status:*    lifecycle
+
+# ── type ──
+- name: "type:bug"
+  color: "d73a4a"
+  description: "A defect — broken, incorrect, or lost data"
+- name: "type:feature"
+  color: "a2eeef"
+  description: "New capability or behavior change"
+- name: "type:docs"
+  color: "0075ca"
+  description: "Documentation is wrong, missing, or misleading"
+- name: "type:question"
+  color: "d876e3"
+  description: "Needs clarification; may not be a defect"
+- name: "type:epic"
+  color: "5319e7"
+  description: "Tracking issue spanning multiple sub-issues"
+- name: "type:chore"
+  color: "cfd3d7"
+  description: "Build, CI, refactor, or maintenance"
+
+# ── severity (technical impact — reporter proposes, triage confirms) ──
+- name: "sev:1-critical"
+  color: "b60205"
+  description: "Data loss, corruption, security, or crash; no workaround"
+- name: "sev:2-high"
+  color: "d93f0b"
+  description: "Major functionality broken; no acceptable workaround"
+- name: "sev:3-medium"
+  color: "fbca04"
+  description: "Feature wrong, but operational and a workaround exists"
+- name: "sev:4-low"
+  color: "0e8a16"
+  description: "Minimal impact / cosmetic"
+
+# ── priority (MAINTAINERS ONLY — urgency, set at triage) ──
+- name: "priority:P0"
+  color: "5319e7"
+  description: "Drop everything — fix now"
+- name: "priority:P1"
+  color: "5319e7"
+  description: "Fix in the current milestone"
+- name: "priority:P2"
+  color: "5319e7"
+  description: "Scheduled, not urgent"
+- name: "priority:P3"
+  color: "5319e7"
+  description: "Backlog / someday"
+
+# ── status (lifecycle) ──
+- name: "status:needs-triage"
+  color: "ededed"
+  description: "Awaiting maintainer triage (severity + priority)"
+- name: "status:needs-repro"
+  color: "e99695"
+  description: "Cannot reproduce yet — more info needed"
+- name: "status:confirmed"
+  color: "0e8a16"
+  description: "Reproduced by a maintainer"
+- name: "status:in-progress"
+  color: "3becf4"
+  description: "Actively being worked on"
+- name: "status:blocked"
+  color: "000000"
+  description: "Waiting on another issue or decision"
+- name: "status:wontfix"
+  color: "ffffff"
+  description: "Working as intended or out of scope"
+
+# ── cross-cutting flags ──
+- name: "regression"
+  color: "b60205"
+  description: "Worked on an earlier build; broke since"
+- name: "good first issue"
+  color: "7057ff"
+  description: "Good for newcomers"
+- name: "help wanted"
+  color: "008672"
+  description: "Extra attention is needed"
