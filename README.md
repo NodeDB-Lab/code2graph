@@ -105,10 +105,14 @@ use code2graph::{extract_path, resolve::{Resolver, SymbolTableResolver}};
 let a = extract_path("src/util.rs", "pub fn helper() {}")?;
 let b = extract_path("src/main.rs", "pub fn run() { helper() }")?;
 
-let graph = SymbolTableResolver.resolve(&[a, b]); // run --calls--> helper
+let graph = SymbolTableResolver.resolve(&[a, b])?; // run --calls--> helper
 ```
 
 Language is inferred from the file extension — there's nothing to configure. Symbols carry a **byte span**, not source text; the consumer slices what it needs.
+
+### Symbol identity wire format
+
+`SymbolId::to_scip_string()` remains a standard, SCIP-parseable display/interoperability string. SCIP has no language or local-file coordinate, so serde-backed API payloads use the versioned lossless object form `{ "version": 1, "scip": "…", "lang": "…" }` for global IDs and `{ "version": 1, "scip": "local …", "file": "…" }` for local IDs. These coordinates are part of code2graph identity and must be retained when persisting or forwarding facts. Readers continue to accept the legacy SCIP-string form; it lacks those coordinates and therefore cannot preserve full identity.
 
 ## Scope
 
@@ -162,10 +166,7 @@ Ground truth comes from hand-authored golden fixtures **and** from external **SC
 
 ## Used by
 
-code2graph is the shared, neutral substrate beneath separate tools — each applies its own policy and storage on top:
-
-- **[ma8e](https://github.com/farhan-syah/ma8e)** — a memory / knowledge layer for agentic AI. Consumes code2graph recall-first, mapping symbols to retrievable entries.
-- **A code-analysis tool** (in development) — consumes it precision-first for deterministic analyzers and cross-artifact reasoning.
+code2graph is designed as a neutral substrate for tools that apply their own policy and storage, including memory and retrieval systems, code-analysis tools, and security scanners.
 
 Building something on code2graph? Open a [Discussion](https://github.com/nodedb-lab/code2graph/discussions) — and if it's useful to you, a ⭐ on the repo genuinely helps others find it.
 

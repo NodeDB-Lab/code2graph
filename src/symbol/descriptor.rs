@@ -19,6 +19,44 @@
 //! macro           ident '!'
 //! ```
 
+/// A SCIP method overload disambiguator.
+///
+/// SCIP permits only a simple identifier (or an empty value) and provides no
+/// escaping for this coordinate. The inner value is private so a public
+/// [`Descriptor::Method`] can never be constructed with an unrenderable value.
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub struct MethodDisambiguator(String);
+
+impl MethodDisambiguator {
+    /// The common, non-overloaded method coordinate.
+    pub fn empty() -> Self {
+        Self(String::new())
+    }
+
+    /// Construct a SCIP-valid overload coordinate.
+    pub fn new(value: impl Into<String>) -> Result<Self, super::id::SymbolParseError> {
+        let value = value.into();
+        if value.chars().all(is_simple_ident_char) {
+            Ok(Self(value))
+        } else {
+            Err(super::id::SymbolParseError::InvalidDisambiguator)
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for MethodDisambiguator {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
 /// One element of a fully-qualified symbol path.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -35,7 +73,10 @@ pub enum Descriptor {
     /// `method-disambiguator ::= simple-identifier?` with **no escaped form**, so
     /// a non-simple disambiguator cannot be rendered to a parseable SCIP string.
     /// Empty disambiguator is the common case.
-    Method { name: String, disambiguator: String },
+    Method {
+        name: String,
+        disambiguator: MethodDisambiguator,
+    },
     /// A generic type parameter (`[ident]`).
     TypeParameter(String),
     /// A value parameter (`(ident)`).
@@ -82,16 +123,7 @@ impl Descriptor {
             } => {
                 push_ident(out, name)?;
                 out.write_char('(')?;
-                // SCIP defines no escaped form for the disambiguator
-                // (`method-disambiguator ::= simple-identifier?`). A non-simple
-                // value would render to an unparseable / mis-round-tripping
-                // string, silently corrupting identity — catch it loudly in
-                // dev/tests rather than emit a broken symbol in release.
-                debug_assert!(
-                    disambiguator.chars().all(is_simple_ident_char),
-                    "SCIP method disambiguator must be a simple identifier, got {disambiguator:?}"
-                );
-                out.write_str(disambiguator)?;
+                out.write_str(disambiguator.as_str())?;
                 out.write_str(").")
             }
             Descriptor::TypeParameter(n) => {
@@ -220,7 +252,10 @@ pub(crate) fn parse_descriptor(s: &str) -> Result<(Descriptor, &str), super::id:
                 .as_str()
                 .split_once(')')
                 .ok_or(SymbolParseError::UnknownDescriptor)?;
-            let disambiguator = disambiguator.to_owned();
+            if !disambiguator.chars().all(is_simple_ident_char) {
+                return Err(SymbolParseError::InvalidDisambiguator);
+            }
+            let disambiguator = MethodDisambiguator::new(disambiguator.to_owned())?;
             let rest = after_close
                 .strip_prefix('.')
                 .ok_or(SymbolParseError::UnknownDescriptor)?;
@@ -251,7 +286,7 @@ mod tests {
         Descriptor::Namespace("auth".into()).render(&mut s).unwrap();
         Descriptor::Method {
             name: "validate_token".into(),
-            disambiguator: String::new(),
+            disambiguator: MethodDisambiguator::empty(),
         }
         .render(&mut s)
         .unwrap();
@@ -274,7 +309,7 @@ mod tests {
         // identity.
         let desc = Descriptor::Method {
             name: "to_string".into(),
-            disambiguator: "1".into(),
+            disambiguator: MethodDisambiguator::new("1").unwrap(),
         };
         let mut s = String::new();
         desc.render(&mut s).unwrap();

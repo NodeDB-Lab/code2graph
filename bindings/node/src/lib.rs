@@ -3,8 +3,8 @@
 //! Node.js / Bun bindings for code2graph.
 //!
 //! Exposes extraction and resolution to JS/TS. Results are returned as plain
-//! JS objects produced from the crate's serde representation, so `SymbolId`s
-//! appear as their stable SCIP strings. See [`extract`] and [`build_graph`].
+//! JS objects produced from the crate's lossless, versioned serde representation.
+//! See [`extract`] and [`build_graph`].
 
 use code2graph_core::{
     FileFacts, Language, Resolver, ScopeGraphResolver, SymbolTableResolver, extract_path,
@@ -35,8 +35,8 @@ pub fn extract(file: String, source: String) -> napi::Result<Value> {
 pub fn build_graph(files: Value, tier: Option<String>) -> napi::Result<Value> {
     let facts: Vec<FileFacts> = serde_json::from_value(files).map_err(to_napi_err)?;
     let graph = match tier.as_deref().unwrap_or("name") {
-        "name" => SymbolTableResolver.resolve(&facts),
-        "scope" => ScopeGraphResolver.resolve(&facts),
+        "name" => SymbolTableResolver.resolve(&facts).map_err(to_napi_err)?,
+        "scope" => ScopeGraphResolver.resolve(&facts).map_err(to_napi_err)?,
         other => {
             return Err(napi::Error::from_reason(format!(
                 "unknown tier {other:?}; expected \"name\" or \"scope\""

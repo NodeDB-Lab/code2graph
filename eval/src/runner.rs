@@ -23,7 +23,9 @@ pub fn score_case<R: Resolver>(case: &Case, resolver: &R) -> Scorecard {
         .iter()
         .filter_map(|(name, src)| extract_path(name, src).ok())
         .collect();
-    let graph = resolver.resolve(&facts);
+    let graph = resolver
+        .resolve(&facts)
+        .expect("extractors must produce resolver-valid FileFacts");
     score_graph_for_case(&graph, case)
 }
 
@@ -73,7 +75,9 @@ pub fn score_case_tiered(case: &Case) -> TieredScorecard {
         .iter()
         .filter_map(|(name, src)| extract_path(name, src).ok())
         .collect();
-    let graph = LayeredResolver::default_dense().resolve(&facts);
+    let graph = LayeredResolver::default_dense()
+        .resolve(&facts)
+        .expect("extractors must produce resolver-valid FileFacts");
 
     TieredScorecard {
         heuristic: score_graph_for_case(&graph.min_confidence(Confidence::Heuristic), case),

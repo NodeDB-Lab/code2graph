@@ -92,6 +92,10 @@ pub enum SymbolParseError {
     #[error("unknown or missing descriptor suffix")]
     UnknownDescriptor,
 
+    /// A method disambiguator was not a SCIP simple identifier.
+    #[error("invalid method disambiguator")]
+    InvalidDisambiguator,
+
     /// A global symbol carried zero descriptors.
     #[error("global symbol has no descriptors")]
     NoDescriptors,
@@ -123,6 +127,40 @@ impl SymbolId {
             file: file.into(),
             id: id.into(),
         }))
+    }
+
+    /// Identity coordinates omitted by SCIP's standard rendered form. Kept
+    /// crate-visible so serde can preserve structural identity without abusing
+    /// package coordinates or changing the required `codegraph` scheme.
+    pub(crate) fn wire_context(&self) -> (Option<&str>, Option<&str>) {
+        match &*self.0 {
+            SymbolRepr::Global { lang, .. } => (Some(lang), None),
+            SymbolRepr::Local { file, .. } => (None, Some(file)),
+        }
+    }
+
+    pub(crate) fn from_wire(
+        scip: &str,
+        lang: Option<String>,
+        file: Option<String>,
+    ) -> Result<Self, SymbolParseError> {
+        let parsed = Self::from_scip_string(scip)?;
+        match &*parsed.0 {
+            SymbolRepr::Global {
+                scheme,
+                package,
+                descriptors,
+                ..
+            } => Ok(SymbolId(Arc::new(SymbolRepr::Global {
+                scheme: scheme.clone(),
+                package: package.clone(),
+                lang: lang.unwrap_or_default(),
+                descriptors: descriptors.clone(),
+            }))),
+            SymbolRepr::Local { id, .. } => {
+                Ok(SymbolId::local(file.unwrap_or_default(), id.clone()))
+            }
+        }
     }
 
     /// Return a new `SymbolId` with `package` stamped in. `Global` variants get
@@ -321,6 +359,7 @@ impl fmt::Display for SymbolId {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::symbol::MethodDisambiguator;
 
     #[test]
     fn namespaces_returns_namespace_segments_only() {
@@ -357,7 +396,7 @@ mod tests {
                 Descriptor::Namespace("auth".into()),
                 Descriptor::Method {
                     name: "validate_token".into(),
-                    disambiguator: String::new(),
+                    disambiguator: MethodDisambiguator::empty(),
                 },
             ],
         );
@@ -367,6 +406,24 @@ mod tests {
             "codegraph . . . auth/validate_token()."
         );
         assert_eq!(id.leaf_name(), Some("validate_token"));
+    }
+
+    #[test]
+    fn global_identity_round_trips_with_its_language() {
+        let rust = SymbolId::global("rust", vec![Descriptor::Term("helper".into())]);
+        let python = SymbolId::global("python", vec![Descriptor::Term("helper".into())]);
+
+        // SCIP deliberately has no language field. The lossless serde wire
+        // representation carries it without changing the standard SCIP scheme.
+        assert_eq!(rust.to_scip_string(), python.to_scip_string());
+        #[cfg(feature = "serde")]
+        {
+            assert_ne!(
+                serde_json::to_string(&rust).unwrap(),
+                serde_json::to_string(&python).unwrap(),
+                "lossless wire identity must retain language"
+            );
+        }
     }
 
     #[test]
@@ -569,6 +626,14 @@ mod tests {
         assert_eq!(
             SymbolId::from_scip_string("codegraph"),
             Err(SymbolParseError::MalformedHeader)
+        );
+    }
+
+    #[test]
+    fn invalid_method_disambiguator_is_rejected_by_the_parser() {
+        assert!(
+            SymbolId::from_scip_string("codegraph . . . helper(not valid).").is_err(),
+            "a method disambiguator is a SCIP simple identifier, never arbitrary text"
         );
     }
 

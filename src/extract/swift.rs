@@ -432,7 +432,7 @@ fn collect_protocol_members(
                 let mut descriptors = prefix.to_vec();
                 descriptors.push(Descriptor::Method {
                     name: name.clone(),
-                    disambiguator: String::new(),
+                    disambiguator: crate::symbol::MethodDisambiguator::empty(),
                 });
                 push_symbol(
                     out,
@@ -499,7 +499,7 @@ fn handle_function(
     let mut descriptors = prefix.to_vec();
     descriptors.push(Descriptor::Method {
         name: name.clone(),
-        disambiguator: String::new(),
+        disambiguator: crate::symbol::MethodDisambiguator::empty(),
     });
     push_symbol(out, ctx, &node, name, kind, visibility, descriptors);
     if is_main {
@@ -515,7 +515,7 @@ fn handle_init(node: Node, prefix: &[Descriptor], ctx: &ExtractCtx, out: &mut Ve
     let mut descriptors = prefix.to_vec();
     descriptors.push(Descriptor::Method {
         name: "init".to_owned(),
-        disambiguator: String::new(),
+        disambiguator: crate::symbol::MethodDisambiguator::empty(),
     });
     push_symbol(
         out,

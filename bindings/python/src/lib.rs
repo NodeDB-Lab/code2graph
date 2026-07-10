@@ -4,8 +4,8 @@
 //!
 //! Exposes the extraction and resolution API to Python. Results are returned as
 //! native Python objects (dicts/lists) produced from the crate's serde
-//! representation, so `SymbolId`s appear as their stable SCIP strings.
-//! See [`extract`] for per-file extraction and [`build_graph`] for cross-file
+//! lossless, versioned serde representation. See [`extract`] for per-file
+//! extraction and [`build_graph`] for cross-file
 //! resolution into a `CodeGraph`.
 
 use code2graph_core::{FileFacts, Resolver, ScopeGraphResolver, SymbolTableResolver, extract_path};
@@ -42,8 +42,12 @@ fn build_graph<'py>(
     let facts: Vec<FileFacts> =
         depythonize(files).map_err(|e| PyValueError::new_err(e.to_string()))?;
     let graph = match tier {
-        "name" => SymbolTableResolver.resolve(&facts),
-        "scope" => ScopeGraphResolver.resolve(&facts),
+        "name" => SymbolTableResolver
+            .resolve(&facts)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?,
+        "scope" => ScopeGraphResolver
+            .resolve(&facts)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?,
         other => {
             return Err(PyValueError::new_err(format!(
                 "unknown tier {other:?}; expected \"name\" or \"scope\""

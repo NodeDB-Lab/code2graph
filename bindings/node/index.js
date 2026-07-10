@@ -61,13 +61,9 @@ const isMuslFromChildProcess = () => {
 }
 
 function requireNative() {
-  if (process.env.NAPI_RS_NATIVE_LIBRARY_PATH) {
-    try {
-      return require(process.env.NAPI_RS_NATIVE_LIBRARY_PATH);
-    } catch (err) {
-      loadErrors.push(err)
-    }
-  } else if (process.platform === 'android') {
+  // Environment variables must not select executable modules. Keep this
+  // restriction after every napi-rs regeneration.
+  if (process.platform === 'android') {
     if (process.arch === 'arm64') {
       try {
         return require('./code2graph-node.android-arm64.node')

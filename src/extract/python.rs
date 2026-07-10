@@ -375,7 +375,7 @@ fn def_of<'a>(
             SymbolKind::Function,
             Descriptor::Method {
                 name: name.clone(),
-                disambiguator: String::new(),
+                disambiguator: crate::symbol::MethodDisambiguator::empty(),
             },
         )
     } else {

@@ -222,7 +222,7 @@ fn collect_function_declaration(
             let mut descriptors = prefix.to_vec();
             descriptors.push(Descriptor::Method {
                 name: name.clone(),
-                disambiguator: String::new(),
+                disambiguator: crate::symbol::MethodDisambiguator::empty(),
             });
             let sig = one_line_signature(node_text(node, ctx.bytes), &['{', '(']);
             out.push(make_symbol(
@@ -254,7 +254,7 @@ fn collect_function_declaration(
             descriptors.push(Descriptor::Type(table));
             descriptors.push(Descriptor::Method {
                 name: method.clone(),
-                disambiguator: String::new(),
+                disambiguator: crate::symbol::MethodDisambiguator::empty(),
             });
             let sig = one_line_signature(node_text(node, ctx.bytes), &['{', '(']);
             out.push(make_symbol(
@@ -332,7 +332,7 @@ fn emit_local_symbol(
             SymbolKind::Function,
             Descriptor::Method {
                 name: name.clone(),
-                disambiguator: String::new(),
+                disambiguator: crate::symbol::MethodDisambiguator::empty(),
             },
         ),
         Some("table_constructor") => (SymbolKind::Module, Descriptor::Type(name.clone())),
@@ -382,7 +382,7 @@ fn collect_table_fields(
                 SymbolKind::Method,
                 Descriptor::Method {
                     name: fname.clone(),
-                    disambiguator: String::new(),
+                    disambiguator: crate::symbol::MethodDisambiguator::empty(),
                 },
             )
         } else {

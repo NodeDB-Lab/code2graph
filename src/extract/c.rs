@@ -249,7 +249,7 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
                     vis,
                     Descriptor::Method {
                         name,
-                        disambiguator: String::new(),
+                        disambiguator: crate::symbol::MethodDisambiguator::empty(),
                     },
                 );
                 // C `main` is always a free function — name-only detection.
@@ -297,7 +297,7 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
                             vis,
                             Descriptor::Method {
                                 name,
-                                disambiguator: String::new(),
+                                disambiguator: crate::symbol::MethodDisambiguator::empty(),
                             },
                         );
                     } else {

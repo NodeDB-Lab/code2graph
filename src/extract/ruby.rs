@@ -176,7 +176,7 @@ fn walk(node: &Node, prefix: &[Descriptor], ctx: &ExtractCtx, out: &mut Vec<Symb
                 let mut descriptors = prefix.to_vec();
                 descriptors.push(Descriptor::Method {
                     name: name.clone(),
-                    disambiguator: String::new(),
+                    disambiguator: crate::symbol::MethodDisambiguator::empty(),
                 });
                 push_symbol(out, ctx, &child, name, SymbolKind::Method, descriptors);
                 // Do not recurse into method bodies — inner defs would produce

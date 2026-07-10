@@ -2,10 +2,17 @@
 
 //! The [`Resolver`] trait — the tier seam every resolver implements.
 
-use crate::graph::{CodeGraph, FileFacts};
+use crate::{
+    error::Result,
+    graph::{CodeGraph, FileFacts},
+};
 
 /// Links references to definitions. Pure: no I/O, deterministic.
 pub trait Resolver {
-    /// Resolve `files` into a graph of symbols and confidence-tagged edges.
-    fn resolve(&self, files: &[FileFacts]) -> CodeGraph;
+    /// Resolve facts into a graph of symbols and confidence-tagged edges.
+    ///
+    /// Every public resolution entry point validates the supplied facts before
+    /// traversing scopes or deriving edges, returning a typed error for malformed
+    /// untrusted input.
+    fn resolve(&self, files: &[FileFacts]) -> Result<CodeGraph>;
 }

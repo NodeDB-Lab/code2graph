@@ -587,11 +587,30 @@ mod serde_tests {
     }
 
     #[test]
-    fn symbol_id_serializes_as_scip_string() {
+    fn symbol_id_serializes_as_lossless_scip_wire_object() {
         let id = make_symbol_id();
-        let json = serde_json::to_string(&id).expect("serialize SymbolId");
-        let expected = format!("\"{}\"", id.to_scip_string());
-        assert_eq!(json, expected);
+        let json = serde_json::to_value(&id).expect("serialize SymbolId");
+        assert_eq!(json["version"], 1);
+        assert_eq!(json["scip"], id.to_scip_string());
+        assert_eq!(json["lang"], "rust");
+    }
+
+    #[test]
+    fn symbol_id_serde_preserves_complete_structural_identity() {
+        let id = SymbolId::global(
+            "python",
+            vec![
+                Descriptor::Namespace("auth".into()),
+                Descriptor::Term("validate".into()),
+            ],
+        );
+        let json = serde_json::to_string(&id).expect("serialize");
+        let restored: SymbolId = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(
+            restored, id,
+            "serde must preserve every identity coordinate, including language"
+        );
     }
 
     #[test]
@@ -599,9 +618,7 @@ mod serde_tests {
         let id = make_symbol_id();
         let json = serde_json::to_string(&id).expect("serialize");
         let id2: SymbolId = serde_json::from_str(&json).expect("deserialize");
-        // to_scip_string is the identity; lang is not encoded in the string so
-        // compare via the rendered form rather than structural equality.
-        assert_eq!(id.to_scip_string(), id2.to_scip_string());
+        assert_eq!(id, id2, "the versioned wire format is lossless");
     }
 
     #[test]

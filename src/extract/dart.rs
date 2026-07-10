@@ -330,7 +330,7 @@ fn collect_top_function(
     let mut descriptors = prefix.to_vec();
     descriptors.push(Descriptor::Method {
         name: name.clone(),
-        disambiguator: String::new(),
+        disambiguator: crate::symbol::MethodDisambiguator::empty(),
     });
     out.push(make_symbol(
         ctx,
@@ -474,7 +474,7 @@ fn emit_method(
     let mut descriptors = prefix.to_vec();
     descriptors.push(Descriptor::Method {
         name: name.clone(),
-        disambiguator: String::new(),
+        disambiguator: crate::symbol::MethodDisambiguator::empty(),
     });
     out.push(make_symbol(
         ctx,

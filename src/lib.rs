@@ -18,7 +18,7 @@
 //!
 //! let a = extract_path("src/util.rs", "pub fn helper() {}").unwrap();
 //! let b = extract_path("src/main.rs", "pub fn run() { helper() }").unwrap();
-//! let graph = SymbolTableResolver.resolve(&[a, b]);
+//! let graph = SymbolTableResolver.resolve(&[a, b]).unwrap();
 //! assert_eq!(graph.edges.len(), 1); // run --calls--> helper
 //! ```
 //!
@@ -65,7 +65,7 @@ pub use extract::{Extractor, extract_file, extract_path};
 pub use graph::{
     Binding, BindingKind, BindingTarget, ByteSpan, CodeGraph, Confidence, Edge, EntryPoint, FfiAbi,
     FfiExport, FileFacts, Occurrence, Provenance, RefRole, Reference, Scope, ScopeId, ScopeKind,
-    Symbol, SymbolKind, TypeRefContext, Visibility,
+    Symbol, SymbolKind, TypeRefContext, Visibility, validate_file_facts,
 };
 pub use lang::Language;
 pub use resolve::{

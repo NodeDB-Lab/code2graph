@@ -347,7 +347,7 @@ fn emit_function(node: &Node, ctx: &ExtractCtx, prefix: &[Descriptor], out: &mut
     let mut descriptors = prefix.to_vec();
     descriptors.push(Descriptor::Method {
         name: name.clone(),
-        disambiguator: String::new(),
+        disambiguator: crate::symbol::MethodDisambiguator::empty(),
     });
     out.push(make_symbol(
         ctx,

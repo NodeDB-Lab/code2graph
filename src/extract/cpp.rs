@@ -266,7 +266,7 @@ fn process_node(node: &Node, namespaces: &[String], ctx: &ExtractCtx, out: &mut 
                 &prefix,
                 Descriptor::Method {
                     name,
-                    disambiguator: String::new(),
+                    disambiguator: crate::symbol::MethodDisambiguator::empty(),
                 },
                 SymbolKind::Function,
                 vis,
@@ -305,7 +305,7 @@ fn process_node(node: &Node, namespaces: &[String], ctx: &ExtractCtx, out: &mut 
                         &prefix,
                         Descriptor::Method {
                             name,
-                            disambiguator: String::new(),
+                            disambiguator: crate::symbol::MethodDisambiguator::empty(),
                         },
                         SymbolKind::Function,
                         vis,
@@ -506,7 +506,7 @@ fn collect_members(
                     type_prefix,
                     Descriptor::Method {
                         name,
-                        disambiguator: String::new(),
+                        disambiguator: crate::symbol::MethodDisambiguator::empty(),
                     },
                     SymbolKind::Method,
                     current_vis,
@@ -527,7 +527,7 @@ fn collect_members(
                         type_prefix,
                         Descriptor::Method {
                             name,
-                            disambiguator: String::new(),
+                            disambiguator: crate::symbol::MethodDisambiguator::empty(),
                         },
                         SymbolKind::Method,
                         current_vis,

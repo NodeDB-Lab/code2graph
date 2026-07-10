@@ -313,7 +313,7 @@ fn collect_members(
                 let mut descriptors = type_prefix.to_vec();
                 descriptors.push(Descriptor::Method {
                     name: name.clone(),
-                    disambiguator: String::new(),
+                    disambiguator: crate::symbol::MethodDisambiguator::empty(),
                 });
                 let sig = one_line_signature(node_text(&member, ctx.bytes), &['{', ';']);
                 // A `static Main` (case-sensitive) method is the C# entry point.

@@ -336,7 +336,7 @@ fn collect_members(
                 descriptors.push(Descriptor::Type(type_name.to_owned()));
                 descriptors.push(Descriptor::Method {
                     name: name.clone(),
-                    disambiguator: String::new(),
+                    disambiguator: crate::symbol::MethodDisambiguator::empty(),
                 });
                 let mut method_sym = make_symbol(
                     ctx,

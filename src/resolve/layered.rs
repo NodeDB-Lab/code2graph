@@ -67,17 +67,21 @@ impl LayeredResolver {
 }
 
 impl Resolver for LayeredResolver {
-    fn resolve(&self, files: &[FileFacts]) -> CodeGraph {
+    fn resolve(&self, files: &[FileFacts]) -> crate::Result<CodeGraph> {
+        crate::validate_file_facts(files)?;
         // ── 1. Run every layer ──────────────────────────────────────────────
-        let graphs: Vec<CodeGraph> = self.layers.iter().map(|r| r.resolve(files)).collect();
+        let graphs: Vec<CodeGraph> = self
+            .layers
+            .iter()
+            .map(|r| r.resolve(files))
+            .collect::<crate::Result<_>>()?;
 
-        // ── 2. Symbol union — dedup by SCIP string, first-seen wins ────────
-        let mut seen_syms: HashSet<String> = HashSet::new();
+        // ── 2. Symbol union — dedup by complete structural identity ────────
+        let mut seen_syms: HashSet<crate::symbol::SymbolId> = HashSet::new();
         let mut symbols: Vec<Symbol> = Vec::new();
         for g in &graphs {
             for sym in &g.symbols {
-                let key = sym.id.to_scip_string();
-                if seen_syms.insert(key) {
+                if seen_syms.insert(sym.id.clone()) {
                     symbols.push(sym.clone());
                 }
             }
@@ -85,11 +89,18 @@ impl Resolver for LayeredResolver {
 
         // ── 3. Edge union — confidence-preferring dedup ─────────────────────
         //
-        // The dedup key is (from_scip, to_scip, role, occ.file, occ.byte).
+        // The dedup key uses structural SymbolIds so language/file context is
+        // not erased by the standard SCIP presentation string.
         // `Occurrence` is `Eq` but not `Hash`, so we decompose it by hand.
         // `RefRole` is `Hash + Eq`; `Provenance` is `Hash + Eq`.
 
-        type EdgeKey = (String, String, RefRole, String, usize);
+        type EdgeKey = (
+            crate::symbol::SymbolId,
+            crate::symbol::SymbolId,
+            RefRole,
+            String,
+            usize,
+        );
 
         // Flatten all edges in layer order (layer 0 first) and compute each
         // edge's key once, shared across both passes.
@@ -98,8 +109,8 @@ impl Resolver for LayeredResolver {
             .iter()
             .map(|e| {
                 (
-                    e.from.to_scip_string(),
-                    e.to.to_scip_string(),
+                    e.from.clone(),
+                    e.to.clone(),
                     e.role,
                     e.occ.file.clone(),
                     e.occ.byte,
@@ -137,7 +148,7 @@ impl Resolver for LayeredResolver {
             }
         }
 
-        CodeGraph { symbols, edges }
+        Ok(CodeGraph { symbols, edges })
     }
 }
 
@@ -206,8 +217,8 @@ mod tests {
     struct StubResolver(CodeGraph);
 
     impl Resolver for StubResolver {
-        fn resolve(&self, _files: &[FileFacts]) -> CodeGraph {
-            self.0.clone()
+        fn resolve(&self, _files: &[FileFacts]) -> crate::Result<CodeGraph> {
+            Ok(self.0.clone())
         }
     }
 
@@ -233,8 +244,8 @@ mod tests {
             .unwrap();
 
         let files = [lib, main];
-        let scope_graph = ScopeGraphResolver.resolve(&files);
-        let layered = LayeredResolver::default_dense().resolve(&files);
+        let scope_graph = ScopeGraphResolver.resolve(&files).unwrap();
+        let layered = LayeredResolver::default_dense().resolve(&files).unwrap();
 
         for sg_edge in &scope_graph.edges {
             let sg_from = sg_edge.from.to_scip_string();
@@ -287,7 +298,7 @@ mod tests {
         };
 
         let resolver = LayeredResolver::new(vec![stub(g1), stub(g2)]);
-        let merged = resolver.resolve(&[]);
+        let merged = resolver.resolve(&[]).unwrap();
 
         let call_edges: Vec<_> = merged
             .edges
@@ -358,7 +369,7 @@ mod tests {
         };
 
         let resolver = LayeredResolver::new(vec![stub(g1), stub(g2)]);
-        let merged = resolver.resolve(&[]);
+        let merged = resolver.resolve(&[]).unwrap();
 
         let call_edges: Vec<_> = merged
             .edges
@@ -392,6 +403,38 @@ mod tests {
     /// Symbols that appear in multiple layers appear exactly once in the merged
     /// output (deduplicated by SCIP identity string; first-seen wins).
     #[test]
+    fn symbols_with_matching_descriptors_in_different_languages_both_survive() {
+        let rust = make_symbol("util", "helper");
+        let mut python = make_symbol("util", "helper");
+        python.id = SymbolId::global(
+            "python",
+            vec![
+                Descriptor::Namespace("util".into()),
+                Descriptor::Term("helper".into()),
+            ],
+        );
+        python.file = "util.py".into();
+
+        let resolver = LayeredResolver::new(vec![
+            stub(CodeGraph {
+                symbols: vec![rust],
+                edges: vec![],
+            }),
+            stub(CodeGraph {
+                symbols: vec![python],
+                edges: vec![],
+            }),
+        ]);
+        let merged = resolver.resolve(&[]).unwrap();
+
+        assert_eq!(
+            merged.symbols.len(),
+            2,
+            "layer merging must deduplicate structural identities, not display strings"
+        );
+    }
+
+    #[test]
     fn symbols_deduplicated_across_layers() {
         let sym_a = make_symbol("util", "helper");
         let sym_b = make_symbol("main", "run");
@@ -408,7 +451,7 @@ mod tests {
         };
 
         let resolver = LayeredResolver::new(vec![stub(g1), stub(g2)]);
-        let merged = resolver.resolve(&[]);
+        let merged = resolver.resolve(&[]).unwrap();
 
         // Should have 3 unique symbols: helper, run, other.
         assert_eq!(
@@ -468,7 +511,7 @@ mod tests {
         };
 
         let resolver = LayeredResolver::new(vec![stub(g1), stub(g2)]);
-        let merged = resolver.resolve(&[]);
+        let merged = resolver.resolve(&[]).unwrap();
 
         assert_eq!(
             merged.edges.len(),

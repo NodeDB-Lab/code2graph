@@ -51,14 +51,16 @@ use std::iter::once;
 use crate::graph::types::{CodeGraph, Confidence, Edge, FileFacts, Provenance, RefRole, Symbol};
 use crate::symbol::{Descriptor, SymbolId};
 
-use super::{Resolver, enclosing_symbol_index, normalize_from_path};
+use super::{Resolver, dedup_files_last_wins, enclosing_symbol_index, normalize_from_path};
 
 /// SCA-reachability resolver. See module docs.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ExternalResolver;
 
 impl Resolver for ExternalResolver {
-    fn resolve(&self, files: &[FileFacts]) -> CodeGraph {
+    fn resolve(&self, files: &[FileFacts]) -> crate::Result<CodeGraph> {
+        crate::validate_file_facts(files)?;
+        let files = dedup_files_last_wins(files);
         // ── 1. Flatten all symbols, mirroring NormalizedNameResolver's layout ──
         let symbols: Vec<Symbol> = files
             .iter()
@@ -151,7 +153,7 @@ impl Resolver for ExternalResolver {
             }
         }
 
-        CodeGraph { symbols, edges }
+        Ok(CodeGraph { symbols, edges })
     }
 }
 
@@ -175,7 +177,7 @@ mod tests {
             )
             .unwrap();
 
-        let graph = ExternalResolver.resolve(&[file]);
+        let graph = ExternalResolver.resolve(&[file]).unwrap();
 
         let ext_edges: Vec<_> = graph
             .edges
@@ -235,7 +237,7 @@ mod tests {
             .extract("def run():\n    mystery()\n", "src/client.py")
             .unwrap();
 
-        let graph = ExternalResolver.resolve(&[file]);
+        let graph = ExternalResolver.resolve(&[file]).unwrap();
 
         let ext_edges: Vec<_> = graph
             .edges
@@ -311,7 +313,7 @@ mod tests {
             type_ref_ctx: None,
         });
 
-        let graph = ExternalResolver.resolve(&[lib, caller]);
+        let graph = ExternalResolver.resolve(&[lib, caller]).unwrap();
 
         let helper_ext: Vec<_> = graph
             .edges
@@ -388,7 +390,7 @@ mod tests {
             type_ref_ctx: None,
         });
 
-        let graph = ExternalResolver.resolve(&[file]);
+        let graph = ExternalResolver.resolve(&[file]).unwrap();
 
         let ext_edges: Vec<_> = graph
             .edges
@@ -430,8 +432,8 @@ mod tests {
             .unwrap();
 
         let input = [file];
-        let g1 = ExternalResolver.resolve(&input);
-        let g2 = ExternalResolver.resolve(&input);
+        let g1 = ExternalResolver.resolve(&input).unwrap();
+        let g2 = ExternalResolver.resolve(&input).unwrap();
 
         let scips1: Vec<_> = g1
             .edges

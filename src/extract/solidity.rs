@@ -332,7 +332,7 @@ fn handle_function(
     let mut descriptors = prefix.to_vec();
     descriptors.push(Descriptor::Method {
         name: name.clone(),
-        disambiguator: String::new(),
+        disambiguator: crate::symbol::MethodDisambiguator::empty(),
     });
     push_symbol(out, ctx, &node, name, kind, visibility, descriptors);
 }
@@ -344,7 +344,7 @@ fn handle_constructor(node: Node, prefix: &[Descriptor], ctx: &ExtractCtx, out: 
     let mut descriptors = prefix.to_vec();
     descriptors.push(Descriptor::Method {
         name: "constructor".to_owned(),
-        disambiguator: String::new(),
+        disambiguator: crate::symbol::MethodDisambiguator::empty(),
     });
     push_symbol(
         out,
@@ -369,7 +369,7 @@ fn handle_modifier(node: Node, prefix: &[Descriptor], ctx: &ExtractCtx, out: &mu
     let mut descriptors = prefix.to_vec();
     descriptors.push(Descriptor::Method {
         name: name.clone(),
-        disambiguator: String::new(),
+        disambiguator: crate::symbol::MethodDisambiguator::empty(),
     });
     push_symbol(
         out,
@@ -406,7 +406,7 @@ fn handle_fallback_receive(
     let mut descriptors = prefix.to_vec();
     descriptors.push(Descriptor::Method {
         name: name.to_owned(),
-        disambiguator: String::new(),
+        disambiguator: crate::symbol::MethodDisambiguator::empty(),
     });
     push_symbol(
         out,

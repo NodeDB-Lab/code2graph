@@ -105,3 +105,4 @@ dmypy.json
 
 # local session scratch
 .claude/prep/
+.agents/prep/

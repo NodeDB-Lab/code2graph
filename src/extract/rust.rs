@@ -148,7 +148,7 @@ fn collect_symbols(root: &Node, ctx: &ExtractCtx, namespaces: &[String]) -> Vec<
                     SymbolKind::Function,
                     Descriptor::Method {
                         name: name.clone(),
-                        disambiguator: String::new(),
+                        disambiguator: crate::symbol::MethodDisambiguator::empty(),
                     },
                 )
             }
@@ -315,7 +315,7 @@ fn collect_impl_members(
                     SymbolKind::Method,
                     Descriptor::Method {
                         name,
-                        disambiguator: String::new(),
+                        disambiguator: crate::symbol::MethodDisambiguator::empty(),
                     },
                 )
             }
@@ -386,7 +386,7 @@ fn collect_trait_members(
                     SymbolKind::Method,
                     Descriptor::Method {
                         name,
-                        disambiguator: String::new(),
+                        disambiguator: crate::symbol::MethodDisambiguator::empty(),
                     },
                 )
             }
@@ -2897,6 +2897,49 @@ impl std::fmt::Display for Point {
     }
 
     #[test]
+    fn ffi_exports_require_exact_unconditional_attributes() {
+        let cases = [
+            (
+                "#[doc = \"no_mangle\"]\npub extern \"C\" fn documented() {}",
+                "documented",
+            ),
+            (
+                "#[other_no_mangle]\npub extern \"C\" fn lookalike() {}",
+                "lookalike",
+            ),
+            (
+                "#[export_name_note = \"ffi_name\"]\npub extern \"C\" fn note() {}",
+                "note",
+            ),
+            (
+                "#[cfg_attr(feature = \"ffi\", no_mangle)]\npub extern \"C\" fn conditional() {}",
+                "conditional",
+            ),
+            (
+                "#[cfg_attr(feature = \"ffi\", doc = \"no_mangle\")]\npub extern \"C\" fn quoted() {}",
+                "quoted",
+            ),
+            (
+                "#[cfg_attr(feature = \"ffi\", unrelated::no_mangle)]\npub extern \"C\" fn nested_unrelated() {}",
+                "nested_unrelated",
+            ),
+        ];
+
+        let incorrectly_exported: Vec<_> = cases
+            .iter()
+            .filter_map(|(source, name)| {
+                let facts = RustExtractor.extract(source, "src/ffi.rs").unwrap();
+                (!facts.ffi_exports.is_empty()).then_some(*name)
+            })
+            .collect();
+
+        assert!(
+            incorrectly_exported.is_empty(),
+            "only exact, unconditional supported attributes may create FFI facts; got {incorrectly_exported:?}"
+        );
+    }
+
+    #[test]
     fn cross_file_assoc_fn_call_resolves_to_impl_member() {
         // The point of unit C3: `Point::new()` in main.rs must resolve to the
         // `new` symbol in point.rs via a Call edge whose `to` ends with `Point#new().`.
@@ -2912,7 +2955,7 @@ impl std::fmt::Display for Point {
             .extract("pub fn run() { let _ = Point::new(); }", "src/main.rs")
             .unwrap();
 
-        let graph = SymbolTableResolver.resolve(&[point, main]);
+        let graph = SymbolTableResolver.resolve(&[point, main]).unwrap();
 
         let call_to_new: Vec<_> = graph
             .edges

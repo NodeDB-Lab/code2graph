@@ -30,3 +30,9 @@ console.log(languageOf("unknown.xyz")); // null
 The addon is a CommonJS package, so CJS `require("@nodedb-lab/code2graph")` works too — ESM `import` resolves via Node's interop.
 
 The `tier` argument to `buildGraph` is `"name"` (default, Tier A — fast, recall-first, `NameOnly` confidence) or `"scope"` (Tier B — scope-graph path resolution, `Scoped`/`Exact` confidence).
+
+## Identity wire format
+
+`SymbolId` values in facts and graphs are lossless objects: global IDs contain `{ version: 1, scip, lang }` and local IDs contain `{ version: 1, scip, file }`. `scip` is the standard SCIP-compatible display string, while `lang` and `file` preserve code2graph identity coordinates that SCIP itself has no field for. Consumers persisting or forwarding facts must retain the full object. Input remains backward-compatible with the legacy string form, but a legacy string cannot preserve those coordinates.
+
+The generated loader is post-processed by `npm run harden-loader` after every `napi build`; environment variables never select a module to execute during package import.

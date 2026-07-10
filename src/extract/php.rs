@@ -174,7 +174,7 @@ fn collect_defs(container: &Node, namespaces: &[String], ctx: &ExtractCtx, out: 
                 let mut descriptors = base_descriptors.clone();
                 descriptors.push(Descriptor::Method {
                     name: name.clone(),
-                    disambiguator: String::new(),
+                    disambiguator: crate::symbol::MethodDisambiguator::empty(),
                 });
                 // Top-level functions have no visibility modifier concept; they
                 // are effectively public within their namespace.
@@ -260,7 +260,7 @@ fn collect_members(
                 let mut descriptors = type_descriptors.to_vec();
                 descriptors.push(Descriptor::Method {
                     name: name.clone(),
-                    disambiguator: String::new(),
+                    disambiguator: crate::symbol::MethodDisambiguator::empty(),
                 });
                 push_symbol(
                     out,

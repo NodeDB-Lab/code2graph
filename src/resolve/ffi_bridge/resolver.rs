@@ -11,7 +11,7 @@ use crate::graph::types::{
 use crate::symbol::SymbolId;
 
 use crate::resolve::Resolver;
-use crate::resolve::enclosing_symbol_index;
+use crate::resolve::{dedup_files_last_wins, enclosing_symbol_index};
 
 /// A cross-language FFI export plus the ABI it is exposed under (so the resolver
 /// can bridge it only to call sites in a language that consumes that ABI).
@@ -26,13 +26,26 @@ struct ExportRec {
 pub struct FfiBridgeResolver;
 
 impl Resolver for FfiBridgeResolver {
-    fn resolve(&self, files: &[FileFacts]) -> CodeGraph {
+    fn resolve(&self, files: &[FileFacts]) -> crate::Result<CodeGraph> {
+        crate::validate_file_facts(files)?;
+        let files = dedup_files_last_wins(files);
         // export name → exports declared under it, each tagged with its language.
         let mut symbols: Vec<Symbol> = Vec::new();
         let mut exports: HashMap<&str, Vec<ExportRec>> = HashMap::new();
-        for f in files {
+        for f in files.iter().copied() {
             symbols.extend(f.symbols.iter().cloned());
             for e in &f.ffi_exports {
+                // An export fact must identify exactly one symbol in its own
+                // facts; otherwise it is malformed and cannot be bridged.
+                if f.symbols.iter().filter(|s| s.id == e.symbol).count() != 1
+                    || f.ffi_exports
+                        .iter()
+                        .filter(|other| other.symbol == e.symbol)
+                        .count()
+                        != 1
+                {
+                    continue;
+                }
                 exports
                     .entry(e.export_name.as_str())
                     .or_default()
@@ -43,10 +56,10 @@ impl Resolver for FfiBridgeResolver {
             }
         }
         if exports.is_empty() {
-            return CodeGraph {
+            return Ok(CodeGraph {
                 symbols,
                 edges: Vec::new(),
-            };
+            });
         }
 
         // Per-file symbol index for caller attribution (span containment).
@@ -100,7 +113,7 @@ impl Resolver for FfiBridgeResolver {
             }
         }
 
-        CodeGraph { symbols, edges }
+        Ok(CodeGraph { symbols, edges })
     }
 }
 
@@ -128,7 +141,7 @@ mod tests {
             .extract("void use_it(void) { create_user(); }", "src/app.c")
             .unwrap();
 
-        let graph = FfiBridgeResolver.resolve(&[rust, c]);
+        let graph = FfiBridgeResolver.resolve(&[rust, c]).unwrap();
         assert_eq!(graph.edges.len(), 1, "expected one FFI bridge edge");
         let e = &graph.edges[0];
         assert_eq!(e.provenance, Provenance::FfiBridge);
@@ -162,7 +175,7 @@ mod tests {
         let c = CExtractor
             .extract("void m(void) { c_alloc(); }", "src/app.c")
             .unwrap();
-        let graph = FfiBridgeResolver.resolve(&[rust, c]);
+        let graph = FfiBridgeResolver.resolve(&[rust, c]).unwrap();
         assert_eq!(graph.edges.len(), 1);
         assert!(
             graph.edges[0]
@@ -184,7 +197,7 @@ mod tests {
         let caller = RustExtractor
             .extract("pub fn run() { create_user(); }", "src/main.rs")
             .unwrap();
-        let graph = FfiBridgeResolver.resolve(&[lib, caller]);
+        let graph = FfiBridgeResolver.resolve(&[lib, caller]).unwrap();
         assert!(
             graph.edges.is_empty(),
             "same-language use must not bridge, got {:?}",
@@ -221,7 +234,7 @@ mod tests {
             .extract("def run():\n    tokenize()", "app.py")
             .unwrap();
 
-        let graph = FfiBridgeResolver.resolve(&[rust, py]);
+        let graph = FfiBridgeResolver.resolve(&[rust, py]).unwrap();
         assert_eq!(graph.edges.len(), 1, "expected one FFI bridge edge");
         let e = &graph.edges[0];
         assert_eq!(e.provenance, Provenance::FfiBridge);
@@ -247,7 +260,7 @@ mod tests {
         let py = PythonExtractor
             .extract("def run():\n    tok()", "app.py")
             .unwrap();
-        let graph = FfiBridgeResolver.resolve(&[rust, py]);
+        let graph = FfiBridgeResolver.resolve(&[rust, py]).unwrap();
         assert_eq!(graph.edges.len(), 1);
         assert!(
             graph.edges[0]
@@ -270,7 +283,7 @@ mod tests {
         let js = JavaScriptExtractor
             .extract("function run() { greet(); }", "app.js")
             .unwrap();
-        let graph = FfiBridgeResolver.resolve(&[rust, js]);
+        let graph = FfiBridgeResolver.resolve(&[rust, js]).unwrap();
         assert_eq!(graph.edges.len(), 1, "expected one FFI bridge edge");
         let e = &graph.edges[0];
         assert_eq!(e.provenance, Provenance::FfiBridge);
@@ -295,7 +308,7 @@ mod tests {
         let js = JavaScriptExtractor
             .extract("function run() { compute(); }", "app.js")
             .unwrap();
-        let graph = FfiBridgeResolver.resolve(&[rust, js]);
+        let graph = FfiBridgeResolver.resolve(&[rust, js]).unwrap();
         assert_eq!(graph.edges.len(), 1, "expected one FFI bridge edge");
         assert_eq!(graph.edges[0].provenance, Provenance::FfiBridge);
         assert!(
@@ -332,7 +345,7 @@ mod tests {
             "Java_com_example_Foo_compute"
         );
 
-        let graph = FfiBridgeResolver.resolve(&[java, rust]);
+        let graph = FfiBridgeResolver.resolve(&[java, rust]).unwrap();
         let bridges: Vec<_> = graph
             .edges
             .iter()
@@ -368,7 +381,7 @@ mod tests {
         assert_eq!(c.ffi_exports.len(), 1, "C must export the Java_ function");
         assert_eq!(c.ffi_exports[0].abi, FfiAbi::Jni);
 
-        let graph = FfiBridgeResolver.resolve(&[java, c]);
+        let graph = FfiBridgeResolver.resolve(&[java, c]).unwrap();
         let bridges: Vec<_> = graph
             .edges
             .iter()
@@ -378,6 +391,53 @@ mod tests {
             bridges.len(),
             1,
             "expected one JNI bridge edge to the C impl"
+        );
+    }
+
+    #[test]
+    fn bridge_exports_must_belong_exactly_once_to_the_declaring_file() {
+        let source = RustExtractor
+            .extract(
+                "#[no_mangle]\npub extern \"C\" fn shared() -> u32 { 0 }",
+                "src/ffi.rs",
+            )
+            .unwrap();
+        let caller = CExtractor
+            .extract("void run(void) { shared(); }", "src/app.c")
+            .unwrap();
+
+        let mut fabricated = source.clone();
+        fabricated.ffi_exports[0].symbol = SymbolId::global(
+            "rust",
+            vec![crate::symbol::Descriptor::Term("absent".into())],
+        );
+
+        let mut duplicate = source.clone();
+        duplicate.ffi_exports.push(duplicate.ffi_exports[0].clone());
+
+        let mut foreign = source.clone();
+        foreign.ffi_exports[0].symbol = caller.symbols[0].id.clone();
+
+        let malformed_exports = [
+            ("fabricated", fabricated),
+            ("duplicate", duplicate),
+            ("foreign", foreign),
+        ];
+        let bridged: Vec<_> = malformed_exports
+            .iter()
+            .filter_map(|(name, exports)| {
+                (!FfiBridgeResolver
+                    .resolve(&[exports.clone(), caller.clone()])
+                    .unwrap()
+                    .edges
+                    .is_empty())
+                .then_some(*name)
+            })
+            .collect();
+
+        assert!(
+            bridged.is_empty(),
+            "only an export identity occurring exactly once in its declaring facts may bridge; accepted {bridged:?}"
         );
     }
 
@@ -392,7 +452,11 @@ mod tests {
             .extract("void run(void) { shared(); }", "app.c")
             .unwrap();
         assert!(
-            FfiBridgeResolver.resolve(&[py_export, c]).edges.is_empty(),
+            FfiBridgeResolver
+                .resolve(&[py_export, c])
+                .unwrap()
+                .edges
+                .is_empty(),
             "C cannot consume a Python-only export"
         );
 
@@ -406,7 +470,11 @@ mod tests {
             .extract("def run():\n    shared()", "app.py")
             .unwrap();
         assert!(
-            FfiBridgeResolver.resolve(&[c_export, py]).edges.is_empty(),
+            FfiBridgeResolver
+                .resolve(&[c_export, py])
+                .unwrap()
+                .edges
+                .is_empty(),
             "Python cannot consume a C-only export"
         );
     }

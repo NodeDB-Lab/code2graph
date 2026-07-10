@@ -12,7 +12,8 @@
   "files": [
     "index.js",
     "index.d.ts",
-    "README.md"
+    "README.md",
+    "*.node"
   ],
   "napi": {
     "binaryName": "code2graph-node",
@@ -26,8 +27,10 @@
     ]
   },
   "scripts": {
-    "build": "napi build --platform --release",
-    "build:debug": "napi build --platform"
+    "build": "napi build --platform --release && npm run harden-loader",
+    "build:debug": "napi build --platform && npm run harden-loader",
+    "harden-loader": "node scripts/harden-loader.cjs",
+    "test": "node test/loader.test.cjs"
   },
   "devDependencies": {
     "@napi-rs/cli": "^3"

@@ -27,6 +27,10 @@ pub enum CodegraphError {
         /// Underlying message.
         msg: String,
     },
+
+    /// Resolver input violated the structural `FileFacts` contract.
+    #[error("malformed file facts for `{file}`: {reason}")]
+    MalformedFacts { file: String, reason: String },
 }
 
 /// Convenience alias for code2graph fallible operations.

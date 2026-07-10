@@ -17,6 +17,7 @@
 
 use std::collections::HashMap;
 
+use crate::error::{CodegraphError, Result};
 use crate::graph::types::{CodeGraph, FileFacts};
 
 use super::stitch::{GlobalIndex, stitch};
@@ -121,11 +122,41 @@ impl IncrementalGraph {
     /// to this method (after calling `build_subgraph`) so the two paths can never
     /// drift.
     pub fn upsert_subgraph(&mut self, file: String, sub: FileSubgraph) {
+        // Compatibility wrapper; callers needing malformed-cache diagnostics use
+        // `try_upsert_subgraph`.
+        let _ = self.try_upsert_subgraph(file, sub);
+    }
+
+    /// Atomically restore a persisted subgraph after validating its schema and
+    /// ownership. On error neither the file store nor global index changes.
+    pub fn try_upsert_subgraph(&mut self, file: String, sub: FileSubgraph) -> Result<()> {
+        let invalid = |reason: String| CodegraphError::MalformedFacts {
+            file: file.clone(),
+            reason,
+        };
+        if sub.schema_version != 1 {
+            return Err(invalid(format!(
+                "unsupported subgraph schema {}",
+                sub.schema_version
+            )));
+        }
+        if sub.owner_file != file {
+            return Err(invalid("subgraph owner does not match restore key".into()));
+        }
+        if sub.symbols.iter().any(|symbol| symbol.file != file)
+            || sub.intra_edges.iter().any(|edge| edge.occ.file != file)
+            || sub.pending.iter().any(|pending| pending.occ.file != file)
+        {
+            return Err(invalid(
+                "subgraph contains facts owned by another file".into(),
+            ));
+        }
         if let Some(old) = self.files.get(&file) {
             self.index.remove_symbols(&old.symbols);
         }
         self.index.insert_symbols(&sub.symbols);
         self.files.insert(file, sub);
+        Ok(())
     }
 
     /// Drop the file `file` from the store, removing its definitions from the
@@ -237,7 +268,7 @@ mod tests {
     fn incremental_matches_batch_same_set() {
         let files = rust_set();
         let store = IncrementalGraph::from_files(&files);
-        let batch = ScopeGraphResolver.resolve(&files);
+        let batch = ScopeGraphResolver.resolve(&files).unwrap();
         assert_multiset_eq(&store.graph(), &batch);
     }
 
@@ -257,7 +288,9 @@ mod tests {
 
         // The store keys by path, so upserting v1 then v2 keeps only v2.
         let store = IncrementalGraph::from_files(&[v1.clone(), v2.clone()]);
-        let batch = ScopeGraphResolver.resolve(&[v1.clone(), v2.clone()]);
+        let batch = ScopeGraphResolver
+            .resolve(&[v1.clone(), v2.clone()])
+            .unwrap();
         assert_multiset_eq(&store.graph(), &batch);
 
         // The surviving graph reflects v2 (`second`), not v1 (`first`).
@@ -281,7 +314,7 @@ mod tests {
 
         // Tier-A over the duplicate set must not emit two symbols with the SAME
         // SymbolId (a duplicate identity, since the id derives from file + descriptors).
-        let tier_a = SymbolTableResolver.resolve(&[v1, v2]);
+        let tier_a = SymbolTableResolver.resolve(&[v1, v2]).unwrap();
         let mut ids: Vec<String> = tier_a
             .symbols
             .iter()
@@ -326,7 +359,7 @@ mod tests {
             .unwrap();
         store.upsert(&b_new);
 
-        let batch = ScopeGraphResolver.resolve(&[a, b_new, c]);
+        let batch = ScopeGraphResolver.resolve(&[a, b_new, c]).unwrap();
         assert_multiset_eq(&store.graph(), &batch);
     }
 
@@ -338,7 +371,7 @@ mod tests {
 
         let conf = files[0].clone();
         let util = files[2].clone();
-        let batch = ScopeGraphResolver.resolve(&[conf, util]);
+        let batch = ScopeGraphResolver.resolve(&[conf, util]).unwrap();
         assert_multiset_eq(&store.graph(), &batch);
 
         // Nothing from src/app.rs survives in symbols or edges.
@@ -385,6 +418,22 @@ mod tests {
 
         // The reloaded store must yield an identical graph (order-independent).
         assert_multiset_eq(&restored.graph(), &store.graph());
+    }
+
+    #[test]
+    fn restoring_a_subgraph_under_a_different_key_leaves_existing_state_unchanged() {
+        let original = RustExtractor
+            .extract("pub fn original() {}", "src/original.rs")
+            .unwrap();
+        let replacement = RustExtractor
+            .extract("pub fn replacement() {}", "src/replacement.rs")
+            .unwrap();
+
+        let mut store = IncrementalGraph::from_files(&[original]);
+        let before = store.graph();
+        store.upsert_subgraph("src/other.rs".to_string(), build_subgraph(&replacement));
+
+        assert_multiset_eq(&store.graph(), &before);
     }
 
     #[test]

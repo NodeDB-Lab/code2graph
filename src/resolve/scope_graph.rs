@@ -76,7 +76,8 @@ use super::{Resolver, dedup_files_last_wins};
 pub struct ScopeGraphResolver;
 
 impl Resolver for ScopeGraphResolver {
-    fn resolve(&self, files: &[FileFacts]) -> CodeGraph {
+    fn resolve(&self, files: &[FileFacts]) -> crate::Result<CodeGraph> {
+        crate::validate_file_facts(files)?;
         // A file path identifies a unique source: on duplicate `file` keys, keep
         // the LAST version (matching the IncrementalGraph store's upsert), so
         // batch output never diverges from the store and never emits duplicate
@@ -110,7 +111,7 @@ impl Resolver for ScopeGraphResolver {
         }
         edges.extend(stitch(&all_pending, &index));
 
-        CodeGraph { symbols, edges }
+        Ok(CodeGraph { symbols, edges })
     }
 }
 
@@ -125,6 +126,13 @@ mod tests {
     /// Python: an import disambiguates an otherwise-ambiguous cross-file call —
     /// the scope tier binds the call to the imported definition alone, where the
     /// name tier would fan out to every same-named def.
+    #[test]
+    fn rejects_malformed_facts_at_checked_boundary() {
+        let mut facts = RustExtractor.extract("fn run() {}", "src/a.rs").unwrap();
+        facts.scopes[0].parent = Some(0);
+        assert!(ScopeGraphResolver.resolve(&[facts]).is_err());
+    }
+
     #[test]
     fn python_import_disambiguates_ambiguous_call() {
         use crate::graph::types::RefRole;
@@ -141,7 +149,7 @@ mod tests {
             )
             .unwrap();
 
-        let graph = ScopeGraphResolver.resolve(&[alpha, beta, main]);
+        let graph = ScopeGraphResolver.resolve(&[alpha, beta, main]).unwrap();
         let calls: Vec<_> = graph
             .edges
             .iter()
@@ -179,7 +187,7 @@ mod tests {
             )
             .unwrap();
 
-        let graph = ScopeGraphResolver.resolve(&[alpha, beta, main]);
+        let graph = ScopeGraphResolver.resolve(&[alpha, beta, main]).unwrap();
         let calls: Vec<_> = graph
             .edges
             .iter()
@@ -216,7 +224,7 @@ mod tests {
                 "src/main.rs",
             )
             .unwrap();
-        let graph = ScopeGraphResolver.resolve(&[facts]);
+        let graph = ScopeGraphResolver.resolve(&[facts]).unwrap();
 
         let locals = local_edges(&graph);
         assert_eq!(
@@ -248,7 +256,7 @@ mod tests {
         let second_let = src[first_let + 1..].find("let val").unwrap() + first_let + 1;
         assert!(second_let > first_let);
 
-        let graph = ScopeGraphResolver.resolve(&[facts]);
+        let graph = ScopeGraphResolver.resolve(&[facts]).unwrap();
         let locals = local_edges(&graph);
         assert_eq!(
             locals.len(),
@@ -274,7 +282,7 @@ mod tests {
         let facts = RustExtractor
             .extract("pub fn run(callback: u32) { callback() }", "src/main.rs")
             .unwrap();
-        let graph = ScopeGraphResolver.resolve(&[facts]);
+        let graph = ScopeGraphResolver.resolve(&[facts]).unwrap();
 
         let locals = local_edges(&graph);
         assert_eq!(
@@ -291,7 +299,7 @@ mod tests {
         let facts = RustExtractor
             .extract("pub fn run() { nothing_here() }", "src/main.rs")
             .unwrap();
-        let graph = ScopeGraphResolver.resolve(&[facts]);
+        let graph = ScopeGraphResolver.resolve(&[facts]).unwrap();
         assert!(
             local_edges(&graph).is_empty(),
             "unbound name must not bind to a local"
@@ -305,7 +313,7 @@ mod tests {
             .extract("def f():\n    pass\n", "src/m.py")
             .unwrap();
         let sym_count = facts.symbols.len();
-        let graph = ScopeGraphResolver.resolve(&[facts]);
+        let graph = ScopeGraphResolver.resolve(&[facts]).unwrap();
         assert_eq!(graph.symbols.len(), sym_count);
         assert!(local_edges(&graph).is_empty());
     }
@@ -321,7 +329,7 @@ mod tests {
                 "src/main.rs",
             )
             .unwrap();
-        let graph = ScopeGraphResolver.resolve(&[facts]);
+        let graph = ScopeGraphResolver.resolve(&[facts]).unwrap();
         assert!(
             local_edges(&graph).is_empty(),
             "outer ref must not bind to a block-scoped local"
@@ -335,7 +343,7 @@ mod tests {
         let facts = RustExtractor
             .extract("pub fn run() { helper() }", "src/main.rs")
             .unwrap();
-        let graph = ScopeGraphResolver.resolve(&[facts]);
+        let graph = ScopeGraphResolver.resolve(&[facts]).unwrap();
         assert!(
             local_edges(&graph).is_empty(),
             "unbound name must not produce a local edge"
@@ -354,7 +362,7 @@ mod tests {
                 "src/main.rs",
             )
             .unwrap();
-        let graph = ScopeGraphResolver.resolve(&[facts]);
+        let graph = ScopeGraphResolver.resolve(&[facts]).unwrap();
 
         // Exactly one edge whose source is `run` and target is the real `helper`.
         let def_edges: Vec<&Edge> = graph
@@ -406,7 +414,9 @@ mod tests {
             )
             .unwrap();
 
-        let graph = ScopeGraphResolver.resolve(&[facts_a, facts_b, facts_caller]);
+        let graph = ScopeGraphResolver
+            .resolve(&[facts_a, facts_b, facts_caller])
+            .unwrap();
 
         // Collect all edges whose `from` ends with `run().`.
         let run_edges: Vec<&Edge> = graph
@@ -446,7 +456,7 @@ mod tests {
         // The LOCAL `process` must shadow the Definition — innermost scope wins.
         let src = "pub fn process() {} pub fn run() { let process = make(); process() }";
         let facts = RustExtractor.extract(src, "src/main.rs").unwrap();
-        let graph = ScopeGraphResolver.resolve(&[facts]);
+        let graph = ScopeGraphResolver.resolve(&[facts]).unwrap();
 
         // Exactly one edge from `run`.
         let run_edges: Vec<&Edge> = graph
@@ -496,7 +506,7 @@ mod tests {
             .extract("use conf::Config;\npub fn run() {}", "src/app.rs")
             .unwrap();
 
-        let graph = ScopeGraphResolver.resolve(&[conf, app]);
+        let graph = ScopeGraphResolver.resolve(&[conf, app]).unwrap();
 
         let imports = import_edges(&graph);
         assert_eq!(
@@ -541,7 +551,7 @@ mod tests {
             .extract("package main\nfunc Run() {\n\tHelper()\n}\n", "main.go")
             .unwrap();
 
-        let graph = ScopeGraphResolver.resolve(&[util, main]);
+        let graph = ScopeGraphResolver.resolve(&[util, main]).unwrap();
 
         let edges: Vec<&Edge> = graph
             .edges
@@ -588,7 +598,7 @@ mod tests {
             .extract("use conf::Config;\npub fn run() {}", "src/app.rs")
             .unwrap();
 
-        let graph = ScopeGraphResolver.resolve(&[conf, other, app]);
+        let graph = ScopeGraphResolver.resolve(&[conf, other, app]).unwrap();
 
         let imports = import_edges(&graph);
         assert_eq!(
@@ -625,7 +635,7 @@ mod tests {
             .extract("use missing::Config;\npub fn run() {}", "src/app.rs")
             .unwrap();
 
-        let graph = ScopeGraphResolver.resolve(&[conf, app]);
+        let graph = ScopeGraphResolver.resolve(&[conf, app]).unwrap();
 
         assert!(
             import_edges(&graph).is_empty(),
@@ -646,7 +656,7 @@ mod tests {
             )
             .unwrap();
 
-        let graph = ScopeGraphResolver.resolve(&[facts]);
+        let graph = ScopeGraphResolver.resolve(&[facts]).unwrap();
 
         let self_edges: Vec<_> = graph
             .edges
@@ -696,7 +706,7 @@ mod tests {
             .extract("pub fn run() { mod_a::process() }", "src/caller.rs")
             .unwrap();
 
-        let graph = ScopeGraphResolver.resolve(&[mod_a, mod_b, caller]);
+        let graph = ScopeGraphResolver.resolve(&[mod_a, mod_b, caller]).unwrap();
 
         let run_edges = call_edges_from_run(&graph);
         assert_eq!(
@@ -755,7 +765,7 @@ mod tests {
             .extract("def run\n  Alpha.compute\nend\n", "main.rb")
             .unwrap();
 
-        let graph = ScopeGraphResolver.resolve(&[alpha, beta, main]);
+        let graph = ScopeGraphResolver.resolve(&[alpha, beta, main]).unwrap();
         let call_edges: Vec<_> = graph
             .edges
             .iter()
@@ -796,7 +806,7 @@ mod tests {
             .extract("pub fn run() { missing::process() }", "src/caller.rs")
             .unwrap();
 
-        let graph = ScopeGraphResolver.resolve(&[conf, caller]);
+        let graph = ScopeGraphResolver.resolve(&[conf, caller]).unwrap();
 
         let run_edges = call_edges_from_run(&graph);
         assert!(
@@ -820,7 +830,7 @@ mod tests {
                 "src/main.rs",
             )
             .unwrap();
-        let graph = ScopeGraphResolver.resolve(&[facts]);
+        let graph = ScopeGraphResolver.resolve(&[facts]).unwrap();
 
         let run_edges: Vec<&Edge> = graph
             .edges
@@ -861,7 +871,7 @@ mod tests {
                 "src/main.rs",
             )
             .unwrap();
-        let graph = ScopeGraphResolver.resolve(&[facts]);
+        let graph = ScopeGraphResolver.resolve(&[facts]).unwrap();
 
         // Filter to TypeRef-role edges only.
         let typeref_edges: Vec<&Edge> = graph
@@ -918,7 +928,7 @@ mod tests {
             .extract("pub fn run() { a::b::process() }", "src/caller.rs")
             .unwrap();
 
-        let graph = ScopeGraphResolver.resolve(&[nested, caller]);
+        let graph = ScopeGraphResolver.resolve(&[nested, caller]).unwrap();
 
         let run_edges = call_edges_from_run(&graph);
         assert_eq!(
@@ -959,7 +969,7 @@ mod tests {
                     "src/main.rs",
                 )
                 .unwrap();
-            let graph = ScopeGraphResolver.resolve(&[facts]);
+            let graph = ScopeGraphResolver.resolve(&[facts]).unwrap();
             let locals = local_edges(&graph);
             assert_eq!(locals.len(), 1, "expected one local edge for 'buffer'");
             assert_eq!(
@@ -974,7 +984,7 @@ mod tests {
             let facts = RustExtractor
                 .extract("pub fn run(handler: u32) { handler() }", "src/main.rs")
                 .unwrap();
-            let graph = ScopeGraphResolver.resolve(&[facts]);
+            let graph = ScopeGraphResolver.resolve(&[facts]).unwrap();
             let locals = local_edges(&graph);
             assert_eq!(locals.len(), 1, "expected one local edge for 'handler'");
             assert_eq!(
@@ -992,7 +1002,7 @@ mod tests {
                     "src/main.rs",
                 )
                 .unwrap();
-            let graph = ScopeGraphResolver.resolve(&[facts]);
+            let graph = ScopeGraphResolver.resolve(&[facts]).unwrap();
             let def_edges: Vec<&Edge> = graph
                 .edges
                 .iter()
@@ -1022,7 +1032,7 @@ mod tests {
             let app = RustExtractor
                 .extract("use service::Service;\npub fn run() {}", "src/app.rs")
                 .unwrap();
-            let graph = ScopeGraphResolver.resolve(&[service, app]);
+            let graph = ScopeGraphResolver.resolve(&[service, app]).unwrap();
             let imports = import_edges(&graph);
             assert_eq!(imports.len(), 1, "expected one import edge for 'Service'");
             assert_eq!(
@@ -1040,7 +1050,7 @@ mod tests {
             let caller = RustExtractor
                 .extract("pub fn run() { util::validate() }", "src/caller.rs")
                 .unwrap();
-            let graph = ScopeGraphResolver.resolve(&[util, caller]);
+            let graph = ScopeGraphResolver.resolve(&[util, caller]).unwrap();
             let run_edges = call_edges_from_run(&graph);
             assert_eq!(
                 run_edges.len(),

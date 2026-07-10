@@ -10,7 +10,7 @@
 //! lookup has a UNIQUE match — Tier-B never fakes precision (zero or ambiguous →
 //! no edge).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::graph::types::{Edge, Provenance, RefRole, Symbol, SymbolKind};
 use crate::symbol::SymbolId;
@@ -23,13 +23,13 @@ use super::subgraph::PendingRef;
 /// it can be maintained incrementally (next unit adds add/remove).
 #[derive(Default)]
 pub(crate) struct GlobalIndex {
-    by_name: HashMap<String, Vec<SymbolId>>,
+    by_name: HashMap<String, HashSet<SymbolId>>,
     /// Module-name → the module SymbolIds sharing that name. Kept separate from
     /// `by_name` because module symbols have a `Namespace`-only id (no leaf
     /// name, so they never land in `by_name`) and because a `ModuleRef` must
     /// resolve ONLY to a module — never to a same-named function, and vice
     /// versa. Keyed by the module's `name` field (the last `Namespace` segment).
-    modules_by_name: HashMap<String, Vec<SymbolId>>,
+    modules_by_name: HashMap<String, HashSet<SymbolId>>,
 }
 
 impl GlobalIndex {
@@ -57,23 +57,19 @@ impl GlobalIndex {
     /// [`from_symbols`]: GlobalIndex::from_symbols
     pub(crate) fn insert_symbols(&mut self, symbols: &[Symbol]) {
         for s in symbols {
-            // Module symbols are ALSO indexed by module name in a separate index
-            // so a `ModuleRef` can match ONLY modules. They additionally keep
-            // their normal `by_name` entry below (when they carry a leaf name, as
-            // some languages' module symbols do) so non-`ModuleRef` references
-            // that target a module — e.g. an HCL `module.vpc.id` TypeRef — still
-            // resolve.
+            // A module belongs exclusively to the module target domain. Ordinary
+            // calls/reads/writes/imports must never become ambiguous because a
+            // same-named module exists.
             if s.kind == SymbolKind::Module {
                 self.modules_by_name
                     .entry(s.name.clone())
                     .or_default()
-                    .push(s.id.clone());
-            }
-            if let Some(n) = s.id.leaf_name() {
+                    .insert(s.id.clone());
+            } else if let Some(n) = s.id.leaf_name() {
                 self.by_name
                     .entry(n.to_string())
                     .or_default()
-                    .push(s.id.clone());
+                    .insert(s.id.clone());
             }
         }
     }
@@ -84,31 +80,28 @@ impl GlobalIndex {
     /// reflects only the current file set.
     ///
     /// Order within a bucket is irrelevant — [`unique_match`] is order-independent
-    /// and returns `None` on ambiguity — so removal uses `swap_remove`. A bucket
+    /// and returns `None` on ambiguity — so hash-set removal is O(1). A bucket
     /// that empties is dropped so the map never leaks empty keys.
     ///
     /// [`unique_match`]: GlobalIndex::unique_match
     pub(crate) fn remove_symbols(&mut self, symbols: &[Symbol]) {
         for s in symbols {
-            // Mirror `insert_symbols`: a module symbol is dropped from
-            // `modules_by_name` AND (if it carried a leaf name) from `by_name`.
+            // Mirror `insert_symbols`: modules live only in `modules_by_name`.
             if s.kind == SymbolKind::Module {
                 if let Some(bucket) = self.modules_by_name.get_mut(&s.name) {
-                    if let Some(pos) = bucket.iter().position(|id| id == &s.id) {
-                        bucket.swap_remove(pos);
-                    }
+                    bucket.remove(&s.id);
                     if bucket.is_empty() {
                         self.modules_by_name.remove(&s.name);
                     }
                 }
             }
-            if let Some(n) = s.id.leaf_name() {
-                if let Some(bucket) = self.by_name.get_mut(n) {
-                    if let Some(pos) = bucket.iter().position(|id| id == &s.id) {
-                        bucket.swap_remove(pos);
-                    }
-                    if bucket.is_empty() {
-                        self.by_name.remove(n);
+            if s.kind != SymbolKind::Module {
+                if let Some(n) = s.id.leaf_name() {
+                    if let Some(bucket) = self.by_name.get_mut(n) {
+                        bucket.remove(&s.id);
+                        if bucket.is_empty() {
+                            self.by_name.remove(n);
+                        }
                     }
                 }
             }
@@ -184,6 +177,11 @@ pub(crate) fn stitch(pending: &[PendingRef], index: &GlobalIndex) -> Vec<Edge> {
         // match disjoint — a ModuleRef can never bind a function, nor a Call a module.
         let matched = match p.role {
             RefRole::ModuleRef => index.unique_module_match(&p.name, &p.segs),
+            // HCL and similar DSLs use type-like references to modules. Prefer
+            // a unique module target, then retain ordinary type lookup.
+            RefRole::TypeRef => index
+                .unique_module_match(&p.name, &p.segs)
+                .or_else(|| index.unique_match(&p.name, &p.segs)),
             _ if p.qualified => index.unique_qualified_match(&p.name, &p.segs),
             _ => index.unique_match(&p.name, &p.segs),
         };
@@ -403,5 +401,56 @@ mod tests {
             module_refs, 0,
             "two modules named `util` → ModuleRef must resolve to no edge"
         );
+    }
+
+    #[test]
+    fn callable_lookup_stays_unique_when_a_module_has_the_same_name() {
+        let lib = RustExtractor
+            .extract(
+                "mod helper;\nuse helper::helper;\npub fn run() { helper(); }",
+                "src/lib.rs",
+            )
+            .unwrap();
+        let helper = RustExtractor
+            .extract("pub fn helper() {}", "src/helper.rs")
+            .unwrap();
+        let lib_sub = build_subgraph(&lib);
+        let helper_sub = build_subgraph(&helper);
+
+        let mut index = GlobalIndex::new();
+        index.insert_symbols(&lib_sub.symbols);
+        index.insert_symbols(&helper_sub.symbols);
+        let edges = stitch(&lib_sub.pending, &index);
+
+        let calls: Vec<_> = edges
+            .iter()
+            .filter(|edge| edge.role == RefRole::Call)
+            .collect();
+        assert_eq!(
+            calls.len(),
+            1,
+            "a unique callable must not become ambiguous because of a same-named module"
+        );
+        let callable = helper_sub
+            .symbols
+            .iter()
+            .find(|symbol| symbol.kind == SymbolKind::Function && symbol.name == "helper")
+            .expect("helper function extracted");
+        assert_eq!(calls[0].to, callable.id);
+
+        let module_refs: Vec<_> = edges
+            .iter()
+            .filter(|edge| edge.role == RefRole::ModuleRef)
+            .collect();
+        assert!(
+            !module_refs.is_empty(),
+            "the module reference must still resolve"
+        );
+        let module = helper_sub
+            .symbols
+            .iter()
+            .find(|symbol| symbol.kind == SymbolKind::Module)
+            .expect("helper module extracted");
+        assert!(module_refs.iter().all(|edge| edge.to == module.id));
     }
 }

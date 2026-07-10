@@ -798,7 +798,7 @@ module "vpc" { source = "./vpc" }
 
         let src = "module \"vpc\" {\n  source = \"./vpc\"\n}\n\nresource \"aws_instance\" \"web\" {\n  vpc_id = module.vpc.id\n}\n";
         let facts = HclExtractor.extract(src, "infra/main.tf").unwrap();
-        let graph = ScopeGraphResolver.resolve(&[facts]);
+        let graph = ScopeGraphResolver.resolve(&[facts]).unwrap();
 
         // Collect TypeRef edges whose `to` SCIP string contains "module/vpc".
         let typeref_edges: Vec<_> = graph

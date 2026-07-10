@@ -19,7 +19,9 @@
 
 use std::collections::HashMap;
 
-use crate::graph::types::{CodeGraph, Confidence, Edge, FileFacts, Provenance, RefRole, Symbol};
+use crate::graph::types::{
+    CodeGraph, Confidence, Edge, FileFacts, Provenance, RefRole, Symbol, SymbolKind,
+};
 
 use super::Resolver;
 use super::{
@@ -31,7 +33,8 @@ use super::{
 pub struct SymbolTableResolver;
 
 impl Resolver for SymbolTableResolver {
-    fn resolve(&self, files: &[FileFacts]) -> CodeGraph {
+    fn resolve(&self, files: &[FileFacts]) -> crate::Result<CodeGraph> {
+        crate::validate_file_facts(files)?;
         // A file path identifies a unique source: on duplicate `file` keys, keep
         // the LAST version (matching the IncrementalGraph store's upsert). Bind
         // once so symbol collection and the reference loop below iterate the same
@@ -45,12 +48,21 @@ impl Resolver for SymbolTableResolver {
             .flat_map(|f| f.symbols.iter().cloned())
             .collect();
 
+        // Ordinary references and module references have disjoint target domains.
+        // This prevents a file/module symbol from polluting callable/value lookup.
         let mut by_name: HashMap<&str, Vec<usize>> = HashMap::new();
+        // Type references may legitimately name a module/type-like container.
+        let mut type_by_name: HashMap<&str, Vec<usize>> = HashMap::new();
+        let mut modules_by_name: HashMap<&str, Vec<usize>> = HashMap::new();
         // Per-file symbol index for caller attribution (span containment).
         let mut by_file: HashMap<&str, Vec<usize>> = HashMap::new();
         for (i, s) in symbols.iter().enumerate() {
-            if let Some(name) = s.id.leaf_name() {
+            if s.kind == SymbolKind::Module {
+                modules_by_name.entry(s.name.as_str()).or_default().push(i);
+                type_by_name.entry(s.name.as_str()).or_default().push(i);
+            } else if let Some(name) = s.id.leaf_name() {
                 by_name.entry(name).or_default().push(i);
+                type_by_name.entry(name).or_default().push(i);
             }
             by_file.entry(s.file.as_str()).or_default().push(i);
         }
@@ -66,8 +78,13 @@ impl Resolver for SymbolTableResolver {
                     continue; // reference not inside any extracted symbol — unattributable
                 };
 
-                let Some(targets) = by_name.get(r.name.as_str()) else {
-                    continue; // unresolved: no definition with this name
+                let targets = match r.role {
+                    RefRole::ModuleRef => modules_by_name.get(r.name.as_str()),
+                    RefRole::TypeRef => type_by_name.get(r.name.as_str()),
+                    _ => by_name.get(r.name.as_str()),
+                };
+                let Some(targets) = targets else {
+                    continue; // unresolved: no definition in this reference's target domain
                 };
 
                 // Count non-self candidates and compute import-path
@@ -132,7 +149,7 @@ impl Resolver for SymbolTableResolver {
             }
         }
 
-        CodeGraph { symbols, edges }
+        Ok(CodeGraph { symbols, edges })
     }
 }
 
@@ -152,7 +169,7 @@ mod tests {
             .extract("pub fn run() -> u32 { helper() }", "src/main.rs")
             .unwrap();
 
-        let graph = SymbolTableResolver.resolve(&[lib, main]);
+        let graph = SymbolTableResolver.resolve(&[lib, main]).unwrap();
 
         // one Call edge: run → helper
         let calls: Vec<_> = graph
@@ -175,7 +192,7 @@ mod tests {
         let main = RustExtractor
             .extract("pub fn run() { nonexistent_fn() }", "src/main.rs")
             .unwrap();
-        let graph = SymbolTableResolver.resolve(&[main]);
+        let graph = SymbolTableResolver.resolve(&[main]).unwrap();
         assert!(graph.edges.is_empty());
     }
 
@@ -191,7 +208,7 @@ mod tests {
             )
             .unwrap();
 
-        let graph = SymbolTableResolver.resolve(&[base, sub]);
+        let graph = SymbolTableResolver.resolve(&[base, sub]).unwrap();
 
         // exactly one IsImplementation edge: Sub → Base
         let inherits: Vec<_> = graph
@@ -226,7 +243,7 @@ mod tests {
             .extract("pub struct P;\nimpl Greet for P {}", "src/p.rs")
             .unwrap();
 
-        let graph = SymbolTableResolver.resolve(&[greet, p]);
+        let graph = SymbolTableResolver.resolve(&[greet, p]).unwrap();
 
         // Exactly one IsImplementation edge: P → Greet
         let inherits: Vec<_> = graph
@@ -270,7 +287,7 @@ mod tests {
             .extract("from pkg.models import Config\n", "src/app.py")
             .unwrap();
 
-        let graph = SymbolTableResolver.resolve(&[a, b]);
+        let graph = SymbolTableResolver.resolve(&[a, b]).unwrap();
 
         // Exactly one Import edge: module(app) → Config
         let imports: Vec<_> = graph
@@ -331,7 +348,7 @@ mod tests {
             type_ref_ctx: None,
         });
 
-        let graph = SymbolTableResolver.resolve(&[a, b]);
+        let graph = SymbolTableResolver.resolve(&[a, b]).unwrap();
 
         // Exactly one Import edge: module(app) → Config
         let imports: Vec<_> = graph
@@ -369,7 +386,7 @@ mod tests {
             .extract("pub fn run() { process() }", "src/main.rs")
             .unwrap();
 
-        let graph = SymbolTableResolver.resolve(&[a, b, caller]);
+        let graph = SymbolTableResolver.resolve(&[a, b, caller]).unwrap();
 
         // Filter to Call edges only (exclude any IsImplementation/Import noise).
         let calls: Vec<_> = graph
@@ -446,7 +463,7 @@ mod tests {
             )
             .unwrap();
 
-        let graph = SymbolTableResolver.resolve(&[a, b, c]);
+        let graph = SymbolTableResolver.resolve(&[a, b, c]).unwrap();
 
         let imports: Vec<_> = graph
             .edges
@@ -517,7 +534,7 @@ mod tests {
             )
             .unwrap();
 
-        let graph = SymbolTableResolver.resolve(&[a, b, c]);
+        let graph = SymbolTableResolver.resolve(&[a, b, c]).unwrap();
 
         let imports: Vec<_> = graph
             .edges
@@ -557,7 +574,7 @@ mod tests {
             .extract("pub fn run(cfg: Config) {}", "src/app.rs")
             .unwrap();
 
-        let graph = SymbolTableResolver.resolve(&[a, b]);
+        let graph = SymbolTableResolver.resolve(&[a, b]).unwrap();
 
         // Filter to TypeRef-role edges only.
         let typeref_edges: Vec<_> = graph
@@ -614,7 +631,7 @@ mod tests {
             .extract("SELECT * FROM users;", "db/query.sql")
             .unwrap();
 
-        let graph = SymbolTableResolver.resolve(&[schema, query]);
+        let graph = SymbolTableResolver.resolve(&[schema, query]).unwrap();
 
         // Expect exactly one TypeRef edge whose `to` ends with `users#`.
         let typeref_edges: Vec<_> = graph
@@ -680,7 +697,7 @@ mod tests {
             rust_file.references
         );
 
-        let graph = SymbolTableResolver.resolve(&[schema, rust_file]);
+        let graph = SymbolTableResolver.resolve(&[schema, rust_file]).unwrap();
 
         // The edge must resolve to the SQL table's SCIP string (ends with `users#`).
         let edges_to_sql_table: Vec<_> = graph
@@ -742,7 +759,7 @@ resource "aws_instance" "web" { subnet_id = aws_subnet.main.id }
             )
             .unwrap();
 
-        let graph = SymbolTableResolver.resolve(&[hcl]);
+        let graph = SymbolTableResolver.resolve(&[hcl]).unwrap();
 
         // Expect exactly one TypeRef edge whose `to` ends with `aws_subnet/main#`.
         let typeref_edges: Vec<_> = graph
@@ -806,7 +823,7 @@ resource "aws_instance" "web" { vpc_id = module.vpc.id }
             )
             .unwrap();
 
-        let graph = SymbolTableResolver.resolve(&[hcl]);
+        let graph = SymbolTableResolver.resolve(&[hcl]).unwrap();
 
         let typeref_edges: Vec<_> = graph
             .edges
@@ -865,7 +882,7 @@ resource "aws_instance" "web" { vpc_id = module.vpc.id }
             )
             .unwrap();
 
-        let graph = SymbolTableResolver.resolve(&[a, b]);
+        let graph = SymbolTableResolver.resolve(&[a, b]).unwrap();
 
         let imports: Vec<_> = graph
             .edges
@@ -879,6 +896,65 @@ resource "aws_instance" "web" { vpc_id = module.vpc.id }
             imports[0].confidence,
             Confidence::Scoped,
             "single-candidate import should be Scoped"
+        );
+    }
+
+    #[test]
+    fn ordinary_references_do_not_target_same_named_modules() {
+        let lib = RustExtractor
+            .extract(
+                "mod helper;\nuse helper::helper;\npub fn run() { helper(); }",
+                "src/lib.rs",
+            )
+            .unwrap();
+        let helper = RustExtractor
+            .extract("pub fn helper() {}", "src/helper.rs")
+            .unwrap();
+
+        let graph = SymbolTableResolver.resolve(&[lib, helper]).unwrap();
+        let ordinary_roles = [
+            RefRole::Call,
+            RefRole::Import,
+            RefRole::Read,
+            RefRole::Write,
+        ];
+        let ordinary_targets: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|edge| {
+                ordinary_roles.contains(&edge.role) && edge.to.leaf_name() == Some("helper")
+            })
+            .collect();
+
+        assert!(
+            !ordinary_targets.is_empty(),
+            "the callable helper must remain available to ordinary references"
+        );
+        assert!(
+            ordinary_targets.iter().all(|edge| {
+                graph
+                    .symbols
+                    .iter()
+                    .find(|symbol| symbol.id == edge.to)
+                    .is_some_and(|symbol| symbol.kind != SymbolKind::Module)
+            }),
+            "ordinary references must exclude a same-named module target"
+        );
+
+        let module_targets: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.role == RefRole::ModuleRef)
+            .collect();
+        assert!(
+            module_targets.iter().all(|edge| {
+                graph
+                    .symbols
+                    .iter()
+                    .find(|symbol| symbol.id == edge.to)
+                    .is_some_and(|symbol| symbol.kind == SymbolKind::Module)
+            }),
+            "module references must target only module symbols"
         );
     }
 }

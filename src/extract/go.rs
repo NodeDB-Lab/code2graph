@@ -258,7 +258,7 @@ fn collect_symbols(
                     .collect();
                 descriptors.push(Descriptor::Method {
                     name: name.clone(),
-                    disambiguator: String::new(),
+                    disambiguator: crate::symbol::MethodDisambiguator::empty(),
                 });
                 let mut sym = make_symbol(
                     ctx,
@@ -284,7 +284,7 @@ fn collect_symbols(
                     .collect();
                 descriptors.push(Descriptor::Method {
                     name: name.clone(),
-                    disambiguator: String::new(),
+                    disambiguator: crate::symbol::MethodDisambiguator::empty(),
                 });
                 let mut sym = make_symbol(
                     ctx,

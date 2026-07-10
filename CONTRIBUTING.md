@@ -30,7 +30,7 @@ use code2graph::{extract_path, resolve::{Resolver, SymbolTableResolver}};
 
 let a = extract_path("src/util.rs", "pub fn helper() {}")?;
 let b = extract_path("src/main.rs", "pub fn run() { helper() }")?;
-let graph = SymbolTableResolver.resolve(&[a, b]); // run --calls--> helper
+let graph = SymbolTableResolver.resolve(&[a, b])?; // run --calls--> helper
 ```
 
 ### Core invariants — non-negotiable, enforced in review

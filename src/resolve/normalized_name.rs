@@ -17,14 +17,16 @@ use std::collections::HashMap;
 
 use crate::graph::types::{CodeGraph, Confidence, Edge, FileFacts, Provenance, Symbol};
 
-use super::{Resolver, enclosing_symbol_index};
+use super::{Resolver, dedup_files_last_wins, enclosing_symbol_index};
 
 /// Case-fold resolver. See module docs.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NormalizedNameResolver;
 
 impl Resolver for NormalizedNameResolver {
-    fn resolve(&self, files: &[FileFacts]) -> CodeGraph {
+    fn resolve(&self, files: &[FileFacts]) -> crate::Result<CodeGraph> {
+        crate::validate_file_facts(files)?;
+        let files = dedup_files_last_wins(files);
         // Flatten all symbols across files, mirroring SymbolTableResolver's layout.
         let symbols: Vec<Symbol> = files
             .iter()
@@ -49,7 +51,7 @@ impl Resolver for NormalizedNameResolver {
         }
 
         let mut edges: Vec<Edge> = Vec::new();
-        for f in files {
+        for f in files.iter().copied() {
             let file_syms = by_file.get(f.file.as_str());
             for r in &f.references {
                 // Attribute the reference to its enclosing symbol (the caller).
@@ -90,7 +92,7 @@ impl Resolver for NormalizedNameResolver {
             }
         }
 
-        CodeGraph { symbols, edges }
+        Ok(CodeGraph { symbols, edges })
     }
 }
 
@@ -134,7 +136,7 @@ mod tests {
             type_ref_ctx: None,
         });
 
-        let graph = NormalizedNameResolver.resolve(&[lib, caller]);
+        let graph = NormalizedNameResolver.resolve(&[lib, caller]).unwrap();
 
         let call_edges: Vec<_> = graph
             .edges
@@ -210,7 +212,7 @@ mod tests {
             type_ref_ctx: None,
         });
 
-        let graph = NormalizedNameResolver.resolve(&[lib, caller]);
+        let graph = NormalizedNameResolver.resolve(&[lib, caller]).unwrap();
 
         assert!(
             graph.edges.is_empty(),
@@ -256,7 +258,7 @@ mod tests {
             type_ref_ctx: None,
         });
 
-        let graph = NormalizedNameResolver.resolve(&[lib, caller]);
+        let graph = NormalizedNameResolver.resolve(&[lib, caller]).unwrap();
 
         assert!(
             graph.edges.is_empty(),

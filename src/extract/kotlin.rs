@@ -380,7 +380,7 @@ fn handle_function(
     let mut descriptors = prefix.to_vec();
     descriptors.push(Descriptor::Method {
         name: name.clone(),
-        disambiguator: String::new(),
+        disambiguator: crate::symbol::MethodDisambiguator::empty(),
     });
     push_symbol(out, ctx, &node, name, kind, vis, descriptors);
     if is_main {
@@ -489,7 +489,7 @@ fn handle_secondary_constructor(
     let mut descriptors = prefix.to_vec();
     descriptors.push(Descriptor::Method {
         name: "constructor".to_owned(),
-        disambiguator: String::new(),
+        disambiguator: crate::symbol::MethodDisambiguator::empty(),
     });
     push_symbol(
         out,

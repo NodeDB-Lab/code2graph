@@ -147,7 +147,7 @@ fn collect_symbols(
             .collect();
         descriptors.push(Descriptor::Method {
             name: name.clone(),
-            disambiguator: String::new(),
+            disambiguator: crate::symbol::MethodDisambiguator::empty(),
         });
         let signature = one_line_signature(node_text(&child, ctx.bytes), &['{']);
         out.push(make_symbol(

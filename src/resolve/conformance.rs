@@ -41,7 +41,7 @@ use crate::graph::types::{
 use crate::symbol::SymbolId;
 
 use super::Resolver;
-use super::enclosing_symbol_index;
+use super::{dedup_files_last_wins, enclosing_symbol_index};
 
 /// Inherited-member recall resolver. See module docs.
 #[derive(Debug, Default, Clone, Copy)]
@@ -76,7 +76,9 @@ fn member_of_type(sym: &Symbol) -> Option<(String /* type */, String /* member *
 }
 
 impl Resolver for ConformanceResolver {
-    fn resolve(&self, files: &[FileFacts]) -> CodeGraph {
+    fn resolve(&self, files: &[FileFacts]) -> crate::Result<CodeGraph> {
+        crate::validate_file_facts(files)?;
+        let files = dedup_files_last_wins(files);
         // ── 1. Flatten all symbols + a per-file index for caller attribution ──
         let symbols: Vec<Symbol> = files
             .iter()
@@ -102,7 +104,7 @@ impl Resolver for ConformanceResolver {
 
         // ── 3. type name → [supertype bare names] (insertion order preserved) ─
         let mut supertypes: HashMap<String, Vec<String>> = HashMap::new();
-        for f in files {
+        for f in files.iter().copied() {
             let file_syms = by_file.get(f.file.as_str());
             for r in &f.references {
                 if r.role != RefRole::IsImplementation {
@@ -126,7 +128,7 @@ impl Resolver for ConformanceResolver {
 
         // ── 4. emit conformance edges for type-qualified member uses ──────────
         let mut edges: Vec<Edge> = Vec::new();
-        for f in files {
+        for f in files.iter().copied() {
             let file_syms = by_file.get(f.file.as_str());
             for r in &f.references {
                 // Only the honest, type-qualified cases (no receiver inference).
@@ -179,7 +181,7 @@ impl Resolver for ConformanceResolver {
             }
         }
 
-        CodeGraph { symbols, edges }
+        Ok(CodeGraph { symbols, edges })
     }
 }
 
@@ -289,7 +291,7 @@ mod tests {
             .references
             .push(qualified_call("process", "Sub", "src/p/Caller.java", byte));
 
-        let graph = ConformanceResolver.resolve(&[base, sub, caller]);
+        let graph = ConformanceResolver.resolve(&[base, sub, caller]).unwrap();
 
         let conf_edges: Vec<_> = graph
             .edges
@@ -360,7 +362,9 @@ mod tests {
             .references
             .push(qualified_call("process", "Sub", "src/p/Caller.java", byte));
 
-        let graph = ConformanceResolver.resolve(&[root, base, sub, caller]);
+        let graph = ConformanceResolver
+            .resolve(&[root, base, sub, caller])
+            .unwrap();
         let conf_edges: Vec<_> = graph
             .edges
             .iter()
@@ -406,7 +410,7 @@ mod tests {
             .references
             .push(qualified_call("process", "Base", "src/p/Caller.java", byte));
 
-        let graph = ConformanceResolver.resolve(&[base, caller]);
+        let graph = ConformanceResolver.resolve(&[base, caller]).unwrap();
         let conf_edges: Vec<_> = graph
             .edges
             .iter()
@@ -459,7 +463,7 @@ mod tests {
             )
             .unwrap();
 
-        let graph = ConformanceResolver.resolve(&[greet, person, main]);
+        let graph = ConformanceResolver.resolve(&[greet, person, main]).unwrap();
 
         let conf_edges: Vec<_> = graph
             .edges
@@ -543,7 +547,7 @@ mod tests {
         unq.qualifier = None;
         caller.references.push(unq);
 
-        let graph = ConformanceResolver.resolve(&[base, sub, caller]);
+        let graph = ConformanceResolver.resolve(&[base, sub, caller]).unwrap();
         assert!(
             graph
                 .edges

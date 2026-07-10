@@ -230,7 +230,7 @@ fn emit_declaration(
                     SymbolKind::Function,
                     Descriptor::Method {
                         name: n,
-                        disambiguator: String::new(),
+                        disambiguator: crate::symbol::MethodDisambiguator::empty(),
                     },
                 );
             }

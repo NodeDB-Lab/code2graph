@@ -64,6 +64,11 @@ pub(crate) struct PendingRef {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone)]
 pub struct FileSubgraph {
+    /// Persistence format version. Rejecting unknown versions prevents silently
+    /// restoring facts under changed invariants.
+    pub(crate) schema_version: u32,
+    /// File key that owns this isolated subgraph.
+    pub(crate) owner_file: String,
     /// This file's symbols (a clone of `f.symbols`).
     pub(crate) symbols: Vec<Symbol>,
     /// Fully-resolved local/param/same-file-definition edges.
@@ -299,6 +304,8 @@ pub(crate) fn build_subgraph(f: &FileFacts) -> FileSubgraph {
     }
 
     FileSubgraph {
+        schema_version: 1,
+        owner_file: f.file.clone(),
         symbols,
         intra_edges,
         pending,
@@ -318,7 +325,9 @@ fn scope_walk<'b>(
     bindings_by_scope: &HashMap<ScopeId, Vec<&'b Binding>>,
 ) -> Option<&'b Binding> {
     let mut current = start;
-    loop {
+    // Facts may come from deserialization at binding boundaries. A malformed
+    // parent cycle must not turn resolution into an unbounded CPU loop.
+    for _ in 0..scopes.len() {
         if let Some(cands) = bindings_by_scope.get(&current) {
             // Visible candidates in THIS scope, matching the name. On shadowing
             // (multiple matches), the latest introduction wins.
@@ -336,6 +345,8 @@ fn scope_walk<'b>(
             None => return None, // reached root with no match
         }
     }
+    // More parent hops than scopes proves a cycle or malformed index chain.
+    None
 }
 
 /// Visibility: `let` locals are position-gated (must be introduced before use);

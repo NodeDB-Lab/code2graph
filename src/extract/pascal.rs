@@ -398,7 +398,7 @@ fn emit_method(
     let mut descriptors = type_prefix.to_vec();
     descriptors.push(Descriptor::Method {
         name: name.clone(),
-        disambiguator: String::new(),
+        disambiguator: crate::symbol::MethodDisambiguator::empty(),
     });
     out.push(make_symbol(
         ctx,
@@ -456,7 +456,7 @@ fn collect_impl_procs(node: &Node, ctx: &ExtractCtx, prefix: &[Descriptor], out:
                             let mut descriptors = prefix.to_vec();
                             descriptors.push(Descriptor::Method {
                                 name: name.clone(),
-                                disambiguator: String::new(),
+                                disambiguator: crate::symbol::MethodDisambiguator::empty(),
                             });
                             out.push(make_symbol(
                                 ctx,
