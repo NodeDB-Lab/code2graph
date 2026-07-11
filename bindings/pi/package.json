@@ -46,7 +46,7 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test test/**/*.test.ts",
+    "test": "tsx --test test/**/*.test.ts && node --test test/stage-release.test.mjs",
     "test:smoke": "node test/pi-package-smoke.test.mjs",
     "test:pack": "node test/pack.test.mjs",
     "test:all": "npm run typecheck && npm test && npm run test:pack && npm run test:smoke",

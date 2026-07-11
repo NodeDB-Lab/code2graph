@@ -33,6 +33,7 @@ test("npm package allowlist ships only Pi runtime resources", () => {
     !files.some(
       (f) =>
         f.startsWith("test/") ||
+        f.startsWith("scripts/") ||
         f.includes("node_modules") ||
         f.endsWith(".node") ||
         f.includes(".pi/") ||

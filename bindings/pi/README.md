@@ -47,6 +47,16 @@ npm install
 npm run test:all
 ```
 
-The published manifest always names the tested registry core range. Release CI regenerates its lockfile in an isolated staging directory only after that exact core version is available, then packs and smoke-tests the resulting tarball.
+The published manifest always names the tested registry core version. Release CI regenerates its lockfile in an isolated staging directory only after that exact core version is available, then packs and smoke-tests the resulting tarball.
+
+## Release
+
+Pi releases are started manually from GitHub Actions. Use an immutable source commit for `ref` and exact versions without a `v` prefix:
+
+```sh
+gh workflow run release-pi.yml --ref main -f ref=<source-commit-sha> -f core_version=<X.Y.Z-or-supported-prerelease> -f pi_version=<X.Y.Z-or-supported-prerelease>
+```
+
+The equivalent UI action is **Release Pi package** with the source `ref`, exact `core_version`, and exact `pi_version`. Versions must be `X.Y.Z` or `X.Y.Z-(alpha|beta|rc).N` (for example, `0.0.0-beta.8`). The workflow archives the resolved commit into an isolated tree, stamps and tests it against the exact published core package, uploads the tested tarballs and checksum manifest, then publishes. It downloads and exactly compares the registry artifact before it creates or confirms `pi-v<pi_version>` at that commit. Do not create the Pi tag first.
 
 Apache-2.0.

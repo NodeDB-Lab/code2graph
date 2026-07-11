@@ -1,14 +1,28 @@
+# SPDX-License-Identifier: Apache-2.0
 name: Release Pi package
 
 on:
-  push:
-    tags: ["pi-v*"]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to release
+        required: false
+        default: main
+        type: string
+      core_version:
+        description: Exact @nodedb-lab/code2graph version (for example 0.0.0-beta.8)
+        required: true
+        type: string
+      pi_version:
+        description: Exact @nodedb-lab/pi-code2graph version (for example 0.1.1)
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-pi
+  group: release-pi-${{ inputs.pi_version }}
   cancel-in-progress: false
 
 jobs:
@@ -16,53 +30,77 @@ jobs:
     runs-on: ubuntu-latest
     environment: npm
     permissions:
-      contents: read
+      contents: write
       id-token: write
     steps:
       - uses: actions/checkout@v6
         with:
+          ref: ${{ inputs.ref }}
           fetch-depth: 0
       - uses: actions/setup-node@v5
         with:
           node-version: "22"
           registry-url: https://registry.npmjs.org
-      - name: Install Pi package loader
-        run: npm install --global @earendil-works/pi-coding-agent@latest
-      - name: Create one immutable, exact-core staging tree
+      - name: Validate inputs and resolve immutable source
+        shell: bash
+        env:
+          CORE_VERSION: ${{ inputs.core_version }}
+          PI_VERSION: ${{ inputs.pi_version }}
+        run: |
+          set -euo pipefail
+          node bindings/pi/scripts/stage-release.mjs validate "$CORE_VERSION" core_version
+          node bindings/pi/scripts/stage-release.mjs validate "$PI_VERSION" pi_version
+          SOURCE_SHA="$(git rev-parse --verify HEAD^{commit})"
+          printf 'SOURCE_SHA=%s\nCORE_VERSION=%s\nPI_VERSION=%s\nPI_TAG=pi-v%s\n' "$SOURCE_SHA" "$CORE_VERSION" "$PI_VERSION" "$PI_VERSION" >> "$GITHUB_ENV"
+      - name: Confirm exact native package exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(npm view "@nodedb-lab/code2graph@$CORE_VERSION" version)" = "$CORE_VERSION"
+      - name: Create and test isolated release staging tree
         id: stage
         shell: bash
         run: |
           set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#pi-v}"
-          SOURCE_VERSION="$(node -p "require('./bindings/pi/package.json').version")"
-          test "$VERSION" = "$SOURCE_VERSION"
           STAGE="$(mktemp -d)"
-          mkdir -p "$STAGE/source"
-          git archive --format=tar "$GITHUB_SHA" bindings/pi | tar -x -C "$STAGE/source"
+          ARTIFACTS_DIR="$STAGE/artifacts"
+          mkdir -p "$STAGE/source" "$ARTIFACTS_DIR"
+          git archive --format=tar "$SOURCE_SHA" bindings/pi | tar -x -C "$STAGE/source"
           PI_DIR="$STAGE/source/bindings/pi"
-          RANGE="$(node -p "require('$PI_DIR/package.json').dependencies['@nodedb-lab/code2graph']")"
-          CORE="$(npm view "@nodedb-lab/code2graph@$RANGE" version 2>/dev/null || true)"
-          test -n "$CORE"
-          for attempt in $(seq 1 30); do
-            if npm view "@nodedb-lab/code2graph@$CORE" version >/dev/null 2>&1; then break; fi
-            test "$attempt" -lt 30 || { echo "Timed out waiting for @nodedb-lab/code2graph@$CORE" >&2; exit 1; }
-            sleep 10
-          done
+          node bindings/pi/scripts/stage-release.mjs stamp "$PI_DIR/package.json" "$PI_VERSION" "$CORE_VERSION"
           cd "$PI_DIR"
-          npm install --package-lock-only --save-exact "@nodedb-lab/code2graph@$CORE"
+          npm install --package-lock-only --save-exact "@nodedb-lab/code2graph@$CORE_VERSION"
+          node "$GITHUB_WORKSPACE/bindings/pi/scripts/stage-release.mjs" verify package.json package-lock.json "$PI_VERSION" "$CORE_VERSION"
           npm ci
-          test "$(node -p "require('./package.json').dependencies['@nodedb-lab/code2graph']")" = "$CORE"
-          mkdir -p "$STAGE/artifacts"
-          npm pack "@nodedb-lab/code2graph@$CORE" --pack-destination "$STAGE/artifacts"
-          npm pack --pack-destination "$STAGE/artifacts"
-          PI_TARBALL="$(find "$STAGE/artifacts" -maxdepth 1 -name 'nodedb-lab-pi-code2graph-*.tgz' -print -quit)"
-          CORE_TARBALL="$(find "$STAGE/artifacts" -maxdepth 1 -name 'nodedb-lab-code2graph-*.tgz' -print -quit)"
-          test -f "$PI_TARBALL" && test -f "$CORE_TARBALL"
-          printf 'stage=%s\npi_tarball=%s\ncore_tarball=%s\nversion=%s\n' "$STAGE" "$PI_TARBALL" "$CORE_TARBALL" "$VERSION" >> "$GITHUB_OUTPUT"
-      - name: Test exactly the staged source and exact packed artifacts
+          npm pack "@nodedb-lab/code2graph@$CORE_VERSION" --pack-destination "$ARTIFACTS_DIR"
+          npm pack --pack-destination "$ARTIFACTS_DIR"
+          shopt -s nullglob
+          pi_tarballs=("$ARTIFACTS_DIR"/nodedb-lab-pi-code2graph-*.tgz)
+          core_tarballs=("$ARTIFACTS_DIR"/nodedb-lab-code2graph-*.tgz)
+          test "${#pi_tarballs[@]}" -eq 1
+          test "${#core_tarballs[@]}" -eq 1
+          PI_TARBALL="${pi_tarballs[0]}"
+          CORE_TARBALL="${core_tarballs[0]}"
+          node "$GITHUB_WORKSPACE/bindings/pi/scripts/stage-release.mjs" inspect "$CORE_TARBALL" @nodedb-lab/code2graph "$CORE_VERSION"
+          node "$GITHUB_WORKSPACE/bindings/pi/scripts/stage-release.mjs" inspect "$PI_TARBALL" @nodedb-lab/pi-code2graph "$PI_VERSION" "$CORE_VERSION"
+          MANIFEST="$ARTIFACTS_DIR/SHA256SUMS"
+          {
+            printf '# source_sha=%s\n# core_version=%s\n# pi_version=%s\n' "$SOURCE_SHA" "$CORE_VERSION" "$PI_VERSION"
+            cd "$ARTIFACTS_DIR"
+            sha256sum "$(basename "$CORE_TARBALL")" "$(basename "$PI_TARBALL")"
+          } > "$MANIFEST"
+          {
+            printf 'stage=%s\n' "$STAGE"
+            printf 'artifacts_dir=%s\n' "$ARTIFACTS_DIR"
+            printf 'pi_dir=%s\n' "$PI_DIR"
+            printf 'pi_tarball=%s\n' "$PI_TARBALL"
+            printf 'core_tarball=%s\n' "$CORE_TARBALL"
+            printf 'manifest=%s\n' "$MANIFEST"
+          } >> "$GITHUB_OUTPUT"
+      - name: Test exact staged source and packed artifacts
         shell: bash
         env:
-          PI_DIR: ${{ steps.stage.outputs.stage }}/source/bindings/pi
+          PI_DIR: ${{ steps.stage.outputs.pi_dir }}
           CODE2GRAPH_PI_TARBALL: ${{ steps.stage.outputs.pi_tarball }}
           CODE2GRAPH_CORE_TARBALL: ${{ steps.stage.outputs.core_tarball }}
         run: |
@@ -72,18 +110,74 @@ jobs:
           npm test
           npm run test:pack
           npm run test:smoke
-      - name: Publish the tested tarball with provenance
+      - name: Upload tested release artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: pi-release-${{ inputs.pi_version }}
+          path: ${{ steps.stage.outputs.artifacts_dir }}
+          retention-days: 14
+      - name: Publish tested tarball or verify existing release
         shell: bash
         env:
+          STAGE: ${{ steps.stage.outputs.stage }}
+          PI_TARBALL: ${{ steps.stage.outputs.pi_tarball }}
           NPM_CONFIG_PROVENANCE: "true"
-          TARBALL: ${{ steps.stage.outputs.pi_tarball }}
-          VERSION: ${{ steps.stage.outputs.version }}
         run: |
           set -euo pipefail
-          NAME="@nodedb-lab/pi-code2graph"
-          if npm view "$NAME@$VERSION" version >/dev/null 2>&1; then
-            echo "$NAME@$VERSION already published"
-            exit 0
+          NAME=@nodedb-lab/pi-code2graph
+          if npm view "$NAME@$PI_VERSION" version >/dev/null 2>&1; then
+            PUBLISH_DISPOSITION=already-published-identical
+          else
+            case "$PI_VERSION" in *-*) DIST_TAG=next ;; *) DIST_TAG=latest ;; esac
+            if npm publish "$PI_TARBALL" --access public --tag "$DIST_TAG" --provenance; then
+              PUBLISH_DISPOSITION="published-$DIST_TAG"
+            else
+              PUBLISH_DISPOSITION=publish-race-registry-verification
+            fi
           fi
-          case "$VERSION" in *-*) TAG=next ;; *) TAG=latest ;; esac
-          npm publish "$TARBALL" --access public --tag "$TAG" --provenance
+
+          registry_version=
+          for attempt in {1..30}; do
+            registry_version="$(npm view "$NAME@$PI_VERSION" version 2>/dev/null || true)"
+            test "$registry_version" = "$PI_VERSION" && break
+            sleep 2
+          done
+          test "$registry_version" = "$PI_VERSION" || { echo "$NAME@$PI_VERSION was not visible in the registry after polling" >&2; exit 1; }
+
+          npm view "$NAME@$PI_VERSION" dist.integrity dist.shasum --json | tee "$STAGE/artifacts/published-dist.json"
+          REMOTE_DIR="$STAGE/remote"
+          mkdir -p "$REMOTE_DIR"
+          npm pack "$NAME@$PI_VERSION" --pack-destination "$REMOTE_DIR"
+          shopt -s nullglob
+          remote_tarballs=("$REMOTE_DIR"/*.tgz)
+          test "${#remote_tarballs[@]}" -eq 1
+          REMOTE_TARBALL="${remote_tarballs[0]}"
+          node "$GITHUB_WORKSPACE/bindings/pi/scripts/stage-release.mjs" inspect "$REMOTE_TARBALL" "$NAME" "$PI_VERSION" "$CORE_VERSION"
+          node "$GITHUB_WORKSPACE/bindings/pi/scripts/stage-release.mjs" compare "$PI_TARBALL" "$REMOTE_TARBALL"
+          printf 'PUBLISH_DISPOSITION=%s\n' "$PUBLISH_DISPOSITION" >> "$GITHUB_ENV"
+      - name: Create or verify release tag after registry confirmation
+        shell: bash
+        run: |
+          set -euo pipefail
+          REMOTE_SHA="$(git ls-remote origin "refs/tags/$PI_TAG" "refs/tags/$PI_TAG^{}" | awk -v peeled="refs/tags/$PI_TAG^{}" '$2 == peeled {commit=$1} $2 != peeled {direct=$1} END {print commit ? commit : direct}')"
+          if test -z "$REMOTE_SHA"; then
+            git push origin "$SOURCE_SHA:refs/tags/$PI_TAG" || true
+            REMOTE_SHA="$(git ls-remote origin "refs/tags/$PI_TAG" "refs/tags/$PI_TAG^{}" | awk -v peeled="refs/tags/$PI_TAG^{}" '$2 == peeled {commit=$1} $2 != peeled {direct=$1} END {print commit ? commit : direct}')"
+          fi
+          test "$REMOTE_SHA" = "$SOURCE_SHA" || { echo "tag $PI_TAG points at ${REMOTE_SHA:-<missing>}, not $SOURCE_SHA" >&2; exit 1; }
+          echo "TAG_DISPOSITION=tag-confirmed" >> "$GITHUB_ENV"
+      - name: Release summary
+        shell: bash
+        env:
+          PI_TARBALL: ${{ steps.stage.outputs.pi_tarball }}
+        run: |
+          {
+            echo "## Pi release"
+            echo "- Pi: \`@nodedb-lab/pi-code2graph@$PI_VERSION\`"
+            echo "- Core: \`@nodedb-lab/code2graph@$CORE_VERSION\`"
+            echo "- Source: \`$SOURCE_SHA\`"
+            echo "- Tested artifact: \`$PI_TARBALL\`"
+            echo "- Publish: $PUBLISH_DISPOSITION"
+            echo "- Tag: $TAG_DISPOSITION (\`$PI_TAG\`)"
+            echo "- Rerun: Actions → Release Pi package → Run workflow with ref=${{ inputs.ref }}, core_version=$CORE_VERSION, pi_version=$PI_VERSION"
+          } >> "$GITHUB_STEP_SUMMARY"
