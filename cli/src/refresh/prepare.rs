@@ -535,7 +535,7 @@ fn validate_reused(
     Ok(())
 }
 
-fn apply_metadata_budgets(discovery: &mut SourceDiscovery, limits: &ResourceLimits) {
+pub(crate) fn apply_metadata_budgets(discovery: &mut SourceDiscovery, limits: &ResourceLimits) {
     let mut retained = Vec::new();
     let mut total = 0usize;
     for candidate in discovery.candidates.drain(..) {

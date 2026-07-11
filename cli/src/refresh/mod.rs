@@ -4,6 +4,7 @@
 
 mod plan;
 mod prepare;
+mod publish;
 mod resolve;
 mod types;
 
@@ -12,5 +13,6 @@ pub use prepare::{
     FactsExtractor, PrepareCandidateInputs, PreparedRefreshCandidate, ProcessFactsExtractor,
     prepare_refresh_candidate, prepare_refresh_candidate_with,
 };
+pub use publish::{PublishedRefresh, prepare_and_publish, prepare_and_publish_with};
 pub use resolve::{PriorScopeState, ResolveCandidateInputs, ResolvedCandidate, resolve_candidate};
 pub use types::{ExtractionError, MAX_REFRESH_ATTEMPTS};

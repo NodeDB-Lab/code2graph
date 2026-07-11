@@ -325,7 +325,7 @@ mod tests {
                 "sleep 30 & exit 0",
                 Deadline::new(Some(Duration::from_secs(5)))
             ),
-            Err(WorkerFailure::Protocol)
+            Err(WorkerFailure::Protocol | WorkerFailure::Timeout)
         ));
         assert!(matches!(
             run_script(

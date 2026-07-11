@@ -36,6 +36,8 @@ pub enum CliError {
     Timeout,
     #[error("operation cancelled")]
     Cancelled,
+    #[error("partial refresh candidates require explicit allowance")]
+    PartialNotAllowed,
     #[error("worker failure: {0}")]
     Worker(WorkerFailure),
     #[error("{command} execution is not implemented in this contract-only CLI shell")]
@@ -66,6 +68,7 @@ impl CliError {
             | Self::ProjectPathOutsideRoot { .. }
             | Self::Timeout
             | Self::Cancelled
+            | Self::PartialNotAllowed
             | Self::Worker(_)
             | Self::Unavailable { .. }
             | Self::Fatal(_) => ExitCode::Operational,
@@ -80,7 +83,7 @@ impl From<&CliError> for OutputStatus {
             CliError::Ambiguous => Self::Ambiguous,
             CliError::Unsupported(_) | CliError::Unavailable { .. } => Self::Unsupported,
             CliError::Timeout => Self::Timeout,
-            CliError::Cancelled => Self::Error,
+            CliError::Cancelled | CliError::PartialNotAllowed => Self::Error,
             CliError::Usage(_)
             | CliError::Cache(_)
             | CliError::Index(_)
@@ -124,6 +127,7 @@ mod tests {
             },
             CliError::Timeout,
             CliError::Cancelled,
+            CliError::PartialNotAllowed,
             CliError::Worker(WorkerFailure::Spawn),
             CliError::Unavailable {
                 command: "status".into(),
@@ -180,6 +184,7 @@ mod tests {
             ),
             (CliError::Timeout, OutputStatus::Timeout),
             (CliError::Cancelled, OutputStatus::Error),
+            (CliError::PartialNotAllowed, OutputStatus::Error),
             (CliError::Worker(WorkerFailure::Spawn), OutputStatus::Error),
             (
                 CliError::Unavailable {
