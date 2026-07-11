@@ -35,7 +35,10 @@ pub use package_assignment::{
     PackageDiagnosticKind, PackageSourcePath, SourcePackageAssignment, assign_packages,
 };
 pub use project::{ProjectPath, ProjectSelection, SelectionProvenance, select_project};
-pub use refresh::{PriorFileRecord, RefreshDecision, RefreshEntry, RefreshInputs, RefreshPlan};
+pub use refresh::{
+    PriorFileRecord, PriorScopeState, RefreshDecision, RefreshEntry, RefreshInputs, RefreshPlan,
+    ResolveCandidateInputs, ResolvedCandidate, resolve_candidate,
+};
 pub use request::{CliRequest, CommandRequest, Selector, SourcePosition};
 pub use result::{
     CacheDisposition, ConfidenceOutput, ErrorEnvelope, Freshness, ImpactOutput,

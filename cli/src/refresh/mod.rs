@@ -3,6 +3,8 @@
 //! Deterministic metadata-first source refresh planning.
 
 mod plan;
+mod resolve;
 mod types;
 
 pub use plan::{PriorFileRecord, RefreshDecision, RefreshEntry, RefreshInputs, RefreshPlan};
+pub use resolve::{PriorScopeState, ResolveCandidateInputs, ResolvedCandidate, resolve_candidate};
