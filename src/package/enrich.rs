@@ -3,8 +3,8 @@
 //! Dep-free enrichment pass: stamps a [`Package`] onto every [`SymbolId`](crate::symbol::SymbolId)-bearing
 //! field in a [`FileFacts`]. Always compiled (no feature gate).
 
-use crate::graph::types::{BindingTarget, CodeGraph, FileFacts};
-use crate::symbol::Package;
+use crate::graph::types::{BindingTarget, FileFacts};
+use crate::symbol::{Package, SymbolId};
 
 /// Stamp `package` onto every [`SymbolId`](crate::symbol::SymbolId) carried by `facts`.
 ///
@@ -12,10 +12,16 @@ use crate::symbol::Package;
 /// - `facts.symbols[*].id`
 /// - `facts.bindings[*].target` when the target is `BindingTarget::Def(_)`
 /// - `facts.ffi_exports[*].symbol`
+/// - `facts.references[*].source_module` when it is a parseable global SCIP ID
 ///
-/// References, scopes, and non-`Def` binding targets carry no `SymbolId` and
-/// are left untouched.
-pub fn enrich(facts: &mut FileFacts, package: &Package) {
+/// A reference's `source_module` is the rendered identity of the importing
+/// file's module symbol, so it must track the same package rewrite as that
+/// symbol. Local and non-SCIP source-module strings are preserved; `from_path`,
+/// qualifiers, and all other external/import metadata are never package IDs and
+/// are left unchanged. This per-file API is intentionally independent of any
+/// project-wide graph: callers assign a package to each file, then invoke it
+/// before resolution.
+pub fn enrich_file_facts(facts: &mut FileFacts, package: &Package) {
     for sym in &mut facts.symbols {
         sym.id = sym.id.with_package(package.clone());
     }
@@ -27,38 +33,34 @@ pub fn enrich(facts: &mut FileFacts, package: &Package) {
     for export in &mut facts.ffi_exports {
         export.symbol = export.symbol.with_package(package.clone());
     }
+    for reference in &mut facts.references {
+        rewrite_source_module(&mut reference.source_module, package);
+    }
 }
 
-/// Stamp `package` onto every [`SymbolId`](crate::symbol::SymbolId) carried by a
-/// resolved [`CodeGraph`].
-///
-/// Unlike [`enrich`] (which operates on a single file's facts before
-/// resolution), a `CodeGraph`'s edges reference symbols *by* their structural
-/// `SymbolId`. This pass therefore rewrites all three id-bearing slots consistently:
-/// - `graph.symbols[*].id`
-/// - `graph.edges[*].from`
-/// - `graph.edges[*].to`
-///
-/// Both endpoints of every edge get the *same* package as the symbols they
-/// point at, so structural identity relationships are preserved (no edge is broken).
-/// `Local` ids are left unchanged by [`SymbolId::with_package`](crate::symbol::SymbolId::with_package)
-/// — locals have no cross-repo coordinate — which is correct.
-pub fn enrich_codegraph(graph: &mut CodeGraph, package: &Package) {
-    for sym in &mut graph.symbols {
-        sym.id = sym.id.with_package(package.clone());
+fn rewrite_source_module(source_module: &mut Option<String>, package: &Package) {
+    let Some(existing) = source_module else {
+        return;
+    };
+    let Ok(id) = SymbolId::from_scip_string(existing) else {
+        return;
+    };
+    if id.language().is_some() {
+        *existing = id.with_package(package.clone()).to_scip_string();
     }
-    for edge in &mut graph.edges {
-        edge.from = edge.from.with_package(package.clone());
-        edge.to = edge.to.with_package(package.clone());
-    }
+}
+
+/// Backwards-compatible name for [`enrich_file_facts`].
+pub fn enrich(facts: &mut FileFacts, package: &Package) {
+    enrich_file_facts(facts, package);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::graph::types::{
-        Binding, BindingKind, BindingTarget, ByteSpan, FfiAbi, FfiExport, FileFacts, Symbol,
-        SymbolKind, Visibility,
+        Binding, BindingKind, BindingTarget, ByteSpan, FfiAbi, FfiExport, FileFacts, Occurrence,
+        RefRole, Reference, Symbol, SymbolKind, Visibility,
     };
     use crate::symbol::{Descriptor, SymbolId};
 
@@ -123,8 +125,54 @@ mod tests {
         let mut facts = FileFacts {
             file: "src/lib.rs".into(),
             lang: "rust".into(),
-            symbols: vec![make_symbol(sym_id)],
-            references: vec![],
+            symbols: vec![make_symbol(sym_id.clone())],
+            references: vec![
+                Reference {
+                    name: "dep".into(),
+                    occ: Occurrence {
+                        file: "src/lib.rs".into(),
+                        line: 1,
+                        col: 0,
+                        byte: 0,
+                    },
+                    role: RefRole::Import,
+                    source_module: Some(sym_id.to_scip_string()),
+                    from_path: Some("external::dep".into()),
+                    qualifier: Some("external".into()),
+                    scope: None,
+                    type_ref_ctx: None,
+                },
+                Reference {
+                    name: "local".into(),
+                    occ: Occurrence {
+                        file: "src/lib.rs".into(),
+                        line: 1,
+                        col: 1,
+                        byte: 1,
+                    },
+                    role: RefRole::Import,
+                    source_module: Some(SymbolId::local("src/lib.rs", "module").to_scip_string()),
+                    from_path: Some("keep/me".into()),
+                    qualifier: None,
+                    scope: None,
+                    type_ref_ctx: None,
+                },
+                Reference {
+                    name: "opaque".into(),
+                    occ: Occurrence {
+                        file: "src/lib.rs".into(),
+                        line: 1,
+                        col: 2,
+                        byte: 2,
+                    },
+                    role: RefRole::Import,
+                    source_module: Some("not a SCIP id".into()),
+                    from_path: Some("still/external".into()),
+                    qualifier: None,
+                    scope: None,
+                    type_ref_ctx: None,
+                },
+            ],
             scopes: vec![],
             bindings: vec![
                 Binding {
@@ -162,72 +210,73 @@ mod tests {
         assert_eq!(facts.bindings[1].target, BindingTarget::Local);
 
         assert_eq!(facts.ffi_exports[0].symbol.to_scip_string(), expected_scip);
+
+        // The importing module's rendered global ID tracks its definition;
+        // local/opaque IDs and external path metadata stay exactly as supplied.
+        assert_eq!(
+            facts.references[0].source_module.as_deref(),
+            Some(expected_scip)
+        );
+        assert_eq!(
+            facts.references[0].from_path.as_deref(),
+            Some("external::dep")
+        );
+        assert_eq!(facts.references[0].qualifier.as_deref(), Some("external"));
+        assert_eq!(
+            facts.references[1].source_module.as_deref(),
+            Some("local module")
+        );
+        assert_eq!(facts.references[1].from_path.as_deref(), Some("keep/me"));
+        assert_eq!(
+            facts.references[2].source_module.as_deref(),
+            Some("not a SCIP id")
+        );
+        assert_eq!(
+            facts.references[2].from_path.as_deref(),
+            Some("still/external")
+        );
     }
 
     #[test]
-    fn enrich_codegraph_restamps_symbols_and_both_edge_endpoints() {
-        use crate::graph::types::{CodeGraph, Confidence, Edge, Occurrence, Provenance, RefRole};
-
-        let pkg = Package {
-            manager: "cargo".into(),
-            name: "demo".into(),
-            version: "1.0.0".into(),
+    fn per_file_enrichment_supports_mixed_packages_without_graph_context() {
+        let global = SymbolId::global("rust", vec![Descriptor::Term("f".into())]);
+        let local = SymbolId::local("src/a.rs", "local");
+        let mut first = FileFacts {
+            file: "src/a.rs".into(),
+            lang: "rust".into(),
+            symbols: vec![make_symbol(global.clone()), make_symbol(local.clone())],
+            references: vec![],
+            scopes: vec![],
+            bindings: vec![],
+            ffi_exports: vec![],
         };
-
-        let from_id = SymbolId::global("rust", vec![Descriptor::Term("run".into())]);
-        let to_id = SymbolId::global("rust", vec![Descriptor::Term("helper".into())]);
-        // A Local id present as a symbol — must stay unchanged.
-        let local_id = SymbolId::local("src/main.rs", "x0");
-
-        let mut graph = CodeGraph {
-            symbols: vec![
-                make_symbol(from_id.clone()),
-                make_symbol(to_id.clone()),
-                make_symbol(local_id.clone()),
-            ],
-            edges: vec![Edge {
-                from: from_id,
-                to: to_id,
-                role: RefRole::Call,
-                confidence: Confidence::NameOnly,
-                provenance: Provenance::SymbolTable,
-                occ: Occurrence {
-                    file: "src/main.rs".into(),
-                    line: 1,
-                    col: 0,
-                    byte: 0,
-                },
-            }],
+        let mut second = FileFacts {
+            file: "src/b.rs".into(),
+            lang: "rust".into(),
+            symbols: vec![make_symbol(global)],
+            references: vec![],
+            scopes: vec![],
+            bindings: vec![],
+            ffi_exports: vec![],
         };
-
-        enrich_codegraph(&mut graph, &pkg);
-
-        // (1) Every global symbol id now carries the package (no '.' placeholders).
-        assert_eq!(
-            graph.symbols[0].id.to_scip_string(),
-            "codegraph cargo demo 1.0.0 run."
+        enrich_file_facts(
+            &mut first,
+            &Package {
+                manager: "cargo".into(),
+                name: "one".into(),
+                version: "1".into(),
+            },
         );
-        assert_eq!(
-            graph.symbols[1].id.to_scip_string(),
-            "codegraph cargo demo 1.0.0 helper."
+        enrich_file_facts(
+            &mut second,
+            &Package {
+                manager: "npm".into(),
+                name: "two".into(),
+                version: "2".into(),
+            },
         );
-
-        // (3) The Local symbol id is unchanged.
-        assert_eq!(graph.symbols[2].id.to_scip_string(), "local x0");
-        assert_eq!(graph.symbols[2].id, local_id);
-
-        // (2) Both edge endpoints were rewritten and stay consistent with the
-        // enriched symbol ids (string-equality matching preserved).
-        assert_eq!(
-            graph.edges[0].from.to_scip_string(),
-            "codegraph cargo demo 1.0.0 run."
-        );
-        assert_eq!(graph.edges[0].from, graph.symbols[0].id);
-        assert_eq!(graph.edges[0].to, graph.symbols[1].id);
-
-        // SCIP round-trip: the enriched id parses back to the same string.
-        let scip = graph.edges[0].to.to_scip_string();
-        let reparsed = SymbolId::from_scip_string(&scip).expect("should parse");
-        assert_eq!(reparsed.to_scip_string(), scip);
+        assert!(first.symbols[0].id.to_scip_string().contains("cargo one 1"));
+        assert!(second.symbols[0].id.to_scip_string().contains("npm two 2"));
+        assert_eq!(first.symbols[1].id, local);
     }
 }

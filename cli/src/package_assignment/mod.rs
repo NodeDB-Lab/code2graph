@@ -1,0 +1,13 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//! Deterministic package-manifest discovery, assignment, and per-file application.
+
+mod apply;
+mod discover;
+mod types;
+
+pub use discover::assign_packages;
+pub use types::{
+    ManifestInput, ManifestOutcome, ManifestParserKind, PackageAssignmentSet, PackageDiagnostic,
+    PackageDiagnosticKind, SourcePackageAssignment,
+};

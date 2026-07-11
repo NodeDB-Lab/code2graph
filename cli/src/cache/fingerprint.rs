@@ -108,7 +108,7 @@ impl PackageFingerprint {
     /// Hash caller-supplied normalized package inputs.
     ///
     /// Each item must be a complete canonical record. Prefer [`Self::from_selection`]
-    /// when manifest inputs and selected package identities are available separately.
+    /// when manifest inputs and per-source assignments are available separately.
     pub fn from_normalized<I, S>(inputs: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -122,8 +122,12 @@ impl PackageFingerprint {
         Self::digest(values)
     }
 
-    /// Hash normalized manifest inputs and package selections as distinct domains.
-    pub fn from_selection<MI, MS, PI, PS>(manifest_inputs: MI, selected_packages: PI) -> Self
+    /// Hash normalized manifest inputs and per-source package assignments as distinct domains.
+    ///
+    /// Inputs are independently sorted; each domain tag and every field are
+    /// length-prefixed before hashing, so manifest failures and `none`
+    /// assignments are compatibility-significant without exposing source text.
+    pub fn from_selection<MI, MS, PI, PS>(manifest_inputs: MI, selected_assignments: PI) -> Self
     where
         MI: IntoIterator<Item = MS>,
         MS: AsRef<str>,
@@ -136,9 +140,9 @@ impl PackageFingerprint {
             append(&mut row, input.as_ref().as_bytes());
             values.push(row);
         }
-        for package in selected_packages {
-            let mut row = b"selected-package".to_vec();
-            append(&mut row, package.as_ref().as_bytes());
+        for assignment in selected_assignments {
+            let mut row = b"source-assignment".to_vec();
+            append(&mut row, assignment.as_ref().as_bytes());
             values.push(row);
         }
         values.sort();
@@ -266,6 +270,18 @@ mod tests {
         );
         assert_eq!(first, reordered);
         assert_ne!(first, category_swapped);
+    }
+
+    #[test]
+    fn package_fingerprint_changes_for_each_canonical_input_domain() {
+        let baseline =
+            PackageFingerprint::from_selection(["Cargo.toml:hash-a"], ["src/a.rs:Cargo.toml"]);
+        let manifest_changed =
+            PackageFingerprint::from_selection(["Cargo.toml:hash-b"], ["src/a.rs:Cargo.toml"]);
+        let assignment_changed =
+            PackageFingerprint::from_selection(["Cargo.toml:hash-a"], ["src/a.rs:none"]);
+        assert_ne!(baseline, manifest_changed);
+        assert_ne!(baseline, assignment_changed);
     }
 
     #[test]

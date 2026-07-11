@@ -9,6 +9,7 @@ pub mod deadline;
 pub mod error;
 pub mod exit;
 pub mod inventory;
+pub mod package_assignment;
 pub mod project;
 pub mod request;
 pub mod result;
@@ -25,6 +26,10 @@ pub use exit::ExitCode;
 pub use inventory::{
     FileClassification, InventoryCompleteness, InventoryFile, InventorySummary, MtimeHint,
     OmissionReason, OmittedFile, SourceInventory, StableIoErrorKind, build_inventory,
+};
+pub use package_assignment::{
+    ManifestInput, ManifestOutcome, ManifestParserKind, PackageAssignmentSet, PackageDiagnostic,
+    PackageDiagnosticKind, SourcePackageAssignment, assign_packages,
 };
 pub use project::{ProjectPath, ProjectSelection, SelectionProvenance, select_project};
 pub use request::{CliRequest, CommandRequest, Selector, SourcePosition};
