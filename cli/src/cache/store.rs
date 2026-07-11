@@ -2135,7 +2135,7 @@ mod tests {
         assert_eq!(directory_state(&cache_location.directory), before);
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn stores_non_utf8_root_as_native_bytes() {
         use std::ffi::OsStr;
@@ -2152,6 +2152,16 @@ mod tests {
             .query_row("SELECT canonical_root FROM meta", [], |row| row.get(0))
             .expect("stored root");
         assert_eq!(stored, root.as_os_str().as_bytes());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_path_bytes_preserve_invalid_unix_bytes_without_filesystem_access() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let path = Path::new(OsStr::from_bytes(b"/canonical/project-\xff"));
+        assert_eq!(native_path_bytes(path), b"/canonical/project-\xff");
     }
 
     #[cfg(unix)]

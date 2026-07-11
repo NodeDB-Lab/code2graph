@@ -10,4 +10,4 @@ mod windows;
 #[cfg(unix)]
 pub use unix::{configure_command, contain, terminate};
 #[cfg(windows)]
-pub use windows::{Containment, configure_command, contain, terminate};
+pub use windows::{configure_command, contain, terminate};

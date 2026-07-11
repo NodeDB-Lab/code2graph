@@ -7,8 +7,9 @@ use std::os::windows::io::AsRawHandle;
 use std::process::{Child, Command};
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
-    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JobObjectExtendedLimitInformation, SetInformationJobObject,
+    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+    SetInformationJobObject,
 };
 
 pub struct Containment(HANDLE);
@@ -24,6 +25,13 @@ impl Drop for Containment {
 
 pub fn configure_command(_: &mut Command) {}
 
+fn kill_on_close_limits() -> JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+    // SAFETY: the Windows API accepts a zero-initialized limits structure.
+    let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    limits
+}
+
 /// Assigns a child to a kill-on-close Job Object immediately after spawn.
 pub fn contain(child: &mut Child) -> io::Result<Containment> {
     // SAFETY: null attributes/name create an unnamed Job Object.
@@ -32,22 +40,22 @@ pub fn contain(child: &mut Child) -> io::Result<Containment> {
         return Err(io::Error::last_os_error());
     }
     let containment = Containment(job);
-    let mut limits: JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
-    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    let limits = kill_on_close_limits();
     // SAFETY: limits is correctly sized for this information class.
     if unsafe {
         SetInformationJobObject(
             job,
             JobObjectExtendedLimitInformation,
-            &limits as *const _ as *const _,
+            std::ptr::from_ref(&limits).cast(),
             std::mem::size_of_val(&limits) as u32,
         )
     } == 0
     {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: child handle remains valid while Child is alive.
-    if unsafe { AssignProcessToJobObject(job, child.as_raw_handle() as HANDLE) } == 0 {
+    let process: HANDLE = child.as_raw_handle();
+    // SAFETY: the child handle remains valid while Child is alive.
+    if unsafe { AssignProcessToJobObject(job, process) } == 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(containment)
@@ -61,4 +69,52 @@ pub fn terminate(containment: &mut Containment, child: &mut Child) {
         containment.0 = std::ptr::null_mut();
     }
     let _ = child.kill();
+}
+
+#[cfg(test)]
+mod tests {
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use super::*;
+
+    #[test]
+    fn kill_on_close_job_limits_use_the_windows_layout() {
+        let limits = kill_on_close_limits();
+        assert_eq!(
+            limits.BasicLimitInformation.LimitFlags,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        );
+        assert_eq!(
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>(),
+            std::mem::size_of_val(&limits)
+        );
+    }
+
+    #[test]
+    fn closing_job_object_terminates_an_assigned_process() {
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "ping -n 30 127.0.0.1 > NUL"])
+            .spawn()
+            .expect("long-running child");
+        let containment = contain(&mut child).expect("Job Object containment");
+        drop(containment);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = child.try_wait().expect("poll child") {
+                assert!(
+                    !status.success(),
+                    "closing the Job Object must kill the child"
+                );
+                return;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("closing the Job Object did not terminate the child");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
 }
