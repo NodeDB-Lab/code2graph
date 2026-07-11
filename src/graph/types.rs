@@ -217,11 +217,11 @@ pub struct Reference {
     /// from, as written in the source (e.g. `"pkg.models"`, `"std::io"`,
     /// `"./svc"`). `None` for non-import refs or when unavailable.
     pub from_path: Option<String>,
-    /// For a path-qualified call (`mod_a::process()`, `a::b::f()`): the qualifier
-    /// written immediately before the leaf, exactly as in source (e.g. `"mod_a"`,
-    /// `"a::b"`). `None` for unqualified calls and all non-call references. The
-    /// resolver matches this against a candidate symbol's namespace-path suffix;
-    /// the extractor never interprets it.
+    /// For a path-qualified call or type reference (`mod_a::process()`,
+    /// `a::b::Type`): the qualifier written immediately before the leaf, exactly
+    /// as in source (e.g. `"mod_a"`, `"a::b"`). `None` for unqualified
+    /// references and other reference roles. The resolver matches this against a
+    /// candidate symbol's namespace-path suffix; the extractor never interprets it.
     pub qualifier: Option<String>,
     /// The innermost scope enclosing this reference site; `None` until a
     /// scope-aware extractor populates it.

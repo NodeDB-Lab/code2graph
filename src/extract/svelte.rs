@@ -98,10 +98,11 @@ impl Extractor for SvelteExtractor {
             let inner_source =
                 std::str::from_utf8(&bytes[raw_text.byte_range()]).unwrap_or_default();
 
-            // Detect lang="ts"/"typescript" inside the start_tag.
-            let inner_lang = detect_script_lang(&script_el, bytes);
-
-            let mut block_facts = extract_ecmascript(inner_source, file, inner_lang)?;
+            // The embedded parser is TypeScript's JavaScript-superset grammar,
+            // but these definitions belong to the enclosing Svelte document.
+            // Keeping the output language Svelte makes every global identity
+            // agree with the containing FileFacts coordinates.
+            let mut block_facts = extract_ecmascript(inner_source, file, Language::Svelte)?;
             shift_offsets(&mut block_facts, delta, file, "svelte", bytes);
 
             // Merge: fix up ScopeId indices before extending. `scope_base` is >= 1
@@ -179,47 +180,6 @@ fn find_raw_text<'a>(script_el: &Node<'a>) -> Option<Node<'a>> {
         .find(|n| n.kind() == "raw_text")
 }
 
-/// Detect whether `<script lang="ts">` or `<script lang="typescript">` is
-/// present on the script element.  Falls back to [`Language::JavaScript`].
-fn detect_script_lang(script_el: &Node<'_>, bytes: &[u8]) -> Language {
-    let mut cursor = script_el.walk();
-    for child in script_el.children(&mut cursor) {
-        if child.kind() == "start_tag" {
-            let mut tag_cursor = child.walk();
-            for attr in child.children(&mut tag_cursor) {
-                if attr.kind() != "attribute" {
-                    continue;
-                }
-                // Check attribute_name == "lang"
-                let name_matches = {
-                    let mut c = attr.walk();
-                    attr.children(&mut c)
-                        .any(|n| n.kind() == "attribute_name" && &bytes[n.byte_range()] == b"lang")
-                };
-                if !name_matches {
-                    continue;
-                }
-                // Look for quoted_attribute_value → attribute_value
-                let mut attr_cursor = attr.walk();
-                for child2 in attr.children(&mut attr_cursor) {
-                    if child2.kind() == "quoted_attribute_value" {
-                        let mut qav_cursor = child2.walk();
-                        for av in child2.children(&mut qav_cursor) {
-                            if av.kind() == "attribute_value" {
-                                let val = &bytes[av.byte_range()];
-                                if val == b"ts" || val == b"typescript" {
-                                    return Language::TypeScript;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    Language::JavaScript
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,7 +195,7 @@ let count = 0;
     }
 
     #[test]
-    fn extracts_run_symbol_and_reference_lang_ts() {
+    fn extracts_run_symbol_and_reference_with_svelte_identity() {
         let source = svelte_source_with_ts_script();
         let facts = SvelteExtractor
             .extract(source, "src/App.svelte")
@@ -248,11 +208,8 @@ let count = 0;
             .symbols
             .iter()
             .find(|s| s.name == "run" && s.kind == SymbolKind::Function);
-        assert!(
-            run_sym.is_some(),
-            "expected `run` function symbol; got: {:?}",
-            facts.symbols
-        );
+        let run_sym = run_sym.expect("expected `run` function symbol");
+        assert_eq!(run_sym.id.language(), Some("svelte"));
 
         // Must have at least a call/import reference (foo, or import {foo}).
         assert!(

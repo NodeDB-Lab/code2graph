@@ -10,4 +10,6 @@ pub use types::{
     EntryPoint, FfiAbi, FfiExport, FileFacts, Occurrence, Provenance, RefRole, Reference, Scope,
     ScopeId, ScopeKind, Symbol, SymbolKind, TypeRefContext, Visibility,
 };
-pub use validate::validate_file_facts;
+pub use validate::{
+    FileFactsValidationContext, validate_file_facts, validate_file_facts_with_context,
+};
