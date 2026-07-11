@@ -1,0 +1,94 @@
+zenith version=1 doc-id="01KX7BD2176XNTJ7JH33B2SDQA" {
+  project id="proj.code2graph-for-pi" name="code2graph for Pi"
+  assets {
+  }
+  tokens format="zenith-token-v1" {
+    token id="color.base.100" type="color" set="@zenith/theme.cobalt" value="#f7f9fa"
+    token id="color.base.200" type="color" set="@zenith/theme.cobalt" value="#eef2f6"
+    token id="color.base.300" type="color" set="@zenith/theme.cobalt" value="#dfe5ed"
+    token id="color.base.content" type="color" set="@zenith/theme.cobalt" value="#0d1529"
+    token id="color.primary" type="color" set="@zenith/theme.cobalt" value="#605dff"
+    token id="color.primary.content" type="color" set="@zenith/theme.cobalt" value="#edf1fe"
+    token id="color.secondary" type="color" set="@zenith/theme.cobalt" value="#61738d"
+    token id="color.secondary.content" type="color" set="@zenith/theme.cobalt" value="#f7f9fa"
+    token id="color.accent" type="color" set="@zenith/theme.cobalt" value="#00a4f2"
+    token id="color.accent.content" type="color" set="@zenith/theme.cobalt" value="#edf7fd"
+    token id="color.neutral" type="color" set="@zenith/theme.cobalt" value="#1a273a"
+    token id="color.neutral.content" type="color" set="@zenith/theme.cobalt" value="#f7f9fa"
+    token id="color.info" type="color" set="@zenith/theme.cobalt" value="#0082ce"
+    token id="color.info.content" type="color" set="@zenith/theme.cobalt" value="#edf7fd"
+    token id="color.success" type="color" set="@zenith/theme.cobalt" value="#009689"
+    token id="color.success.content" type="color" set="@zenith/theme.cobalt" value="#effcf9"
+    token id="color.warning" type="color" set="@zenith/theme.cobalt" value="#d08700"
+    token id="color.warning.content" type="color" set="@zenith/theme.cobalt" value="#fcfae6"
+    token id="color.error" type="color" set="@zenith/theme.cobalt" value="#ea003e"
+    token id="color.error.content" type="color" set="@zenith/theme.cobalt" value="#fceeef"
+    token id="radius.box" type="dimension" set="@zenith/theme.cobalt" value=(px)32
+    token id="radius.field" type="dimension" set="@zenith/theme.cobalt" value=(px)4
+    token id="radius.selector" type="dimension" set="@zenith/theme.cobalt" value=(px)8
+    token id="border.width" type="dimension" set="@zenith/theme.cobalt" value=(px)1
+    token id="space.unit" type="dimension" set="@zenith/theme.cobalt" value=(px)4
+    token id="font.heading" type="fontFamily" set="@zenith/theme.cobalt" value="Noto Sans"
+    token id="font.body" type="fontFamily" set="@zenith/theme.cobalt" value="Noto Sans"
+    token id="size.h1" type="dimension" set="@zenith/theme.cobalt" value=(px)64
+    token id="size.h2" type="dimension" set="@zenith/theme.cobalt" value=(px)40
+    token id="size.body" type="dimension" set="@zenith/theme.cobalt" value=(px)28
+    token id="size.caption" type="dimension" set="@zenith/theme.cobalt" value=(px)18
+    token id="size.hero" type="dimension" value=(px)58
+    token id="size.kicker" type="dimension" value=(px)20
+    token id="size.node" type="dimension" value=(px)16
+    token id="weight.bold" type="fontWeight" value=700
+    token id="weight.medium" type="fontWeight" value=600
+    token id="radius.node" type="dimension" value=(px)16
+    token id="line.graph" type="dimension" value=(px)3
+  }
+  styles {
+  }
+  document id="doc.code2graph-for-pi" title="code2graph for Pi" {
+    page id="page.1" w=(px)1200 h=(px)675 background=(token)"color.base.100" {
+      rect id="accent.rail" x=(px)0 y=(px)0 w=(px)18 h=(px)675 fill=(token)"color.primary"
+      text id="brand.kicker" x=(px)74 y=(px)68 w=(px)480 h=(px)34 fill=(token)"color.primary" font-family=(token)"font.heading" font-size=(token)"size.kicker" font-weight=(token)"weight.bold" {
+        span "CODE2GRAPH × PI"
+      }
+      text id="hero.title" x=(px)72 y=(px)126 w=(px)560 h=(px)218 fill=(token)"color.base.content" font-family=(token)"font.heading" font-size=(token)"size.hero" font-weight=(token)"weight.bold" overflow="visible" {
+        span "See the structure.\nSpend fewer tokens."
+      }
+      text id="hero.body" x=(px)76 y=(px)380 w=(px)500 h=(px)120 fill=(token)"color.secondary" font-family=(token)"font.body" font-size=(token)"size.body" {
+        span "Deterministic symbols, callers, callees,\nand impact analysis inside Pi."
+      }
+      rect id="install.badge" x=(px)76 y=(px)525 w=(px)470 h=(px)64 fill=(token)"color.neutral" radius=(token)"radius.node"
+      text id="install.text" x=(px)100 y=(px)532 w=(px)430 h=(px)50 fill=(token)"color.neutral.content" font-family=(token)"font.body" font-size=(token)"size.caption" font-weight=(token)"weight.medium" {
+        span "pi install npm:@nodedb-lab/pi-code2graph"
+      }
+      rect id="graph.panel" x=(px)660 y=(px)52 w=(px)482 h=(px)570 fill=(token)"color.base.200" radius=(token)"radius.box"
+      rect id="node.repo" x=(px)806 y=(px)104 w=(px)190 h=(px)68 fill=(token)"color.primary" radius=(token)"radius.node"
+      text id="node.repo.label" x=(px)830 y=(px)126 w=(px)145 h=(px)28 fill=(token)"color.primary.content" font-family=(token)"font.body" font-size=(token)"size.node" font-weight=(token)"weight.bold" align="center" {
+        span "your repository"
+      }
+      rect id="node.symbols" x=(px)712 y=(px)252 w=(px)150 h=(px)64 fill=(token)"color.info" radius=(token)"radius.node"
+      text id="node.symbols.label" x=(px)732 y=(px)272 w=(px)110 h=(px)28 fill=(token)"color.info.content" font-family=(token)"font.body" font-size=(token)"size.node" font-weight=(token)"weight.bold" align="center" {
+        span "symbols"
+      }
+      rect id="node.edges" x=(px)944 y=(px)252 w=(px)150 h=(px)64 fill=(token)"color.success" radius=(token)"radius.node"
+      text id="node.edges.label" x=(px)964 y=(px)272 w=(px)110 h=(px)28 fill=(token)"color.success.content" font-family=(token)"font.body" font-size=(token)"size.node" font-weight=(token)"weight.bold" align="center" {
+        span "edges"
+      }
+      rect id="node.callers" x=(px)708 y=(px)426 w=(px)160 h=(px)64 fill=(token)"color.neutral" radius=(token)"radius.node"
+      text id="node.callers.label" x=(px)728 y=(px)446 w=(px)120 h=(px)28 fill=(token)"color.neutral.content" font-family=(token)"font.body" font-size=(token)"size.node" font-weight=(token)"weight.bold" align="center" {
+        span "callers"
+      }
+      rect id="node.impact" x=(px)938 y=(px)426 w=(px)160 h=(px)64 fill=(token)"color.neutral" radius=(token)"radius.node"
+      text id="node.impact.label" x=(px)958 y=(px)446 w=(px)120 h=(px)28 fill=(token)"color.neutral.content" font-family=(token)"font.body" font-size=(token)"size.node" font-weight=(token)"weight.bold" align="center" {
+        span "impact"
+      }
+      connector id="edge.repo.symbols" from="node.repo" to="node.symbols" route="straight" stroke=(token)"color.primary" stroke-width=(token)"line.graph"
+      connector id="edge.repo.edges" from="node.repo" to="node.edges" route="straight" stroke=(token)"color.primary" stroke-width=(token)"line.graph"
+      connector id="edge.symbols.callers" from="node.symbols" to="node.callers" route="straight" stroke=(token)"color.secondary" stroke-width=(token)"line.graph"
+      connector id="edge.edges.callers" from="node.edges" to="node.callers" route="straight" stroke=(token)"color.secondary" stroke-width=(token)"line.graph"
+      connector id="edge.edges.impact" from="node.edges" to="node.impact" route="straight" stroke=(token)"color.secondary" stroke-width=(token)"line.graph"
+      text id="graph.caption" x=(px)750 y=(px)538 w=(px)305 h=(px)50 fill=(token)"color.secondary" font-family=(token)"font.body" font-size=(token)"size.caption" align="center" {
+        span "local • deterministic • multi-language"
+      }
+    }
+  }
+}

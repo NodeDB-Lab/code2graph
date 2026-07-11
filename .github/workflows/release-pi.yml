@@ -1,0 +1,89 @@
+name: Release Pi package
+
+on:
+  push:
+    tags: ["pi-v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-pi
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          registry-url: https://registry.npmjs.org
+      - name: Install Pi package loader
+        run: npm install --global @earendil-works/pi-coding-agent@latest
+      - name: Create one immutable, exact-core staging tree
+        id: stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#pi-v}"
+          SOURCE_VERSION="$(node -p "require('./bindings/pi/package.json').version")"
+          test "$VERSION" = "$SOURCE_VERSION"
+          STAGE="$(mktemp -d)"
+          mkdir -p "$STAGE/source"
+          git archive --format=tar "$GITHUB_SHA" bindings/pi | tar -x -C "$STAGE/source"
+          PI_DIR="$STAGE/source/bindings/pi"
+          RANGE="$(node -p "require('$PI_DIR/package.json').dependencies['@nodedb-lab/code2graph']")"
+          CORE="$(npm view "@nodedb-lab/code2graph@$RANGE" version 2>/dev/null || true)"
+          test -n "$CORE"
+          for attempt in $(seq 1 30); do
+            if npm view "@nodedb-lab/code2graph@$CORE" version >/dev/null 2>&1; then break; fi
+            test "$attempt" -lt 30 || { echo "Timed out waiting for @nodedb-lab/code2graph@$CORE" >&2; exit 1; }
+            sleep 10
+          done
+          cd "$PI_DIR"
+          npm install --package-lock-only --save-exact "@nodedb-lab/code2graph@$CORE"
+          npm ci
+          test "$(node -p "require('./package.json').dependencies['@nodedb-lab/code2graph']")" = "$CORE"
+          mkdir -p "$STAGE/artifacts"
+          npm pack "@nodedb-lab/code2graph@$CORE" --pack-destination "$STAGE/artifacts"
+          npm pack --pack-destination "$STAGE/artifacts"
+          PI_TARBALL="$(find "$STAGE/artifacts" -maxdepth 1 -name 'nodedb-lab-pi-code2graph-*.tgz' -print -quit)"
+          CORE_TARBALL="$(find "$STAGE/artifacts" -maxdepth 1 -name 'nodedb-lab-code2graph-*.tgz' -print -quit)"
+          test -f "$PI_TARBALL" && test -f "$CORE_TARBALL"
+          printf 'stage=%s\npi_tarball=%s\ncore_tarball=%s\nversion=%s\n' "$STAGE" "$PI_TARBALL" "$CORE_TARBALL" "$VERSION" >> "$GITHUB_OUTPUT"
+      - name: Test exactly the staged source and exact packed artifacts
+        shell: bash
+        env:
+          PI_DIR: ${{ steps.stage.outputs.stage }}/source/bindings/pi
+          CODE2GRAPH_PI_TARBALL: ${{ steps.stage.outputs.pi_tarball }}
+          CODE2GRAPH_CORE_TARBALL: ${{ steps.stage.outputs.core_tarball }}
+        run: |
+          set -euo pipefail
+          cd "$PI_DIR"
+          npm run typecheck
+          npm test
+          npm run test:pack
+          npm run test:smoke
+      - name: Publish the tested tarball with provenance
+        shell: bash
+        env:
+          NPM_CONFIG_PROVENANCE: "true"
+          TARBALL: ${{ steps.stage.outputs.pi_tarball }}
+          VERSION: ${{ steps.stage.outputs.version }}
+        run: |
+          set -euo pipefail
+          NAME="@nodedb-lab/pi-code2graph"
+          if npm view "$NAME@$VERSION" version >/dev/null 2>&1; then
+            echo "$NAME@$VERSION already published"
+            exit 0
+          fi
+          case "$VERSION" in *-*) TAG=next ;; *) TAG=latest ;; esac
+          npm publish "$TARBALL" --access public --tag "$TAG" --provenance

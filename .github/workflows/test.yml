@@ -56,8 +56,12 @@ jobs:
         run: cargo test --workspace --all-features --exclude code2graph-py --exclude code2graph-node
 
   bindings:
-    name: Build bindings
-    runs-on: ubuntu-latest
+    name: Build bindings (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v6
       - name: Install Rust
@@ -66,10 +70,12 @@ jobs:
         with:
           prefix-key: bindings
       - name: Set up Python
+        if: matrix.os == 'ubuntu-latest'
         uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: Build Python wheel (maturin)
+        if: matrix.os == 'ubuntu-latest'
         run: |
           pip install maturin
           maturin build --release -m bindings/python/Cargo.toml
@@ -81,7 +87,7 @@ jobs:
         working-directory: bindings/node
         run: |
           npm ci
-          npx napi build --release --platform
+          npm run build
       # `napi build` regenerates index.js / index.d.ts from the #[napi] API.
       # They are committed (so the published package ships its loader), so a
       # change to the Rust binding API that wasn't regenerated leaves them stale.
@@ -93,3 +99,22 @@ jobs:
             echo "::error::bindings/node/index.js or index.d.ts is out of date — run 'npm run build' in bindings/node and commit the regenerated files."
             exit 1
           fi
+      - name: Verify host native addon loads
+        working-directory: bindings/node
+        run: node -e "const addon=require('./'); if (!addon.languageOf('sample.rs')) process.exit(1)"
+      - name: Install Pi package test dependencies against this built addon
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGE="$(mktemp -d)"
+          mkdir -p "$STAGE/core"
+          (cd bindings/node && npm pack --pack-destination "$STAGE/core")
+          CORE_TGZ="$(find "$STAGE/core" -name '*.tgz' -print -quit)"
+          cd bindings/pi
+          npm install --no-save --package-lock=false "$CORE_TGZ" ignore tsx typescript @types/node @earendil-works/pi-ai @earendil-works/pi-coding-agent @earendil-works/pi-tui
+          npm install --global @earendil-works/pi-coding-agent@latest
+      - name: Validate packed Pi package through Pi loader and worker scan
+        if: matrix.os == 'ubuntu-latest'
+        working-directory: bindings/pi
+        run: npm run test:all

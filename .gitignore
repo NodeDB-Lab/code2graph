@@ -106,3 +106,6 @@ dmypy.json
 # local session scratch
 .claude/prep/
 .agents/prep/
+
+.pi/
+.pi-subagents/

@@ -1,0 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { matches, symbolPreview } from "./relations.ts";
+import { scan, summarize } from "./scan.ts";
+export function registerCommands(pi: ExtensionAPI){pi.registerCommand("code2graph",{description:"Show status, scan, or search deterministic code graph facts.",getArgumentCompletions:p=>["status","scan","symbols"].filter(v=>v.startsWith(p.trim())).map(value=>({value,label:value})),handler:async(args,ctx)=>{const[sub="status",...rest]=args.trim().split(/\s+/).filter(Boolean);if(sub==="status"){ctx.ui.notify("code2graph tools loaded: scan, symbol_search, callers, callees, impact","info");return;}try{const result=await scan(ctx.cwd,{root:sub==="scan"?rest.join(" ")||undefined:undefined,tier:"scope",refresh:sub==="scan"});if(sub==="scan"){ctx.ui.notify(JSON.stringify(summarize(result)),"info");return;}if(sub==="symbols"){const symbols=result.graph.symbols.filter(s=>matches(s,rest.join(" "))).slice(0,20).map(symbolPreview);ctx.ui.notify(JSON.stringify({returned:symbols.length,symbols}),"info");return;}ctx.ui.notify("Usage: /code2graph status | scan [path] | symbols [query]","warning");}catch(error){ctx.ui.notify(error instanceof Error?error.message:String(error),"error");}}});}
