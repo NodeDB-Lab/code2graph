@@ -10,16 +10,18 @@ description = "Storage-free structural graph indexes and query primitives for co
 repository = "https://github.com/nodedb-lab/code2graph"
 keywords = ["code-graph", "static-analysis", "query", "symbols"]
 categories = ["development-tools", "parsing"]
+readme.workspace = true
 
 [dependencies]
 thiserror = "2"
 
 [dependencies.code2graph]
 path = ".."
-version = "0.0.0"
+version = "=0.0.0"
 default-features = false
 
 [dev-dependencies.code2graph]
 path = ".."
+version = "=0.0.0"
 default-features = false
 features = ["rust"]

@@ -11,7 +11,7 @@ name = "code2graph"
 crate-type = ["cdylib"]
 
 [dependencies]
-code2graph_core = { package = "code2graph", path = "../..", default-features = false, features = ["serde", "rust", "python", "typescript", "go", "java", "c", "cpp", "ruby", "php", "shell", "swift", "kotlin", "solidity", "sql", "hcl", "csharp", "scala", "dart", "lua", "luau", "pascal", "svelte"] }
+code2graph_core = { package = "code2graph", path = "../..", version = "=0.0.0", default-features = false, features = ["serde", "rust", "python", "typescript", "go", "java", "c", "cpp", "ruby", "php", "shell", "swift", "kotlin", "solidity", "sql", "hcl", "csharp", "scala", "dart", "lua", "luau", "pascal", "svelte"] }
 code2graph-query.workspace = true
 pyo3 = { version = "0.29", features = ["extension-module", "abi3-py39"] }
 pythonize = "0.29"

@@ -10,6 +10,7 @@ description = "Standalone project query and indexing consumer for code2graph."
 repository = "https://github.com/nodedb-lab/code2graph"
 keywords = ["code-graph", "static-analysis", "cli", "symbols"]
 categories = ["command-line-utilities", "development-tools"]
+readme.workspace = true
 
 [[bin]]
 name = "code2graph"

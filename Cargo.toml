@@ -1,18 +1,23 @@
 [workspace]
 members = ["eval", "bindings/python", "bindings/node", "query", "cli"]
 
-# Single source of truth for the version shared by the crate and all bindings.
-# CI stamps this from the git tag and mirrors it into pyproject.toml / package.json.
+# Single source of truth for the version shared by the publishable Rust crates and bindings.
+# Release CI stamps this package version plus both internal workspace dependency
+# requirements from the git tag, then mirrors the binding version into pyproject.toml / package.json.
 [workspace.package]
 version = "0.0.0"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
+readme = "README.md"
 
 [workspace.dependencies]
-code2graph = { path = ".", version = "0.0.0" }
+# Exact requirements prevent a prerelease (for example 0.0.0-beta.2) from
+# silently resolving a different prerelease or the eventual stable release.
+# scripts/stamp-release.py replaces this development sentinel for tagged builds.
+code2graph = { path = ".", version = "=0.0.0" }
 directories = "6"
-code2graph-query = { path = "query", version = "0.0.0" }
+code2graph-query = { path = "query", version = "=0.0.0" }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -28,6 +33,7 @@ description = "Purpose-neutral code-graph extraction: source files → symbols, 
 repository = "https://github.com/nodedb-lab/code2graph"
 keywords = ["code-graph", "tree-sitter", "static-analysis", "symbols", "cpg"]
 categories = ["development-tools", "parsing"]
+readme.workspace = true
 
 [features]
 default = ["rust","python","typescript","go","java","c","cpp","ruby","php","shell","swift","kotlin","solidity","sql","hcl","csharp","scala","dart","lua","luau","pascal","svelte"]

@@ -55,6 +55,26 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --all-features --exclude code2graph-py --exclude code2graph-node
 
+  packaging:
+    name: Install CLI from source
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: packaging
+      # Dependent package verification runs in release after its exact core
+      # version is available from crates.io. PRs still prove the install surface.
+      - name: Install and run CLI from source
+        shell: bash
+        run: |
+          set -euo pipefail
+          INSTALL_ROOT="$(mktemp -d)"
+          cargo install --path cli --root "$INSTALL_ROOT"
+          "$INSTALL_ROOT/bin/code2graph" --help
+
   bindings:
     name: Build bindings (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -93,6 +113,7 @@ jobs:
       # change to the Rust binding API that wasn't regenerated leaves them stale.
       # Fail the gate if the just-built files differ from what's committed.
       - name: Verify committed napi bindings are in sync
+        shell: bash
         working-directory: bindings/node
         run: |
           if ! git diff --exit-code -- index.js index.d.ts; then

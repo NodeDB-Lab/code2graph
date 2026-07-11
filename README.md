@@ -67,7 +67,7 @@ code2graph is a **low-level primitive**, not a finished product. If your tool ne
 
 It exists so other tools don't each rebuild the same conversion layer.
 
-**Storage- and database-agnostic by design.** code2graph hands you plain data — `{ symbols, references, edges }` — and stops. It never persists anything and has no opinion on _where_ the graph lives. Put it in a graph database, a vector store, SQLite, an in-memory index, or flat files — your call.
+**Storage- and database-agnostic by design.** Extraction returns `FileFacts` containing symbols and raw references; resolution returns a `CodeGraph` containing symbols and edges. code2graph never persists either and has no opinion on _where_ a consumer keeps them. Put consumer-owned data in a graph database, a vector store, SQLite, an in-memory index, or flat files — your call.
 
 Most code-intelligence tools ship a baked-in storage engine and a fixed query model bolted to the parser; code2graph deliberately keeps them separate, so you're never fighting someone else's persistence or query opinion.
 
@@ -81,15 +81,41 @@ It's **not** for you if you want a turnkey, batteries-included code-intelligence
 
 ## Install
 
-code2graph ships to three ecosystems from a single source — the Rust crate plus native bindings that emit the same neutral facts as language-native objects:
+Choose the surface that owns the work you need:
 
-| Ecosystem  | Package                                                                          | Install                              |
-| ---------- | -------------------------------------------------------------------------------- | ------------------------------------ |
-| Rust       | [`code2graph`](https://crates.io/crates/code2graph)                              | `cargo add code2graph`               |
-| Python     | [`code2graph-rs`](https://pypi.org/project/code2graph-rs/)                       | `pip install code2graph-rs`          |
-| Node / Bun | [`@nodedb-lab/code2graph`](https://www.npmjs.com/package/@nodedb-lab/code2graph) | `npm install @nodedb-lab/code2graph` |
+| Surface | Package | Install |
+| --- | --- | --- |
+| Conversion primitive | [`code2graph`](https://crates.io/crates/code2graph) | `cargo add code2graph` |
+| Optional in-memory query index | [`code2graph-query`](https://crates.io/crates/code2graph-query) | `cargo add code2graph-query` |
+| Project-query CLI (`code2graph` binary) | [`code2graph-cli`](https://crates.io/crates/code2graph-cli) | `cargo install code2graph-cli` |
+| Python binding | [`code2graph-rs`](https://pypi.org/project/code2graph-rs/) | `pip install code2graph-rs` |
+| Node / Bun binding | [`@nodedb-lab/code2graph`](https://www.npmjs.com/package/@nodedb-lab/code2graph) | `npm install @nodedb-lab/code2graph` |
 
-API reference: [docs.rs/code2graph](https://docs.rs/code2graph). Binding sources: [`bindings/python`](bindings/python) (PyO3 / maturin) and [`bindings/node`](bindings/node) (napi-rs).
+`code2graph-query` is optional and storage-free: it builds an owned in-memory index over a resolved graph, leaving persistence to its caller. A `CodeGraph` contains the extracted symbol definitions plus resolved edges; each edge records its source and target IDs, relationship role, confidence, provenance, and reference occurrence.
+
+```rust
+use code2graph::resolve::{Resolver, SymbolTableResolver};
+use code2graph_query::GraphIndex;
+
+let graph = SymbolTableResolver.resolve(&[a, b])?;
+let index = GraphIndex::from_graph(graph)?; // owned by this process
+let helpers = index.symbols_named("helper");
+```
+
+The CLI is a consumer application, not part of the core or query crates. It builds a local, consumer-owned cache for project commands; use `--no-cache` when a cache should not be read or written.
+
+```sh
+code2graph index .
+code2graph symbols helper
+code2graph callers helper
+code2graph impact helper --depth 3
+```
+
+`cargo install code2graph-cli` builds the binary from source with Cargo. No prebuilt binary distribution is promised here.
+
+The Python and Node/Bun packages expose the conversion and query handles as native language objects; see [`bindings/python`](bindings/python) and [`bindings/node`](bindings/node) for their APIs. A public Pi host integration is available as [`@nodedb-lab/pi-code2graph`](bindings/pi); it composes the native binding for agent-host tools without changing the core library's storage-neutral contract. Other host integrations are described only as integrations, not as part of the core API.
+
+API reference: [docs.rs/code2graph](https://docs.rs/code2graph).
 
 ## Quickstart
 
@@ -121,7 +147,7 @@ Language is inferred from the file extension — there's nothing to configure. S
 - Multi-language symbol **definitions** (functions, types, traits/classes, consts, modules, …).
 - **References** (call sites / usages) with `file:line:col`.
 - **Cross-file edges** built by resolving references to definitions (`calls`, `imports`, `inherits`; richer reference kinds and data-flow later).
-- A neutral `CodeGraph` value: `{ symbols, references, edges }`.
+- A neutral `FileFacts` value with symbols and raw references, and a resolved `CodeGraph` with symbols and edges.
 
 **Out of scope** (belongs in the consumer):
 
@@ -144,7 +170,7 @@ Resolution is **pluggable behind the `Resolver` trait** — the tier seam. Every
 | Tier  | Resolver              | Confidence         | Behaviour                                                                                                                                                                                                                                                          |
 | ----- | --------------------- | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | **A** | `SymbolTableResolver` | `NameOnly`         | Fast, all languages, **recall-first**. An ambiguous name links to _all_ same-named definitions.                                                                                                                                                                    |
-| **B** | `ScopeGraphResolver`  | `Scoped` / `Exact` | Scope-aware: resolves through lexical scopes, imports, and qualified paths. **Never fakes precision** — it emits an edge only when it can resolve one, so it has zero false positives.                                                                             |
+| **B** | `ScopeGraphResolver`  | `Scoped` / `Exact` | Scope-aware: resolves through lexical scopes, imports, and qualified paths. It emits only syntactically supported resolutions and marks the resulting confidence; it is not type-checking.                                                                             |
 | —     | `FfiBridgeResolver`   | —                  | Links cross-language boundaries (e.g. a `#[no_mangle]` Rust fn called from C, a PyO3 `#[pyfunction]` from Python, a `#[wasm_bindgen]`/`#[napi]` fn from JS/TS, a Java `native` method) by ABI name — even when the exported name differs from the definition name. |
 
 Both tiers emit the same shape, so a consumer reads the output identically and chooses the tier by the confidence it needs. The scope-aware tier is implemented for a growing subset of languages; others fall back to the recall-first baseline. Identity rendering and the graph schema may still evolve before `0.1`.
