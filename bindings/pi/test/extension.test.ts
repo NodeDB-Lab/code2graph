@@ -6,6 +6,7 @@ import path from "node:path";
 import test from "node:test";
 import { scan } from "../extensions/code2graph/scan.ts";
 import extension from "../extensions/code2graph/index.ts";
+import { getNative } from "../extensions/code2graph/code2graph-node.ts";
 
 test("extension registers every public tool and command against ExtensionAPI", async () => {
   const tools: any[] = []; const commands = new Map<string, any>();
@@ -20,7 +21,8 @@ test("tool schemas expose exact identity and bounded traversal inputs", () => {
   for (const tool of tools) { assert.equal(typeof tool.execute, "function"); assert.equal(typeof tool.description, "string"); }
   assert.match(String(tools.find(tool => tool.name === "code2graph_callers").description), /exact lossless symbolId/);
 });
-test("relation and impact tools accept an exact symbolId without a text query", async () => {
+test("relation and impact tools accept an exact symbolId without a text query", async t => {
+  try { getNative(); } catch { t.skip("requires a built or published native binding; scan lifecycle tests inject a test native module"); return; }
   const root = await mkdtemp(path.join(tmpdir(), "pi-code2graph-selector-"));
   try {
     await writeFile(path.join(root, "sample.rs"), "pub fn target() {}\npub fn caller() { target(); }\n");
