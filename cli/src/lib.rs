@@ -46,12 +46,14 @@ pub use refresh::{
 };
 pub use request::{CliRequest, CommandRequest, Selector, SourcePosition};
 pub use result::{
-    CacheDisposition, ConfidenceOutput, ErrorEnvelope, Freshness, ImpactOutput,
-    InventoryCompletenessOutput, InventoryOmissionReasonOutput, InventoryReasonCountOutput,
-    InventorySummaryOutput, ModuleDependencyOutput, ModuleDependencyTargetOutput,
-    OUTPUT_SCHEMA_VERSION, OccurrenceOutput, OutputEnvelope, OutputStatus, ProjectOutput,
-    ProvenanceOutput, RefRoleOutput, ReferenceOutput, RelationOutput, SelectorOutput,
-    StableIoErrorOutput, StatusOutput, SymbolKindOutput, SymbolOutput, TypeRefContextOutput,
+    CacheCompletenessOutput, CacheDisposition, CacheOmissionOutput, ConfidenceOutput,
+    ErrorEnvelope, Freshness, ImpactOutput, IndexOutput, InventoryCompletenessOutput,
+    InventoryOmissionReasonOutput, InventoryReasonCountOutput, InventorySummaryOutput,
+    ModuleDependencyOutput, ModuleDependencyTargetOutput, OUTPUT_SCHEMA_VERSION, OccurrenceOutput,
+    OutputEnvelope, OutputStatus, PlanDecisionCountsOutput, ProjectOutput, ProvenanceOutput,
+    RefRoleOutput, ReferenceOutput, RelationOutput, SelectorOutput, StableIoErrorOutput,
+    StatusOutput, SymbolKindOutput, SymbolOutput, TypeRefContextOutput, success_exit_code,
+    success_status,
 };
 pub use worker::{
     WORKER_SENTINEL, WorkerFailure, extract_inventory_file, is_worker_invocation, run_worker,

@@ -28,6 +28,26 @@ pub enum ResolverTier {
     Dense,
 }
 
+impl From<ResolverTier> for crate::cache::ResolverCacheTier {
+    fn from(value: ResolverTier) -> Self {
+        match value {
+            ResolverTier::Name => Self::Name,
+            ResolverTier::Scope => Self::Scope,
+            ResolverTier::Dense => Self::Dense,
+        }
+    }
+}
+
+impl From<crate::cache::ResolverCacheTier> for ResolverTier {
+    fn from(value: crate::cache::ResolverCacheTier) -> Self {
+        match value {
+            crate::cache::ResolverCacheTier::Name => Self::Name,
+            crate::cache::ResolverCacheTier::Scope => Self::Scope,
+            crate::cache::ResolverCacheTier::Dense => Self::Dense,
+        }
+    }
+}
+
 impl ResolverTier {
     /// Planned effective minimum when `--min-confidence` is not supplied.
     pub const fn default_min_confidence(self) -> code2graph::Confidence {
@@ -130,5 +150,15 @@ mod tests {
             ..GlobalOptions::default()
         };
         assert_eq!(options.effective_min_confidence(), Confidence::Exact);
+    }
+
+    #[test]
+    fn resolver_tier_cache_conversions_are_lossless() {
+        for tier in [ResolverTier::Name, ResolverTier::Scope, ResolverTier::Dense] {
+            assert_eq!(
+                ResolverTier::from(crate::cache::ResolverCacheTier::from(tier)),
+                tier
+            );
+        }
     }
 }

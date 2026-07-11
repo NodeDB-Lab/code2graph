@@ -216,6 +216,11 @@ impl RawCli {
             allow_partial: self.global.allow_partial,
             no_cache: self.global.no_cache,
         };
+        if global.frozen && global.no_cache {
+            return Err(CliError::Usage(
+                "--frozen requires cache access and cannot be used with --no-cache".into(),
+            ));
+        }
         let command = match self.command {
             RawCommand::Index {
                 path,
@@ -225,6 +230,11 @@ impl RawCli {
                 if global.frozen {
                     return Err(CliError::Usage(
                         "--frozen is a query flag and cannot be used with index".into(),
+                    ));
+                }
+                if global.allow_stale {
+                    return Err(CliError::Usage(
+                        "--allow-stale is a query flag and cannot be used with index".into(),
                     ));
                 }
                 CommandRequest::Index {
@@ -603,7 +613,7 @@ mod tests {
     }
 
     #[test]
-    fn global_flags_work_after_commands_and_frozen_index_is_still_rejected() {
+    fn global_flags_work_after_commands_and_cache_query_flags_are_rejected_for_index() {
         let request = parse_request([
             "code2graph",
             "status",
@@ -616,6 +626,14 @@ mod tests {
         assert!(request.global.include_hidden);
         assert_eq!(request.global.tier, ResolverTier::Dense);
         assert!(parse_from(["code2graph", "index", "--frozen"]).is_err());
+        for args in [
+            &["code2graph", "--frozen", "--no-cache", "status"][..],
+            &["code2graph", "status", "--frozen", "--no-cache"][..],
+            &["code2graph", "--allow-stale", "index"][..],
+            &["code2graph", "index", "--allow-stale"][..],
+        ] {
+            assert!(parse_from(args).is_err(), "{args:?}");
+        }
     }
 
     #[test]

@@ -3,7 +3,9 @@
 use code2graph::{Confidence, Provenance, RefRole, SymbolId, SymbolKind, TypeRefContext};
 use serde::{Deserialize, Serialize};
 
-use crate::config::ResolverTier;
+use crate::cache::{CacheCompleteness, CacheOmission, LoadedSnapshot};
+use crate::config::{ResolverTier, ResourceLimits};
+use crate::exit::ExitCode;
 use crate::inventory::{
     InventoryCompleteness, InventorySummary, OmissionReason, StableIoErrorKind,
 };
@@ -32,6 +34,42 @@ pub enum Freshness {
     Fresh,
     Frozen,
     Stale,
+}
+
+/// Stable cache snapshot completeness spelling in index and cached-status output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CacheCompletenessOutput {
+    Complete,
+    Partial,
+}
+
+impl From<CacheCompleteness> for CacheCompletenessOutput {
+    fn from(value: CacheCompleteness) -> Self {
+        match value {
+            CacheCompleteness::Complete => Self::Complete,
+            CacheCompleteness::Partial => Self::Partial,
+        }
+    }
+}
+
+/// Maps successful snapshot states to their machine-visible status. Stale wins
+/// over completeness because it describes the authoritative freshness caveat.
+pub const fn success_status(completeness: CacheCompleteness, freshness: Freshness) -> OutputStatus {
+    match (completeness, freshness) {
+        (_, Freshness::Stale) => OutputStatus::Stale,
+        (CacheCompleteness::Partial, _) => OutputStatus::Partial,
+        (CacheCompleteness::Complete, Freshness::Fresh | Freshness::Frozen) => OutputStatus::Ok,
+    }
+}
+
+/// All successful index/query states, including partial and stale results, use
+/// the stable success exit code.
+pub const fn success_exit_code(
+    _completeness: CacheCompleteness,
+    _freshness: Freshness,
+) -> ExitCode {
+    ExitCode::Success
 }
 
 /// Cache participation for this invocation.
@@ -413,11 +451,101 @@ impl InventorySummaryOutput {
     }
 }
 
+/// One persisted cache omission. Its reason is cache data, not a live-walk
+/// classification, and is therefore intentionally represented verbatim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheOmissionOutput {
+    pub path: String,
+    pub reason: String,
+}
+
+impl From<&CacheOmission> for CacheOmissionOutput {
+    fn from(value: &CacheOmission) -> Self {
+        Self {
+            path: value.path.clone(),
+            reason: value.reason.clone(),
+        }
+    }
+}
+
+/// Counts of decisions made by the refresh planner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct PlanDecisionCountsOutput {
+    pub need_hash: usize,
+    pub reuse_facts: usize,
+    pub extract: usize,
+    pub remove: usize,
+    pub omit: usize,
+}
+
+impl From<&crate::refresh::RefreshPlan> for PlanDecisionCountsOutput {
+    fn from(plan: &crate::refresh::RefreshPlan) -> Self {
+        let mut counts = Self::default();
+        for entry in &plan.entries {
+            match &entry.decision {
+                crate::refresh::RefreshDecision::NeedHash => counts.need_hash += 1,
+                crate::refresh::RefreshDecision::ReuseFacts => counts.reuse_facts += 1,
+                crate::refresh::RefreshDecision::Extract => counts.extract += 1,
+                crate::refresh::RefreshDecision::Remove => counts.remove += 1,
+                crate::refresh::RefreshDecision::Omit { .. } => counts.omit += 1,
+            }
+        }
+        counts
+    }
+}
+
+/// Owned result returned by `index`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexOutput {
+    pub candidate: String,
+    pub snapshot: String,
+    pub tier: ResolverTier,
+    pub completeness: CacheCompletenessOutput,
+    pub inventory_file_count: u64,
+    pub inventory_total_bytes: u64,
+    pub omissions: Vec<CacheOmissionOutput>,
+    pub changed: usize,
+    pub deleted: usize,
+    pub ignored_omissions: usize,
+    pub attempts: u8,
+    pub plan_decisions: PlanDecisionCountsOutput,
+}
+
+impl IndexOutput {
+    /// Creates an owned index contract from persisted snapshot metadata.
+    pub fn from_loaded_snapshot(
+        snapshot: &LoadedSnapshot,
+        tier: ResolverTier,
+        changed: usize,
+        deleted: usize,
+        ignored_omissions: usize,
+        attempts: u8,
+        plan_decisions: PlanDecisionCountsOutput,
+    ) -> Self {
+        Self {
+            candidate: snapshot.candidate_id.to_string(),
+            snapshot: snapshot.input_digest.to_string(),
+            tier,
+            completeness: snapshot.completeness.into(),
+            inventory_file_count: snapshot.inventory_file_count,
+            inventory_total_bytes: snapshot.inventory_total_bytes,
+            omissions: snapshot.omissions.iter().map(Into::into).collect(),
+            changed,
+            deleted,
+            ignored_omissions,
+            attempts,
+            plan_decisions,
+        }
+    }
+}
+
 /// Cache/project and inventory information returned by `status`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatusOutput {
     pub project: ProjectOutput,
     pub inventory: InventorySummaryOutput,
+    /// Persisted omissions available without claiming that the filesystem was scanned.
+    pub cached_omissions: Vec<CacheOmissionOutput>,
     pub max_files: usize,
     pub max_file_bytes: usize,
     pub max_total_bytes: usize,
@@ -425,6 +553,42 @@ pub struct StatusOutput {
     pub result_limit: usize,
     pub impact_depth: u32,
     pub timeout_millis: Option<u64>,
+}
+
+impl StatusOutput {
+    /// Builds status entirely from an already loaded snapshot. This deliberately
+    /// reports cached omission metadata rather than implying a live inventory walk.
+    pub fn from_loaded_snapshot(
+        project: ProjectOutput,
+        snapshot: &LoadedSnapshot,
+        limits: &ResourceLimits,
+    ) -> Self {
+        Self {
+            project,
+            inventory: InventorySummaryOutput {
+                completeness: match snapshot.completeness {
+                    CacheCompleteness::Complete => InventoryCompletenessOutput::Complete,
+                    CacheCompleteness::Partial => InventoryCompletenessOutput::Partial,
+                },
+                admitted_files: usize::try_from(snapshot.inventory_file_count)
+                    .unwrap_or(usize::MAX),
+                admitted_bytes: usize::try_from(snapshot.inventory_total_bytes)
+                    .unwrap_or(usize::MAX),
+                omitted_files: snapshot.omissions.len(),
+                omission_reasons: Vec::new(),
+            },
+            cached_omissions: snapshot.omissions.iter().map(Into::into).collect(),
+            max_files: limits.max_files,
+            max_file_bytes: limits.max_file_bytes,
+            max_total_bytes: limits.max_total_bytes,
+            max_depth: limits.max_depth,
+            result_limit: limits.result_limit,
+            impact_depth: crate::config::DEFAULT_IMPACT_DEPTH,
+            timeout_millis: limits
+                .timeout
+                .map(|value| value.as_millis().try_into().unwrap_or(u64::MAX)),
+        }
+    }
 }
 
 /// A lossless selector report, emitted before result limiting.
@@ -494,6 +658,40 @@ impl ErrorEnvelope {
 mod tests {
     use super::*;
 
+    fn loaded_snapshot(completeness: CacheCompleteness) -> LoadedSnapshot {
+        let language = crate::cache::LanguageFeatureFingerprint::current();
+        let package = crate::cache::PackageFingerprint::from_normalized(["test"]);
+        let compatibility = crate::cache::CompatibilityFingerprint::new(language, package);
+        let digest =
+            crate::cache::ProjectInputDigest::from_inputs([] as [(&str, &str, [u8; 32]); 0]);
+        let omissions = vec![CacheOmission {
+            path: "src/large.rs".into(),
+            reason: "file-too-large".into(),
+        }];
+        LoadedSnapshot {
+            candidate_id: crate::cache::CandidateId::new(
+                compatibility,
+                digest,
+                completeness,
+                &omissions,
+            ),
+            compatibility: crate::cache::CompatibilityRecord {
+                id: compatibility,
+                language_fingerprint: language,
+                package_fingerprint: package,
+                created_at_ns: 1,
+            },
+            input_digest: digest,
+            completeness,
+            omissions,
+            created_at_ns: 2,
+            inventory_file_count: 3,
+            inventory_total_bytes: 42,
+            files: Vec::new(),
+            tier_graphs: Vec::new(),
+        }
+    }
+
     #[test]
     fn envelope_uses_stable_schema_and_spelling() {
         let envelope = OutputEnvelope::new(OutputStatus::NoMatch, Vec::<String>::new());
@@ -532,6 +730,180 @@ mod tests {
             .unwrap(),
             r#"{"kind":"file","file":"src/lib.rs"}"#
         );
+    }
+
+    #[test]
+    fn index_output_and_cached_status_are_owned_stable_contracts() {
+        let snapshot = loaded_snapshot(CacheCompleteness::Partial);
+        let index = IndexOutput::from_loaded_snapshot(
+            &snapshot,
+            ResolverTier::Scope,
+            2,
+            1,
+            4,
+            3,
+            PlanDecisionCountsOutput {
+                need_hash: 1,
+                reuse_facts: 2,
+                extract: 3,
+                remove: 4,
+                omit: 5,
+            },
+        );
+        let value = serde_json::to_value(&index).unwrap();
+        assert_eq!(value["tier"], "scope");
+        assert_eq!(value["completeness"], "partial");
+        assert_eq!(value["inventory_file_count"], 3);
+        assert_eq!(value["omissions"][0]["reason"], "file-too-large");
+        assert_eq!(value["plan_decisions"]["extract"], 3);
+
+        let status = StatusOutput::from_loaded_snapshot(
+            ProjectOutput {
+                root: "/project".into(),
+                snapshot: snapshot.input_digest.to_string(),
+                tier: ResolverTier::Scope,
+                freshness: Freshness::Frozen,
+                cache: CacheDisposition::Hit,
+            },
+            &snapshot,
+            &ResourceLimits::default(),
+        );
+        assert_eq!(status.inventory.admitted_files, 3);
+        assert_eq!(status.cached_omissions[0].path, "src/large.rs");
+        assert!(status.inventory.omission_reasons.is_empty());
+    }
+
+    #[test]
+    fn index_and_stale_partial_status_have_golden_json_contracts() {
+        let index = IndexOutput {
+            candidate: "candidate".into(),
+            snapshot: "snapshot".into(),
+            tier: ResolverTier::Scope,
+            completeness: CacheCompletenessOutput::Partial,
+            inventory_file_count: 3,
+            inventory_total_bytes: 42,
+            omissions: vec![CacheOmissionOutput {
+                path: "src/large.rs".into(),
+                reason: "file-too-large".into(),
+            }],
+            changed: 2,
+            deleted: 1,
+            ignored_omissions: 4,
+            attempts: 3,
+            plan_decisions: PlanDecisionCountsOutput {
+                need_hash: 1,
+                reuse_facts: 2,
+                extract: 3,
+                remove: 4,
+                omit: 5,
+            },
+        };
+        assert_eq!(
+            serde_json::to_string(&index).unwrap(),
+            r#"{"candidate":"candidate","snapshot":"snapshot","tier":"scope","completeness":"partial","inventory_file_count":3,"inventory_total_bytes":42,"omissions":[{"path":"src/large.rs","reason":"file-too-large"}],"changed":2,"deleted":1,"ignored_omissions":4,"attempts":3,"plan_decisions":{"need_hash":1,"reuse_facts":2,"extract":3,"remove":4,"omit":5}}"#
+        );
+
+        let snapshot = loaded_snapshot(CacheCompleteness::Partial);
+        let status = StatusOutput::from_loaded_snapshot(
+            ProjectOutput {
+                root: "/project".into(),
+                snapshot: "snapshot".into(),
+                tier: ResolverTier::Scope,
+                freshness: Freshness::Stale,
+                cache: CacheDisposition::Hit,
+            },
+            &snapshot,
+            &ResourceLimits::default(),
+        );
+        assert_eq!(
+            serde_json::to_string(&status).unwrap(),
+            r#"{"project":{"root":"/project","snapshot":"snapshot","tier":"scope","freshness":"stale","cache":"hit"},"inventory":{"completeness":"partial","admitted_files":3,"admitted_bytes":42,"omitted_files":1,"omission_reasons":[]},"cached_omissions":[{"path":"src/large.rs","reason":"file-too-large"}],"max_files":1000,"max_file_bytes":1048576,"max_total_bytes":26214400,"max_depth":32,"result_limit":50,"impact_depth":2,"timeout_millis":null}"#
+        );
+    }
+
+    #[test]
+    fn success_status_matrix_preserves_success_exit_code() {
+        for (completeness, freshness, expected) in [
+            (
+                CacheCompleteness::Complete,
+                Freshness::Fresh,
+                OutputStatus::Ok,
+            ),
+            (
+                CacheCompleteness::Complete,
+                Freshness::Frozen,
+                OutputStatus::Ok,
+            ),
+            (
+                CacheCompleteness::Partial,
+                Freshness::Fresh,
+                OutputStatus::Partial,
+            ),
+            (
+                CacheCompleteness::Partial,
+                Freshness::Frozen,
+                OutputStatus::Partial,
+            ),
+            (
+                CacheCompleteness::Complete,
+                Freshness::Stale,
+                OutputStatus::Stale,
+            ),
+            (
+                CacheCompleteness::Partial,
+                Freshness::Stale,
+                OutputStatus::Stale,
+            ),
+        ] {
+            assert_eq!(success_status(completeness, freshness), expected);
+            assert_eq!(
+                success_exit_code(completeness, freshness),
+                ExitCode::Success
+            );
+        }
+    }
+
+    #[test]
+    fn status_represents_every_freshness_and_cache_disposition_without_losing_completeness() {
+        let snapshot = loaded_snapshot(CacheCompleteness::Partial);
+        for freshness in [Freshness::Fresh, Freshness::Frozen, Freshness::Stale] {
+            for cache in [
+                CacheDisposition::Hit,
+                CacheDisposition::Miss,
+                CacheDisposition::Disabled,
+            ] {
+                let status = StatusOutput::from_loaded_snapshot(
+                    ProjectOutput {
+                        root: "/project".into(),
+                        snapshot: "snapshot".into(),
+                        tier: ResolverTier::Dense,
+                        freshness,
+                        cache,
+                    },
+                    &snapshot,
+                    &ResourceLimits::default(),
+                );
+                let value = serde_json::to_value(status).unwrap();
+                assert_eq!(
+                    value["project"]["freshness"],
+                    serde_json::to_value(freshness).unwrap()
+                );
+                assert_eq!(
+                    value["project"]["cache"],
+                    serde_json::to_value(cache).unwrap()
+                );
+                assert_eq!(value["inventory"]["completeness"], "partial");
+                assert_eq!(value["cached_omissions"][0]["path"], "src/large.rs");
+                assert_eq!(
+                    success_status(CacheCompleteness::Partial, freshness),
+                    if freshness == Freshness::Stale {
+                        OutputStatus::Stale
+                    } else {
+                        OutputStatus::Partial
+                    }
+                );
+            }
+        }
     }
 
     #[test]

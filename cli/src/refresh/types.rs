@@ -42,11 +42,7 @@ impl PriorFileRecord {
         snapshot: &LoadedSnapshot,
         requested_tier: ResolverTier,
     ) -> Result<Vec<Self>> {
-        let requested_cache_tier = match requested_tier {
-            ResolverTier::Name => ResolverCacheTier::Name,
-            ResolverTier::Scope => ResolverCacheTier::Scope,
-            ResolverTier::Dense => ResolverCacheTier::Dense,
-        };
+        let requested_cache_tier: ResolverCacheTier = requested_tier.into();
         if !snapshot
             .tier_graphs
             .iter()

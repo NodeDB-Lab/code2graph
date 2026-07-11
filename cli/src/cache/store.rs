@@ -295,7 +295,8 @@ impl CacheStore {
         }
     }
 
-    /// Loads the currently active graph for an isolated `(tier, completeness)` slot.
+    /// Loads the currently active graph for an isolated `(tier, completeness)` slot
+    /// when it has the requested compatibility fingerprint.
     pub fn load_active(
         &self,
         tier: ResolverCacheTier,
@@ -304,28 +305,30 @@ impl CacheStore {
         deadline: &Deadline,
     ) -> Result<Option<LoadedSnapshot>, CacheError> {
         self.with_read_transaction(deadline, || {
-            let active: Option<(Vec<u8>, String, i64, Vec<u8>)> = self.connection.query_row(
-                "SELECT c.candidate_id, g.resolver_tier, c.completeness, c.compatibility_id FROM active_snapshots a JOIN graph_snapshots g ON g.snapshot_id = a.snapshot_id JOIN candidates c ON c.candidate_id = g.candidate_id WHERE a.resolver_tier = ?1 AND a.completeness = ?2",
-                params![tier.as_sql(), completeness.as_sql()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            ).optional().map_err(|error| map_sqlite_error(error, deadline))?;
-            match active {
-                None => Ok(None),
-                Some((bytes, graph_tier, candidate_completeness, compatibility_id)) => {
-                    if ResolverCacheTier::from_sql(graph_tier)? != tier
-                        || CacheCompleteness::from_sql(candidate_completeness)? != completeness
-                    {
-                        return Err(CacheError::Corrupt);
-                    }
-                    if CompatibilityFingerprint::from_bytes(fixed_32(compatibility_id)?)
-                        != compatibility
-                    {
-                        return Ok(None);
-                    }
-                    self.load_candidate_inner(fingerprint_from_blob(bytes)?, Some(tier), deadline)
-                        .map(Some)
-                }
-            }
+            self.load_active_inner(
+                tier,
+                completeness,
+                Some(compatibility),
+                Some(tier),
+                deadline,
+            )
+        })
+    }
+
+    /// Loads the newest active candidate for an isolated `(tier, completeness)`
+    /// slot without requiring a compatibility match. The returned snapshot contains
+    /// all persisted resolver graphs, not only the graph that selected the slot.
+    ///
+    /// This is safe for frozen callers: it uses the same coherent read transaction
+    /// and does not mutate the cache.
+    pub fn load_latest_active(
+        &self,
+        tier: ResolverCacheTier,
+        completeness: CacheCompleteness,
+        deadline: &Deadline,
+    ) -> Result<Option<LoadedSnapshot>, CacheError> {
+        self.with_read_transaction(deadline, || {
+            self.load_active_inner(tier, completeness, None, None, deadline)
         })
     }
 
@@ -406,6 +409,36 @@ impl CacheStore {
                 Err(error)
             }
         }
+    }
+
+    fn load_active_inner(
+        &self,
+        tier: ResolverCacheTier,
+        completeness: CacheCompleteness,
+        compatibility: Option<CompatibilityFingerprint>,
+        only_tier: Option<ResolverCacheTier>,
+        deadline: &Deadline,
+    ) -> Result<Option<LoadedSnapshot>, CacheError> {
+        let active: Option<(Vec<u8>, String, i64, Vec<u8>)> = self.connection.query_row(
+            "SELECT c.candidate_id, g.resolver_tier, c.completeness, c.compatibility_id FROM active_snapshots a JOIN graph_snapshots g ON g.snapshot_id = a.snapshot_id JOIN candidates c ON c.candidate_id = g.candidate_id WHERE a.resolver_tier = ?1 AND a.completeness = ?2",
+            params![tier.as_sql(), completeness.as_sql()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).optional().map_err(|error| map_sqlite_error(error, deadline))?;
+        let Some((bytes, graph_tier, candidate_completeness, compatibility_id)) = active else {
+            return Ok(None);
+        };
+        if ResolverCacheTier::from_sql(graph_tier)? != tier
+            || CacheCompleteness::from_sql(candidate_completeness)? != completeness
+        {
+            return Err(CacheError::Corrupt);
+        }
+        // Validate the persisted fingerprint even if no caller supplied one.
+        let compatibility_id = CompatibilityFingerprint::from_bytes(fixed_32(compatibility_id)?);
+        if compatibility.is_some_and(|expected| expected != compatibility_id) {
+            return Ok(None);
+        }
+        self.load_candidate_inner(fingerprint_from_blob(bytes)?, only_tier, deadline)
+            .map(Some)
     }
 
     fn verify_existing_candidate(
@@ -1275,6 +1308,117 @@ mod tests {
         store
             .publish_candidate(&complete, &Deadline::new(None))
             .expect("idempotent publish");
+    }
+
+    #[test]
+    fn latest_active_loads_full_snapshot_without_compatibility_or_mutation() {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().join("project");
+        fs::create_dir(&root).expect("project");
+        let cache_location = location(&root, temp.path());
+        let store =
+            CacheStore::open_writable(&cache_location, &root, &Deadline::new(None)).expect("open");
+        let mut complete = candidate(CacheCompleteness::Complete, ResolverCacheTier::Name);
+        complete.tier_graphs.push((
+            ResolverCacheTier::Dense,
+            CodeGraph {
+                symbols: Vec::new(),
+                edges: Vec::new(),
+            },
+        ));
+        let partial = candidate(CacheCompleteness::Partial, ResolverCacheTier::Dense);
+        store
+            .publish_candidate(&complete, &Deadline::new(None))
+            .expect("publish complete");
+        store
+            .publish_candidate(&partial, &Deadline::new(None))
+            .expect("publish partial");
+        let loaded = store
+            .load_latest_active(
+                ResolverCacheTier::Name,
+                CacheCompleteness::Complete,
+                &Deadline::new(None),
+            )
+            .expect("load")
+            .expect("active");
+        assert_eq!(loaded.candidate_id, complete.candidate_id);
+        assert_eq!(loaded.tier_graphs.len(), 2);
+        assert_eq!(
+            store
+                .load_latest_active(
+                    ResolverCacheTier::Dense,
+                    CacheCompleteness::Partial,
+                    &Deadline::new(None),
+                )
+                .expect("load partial tier")
+                .expect("active")
+                .candidate_id,
+            partial.candidate_id
+        );
+        assert!(
+            store
+                .load_latest_active(
+                    ResolverCacheTier::Scope,
+                    CacheCompleteness::Complete,
+                    &Deadline::new(None),
+                )
+                .expect("load missing slot")
+                .is_none()
+        );
+
+        drop(store);
+        let database_before = fs::read(&cache_location.database_path).expect("read database");
+        let frozen = CacheStore::open_frozen(&cache_location, &root, &Deadline::new(None))
+            .expect("open frozen");
+        assert_eq!(
+            frozen
+                .load_latest_active(
+                    ResolverCacheTier::Name,
+                    CacheCompleteness::Complete,
+                    &Deadline::new(None),
+                )
+                .expect("frozen load")
+                .expect("active")
+                .candidate_id,
+            complete.candidate_id
+        );
+        assert_eq!(
+            fs::read(&cache_location.database_path).expect("read database"),
+            database_before
+        );
+    }
+
+    #[test]
+    fn latest_active_rejects_a_corrupt_active_row() {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().join("project");
+        fs::create_dir(&root).expect("project");
+        let cache_location = location(&root, temp.path());
+        let store =
+            CacheStore::open_writable(&cache_location, &root, &Deadline::new(None)).expect("open");
+        let snapshot = candidate(CacheCompleteness::Complete, ResolverCacheTier::Name);
+        store
+            .publish_candidate(&snapshot, &Deadline::new(None))
+            .expect("publish");
+        store
+            .connection
+            .execute_batch("PRAGMA ignore_check_constraints = ON")
+            .expect("allow corruption fixture");
+        store
+            .connection
+            .execute(
+                "UPDATE candidates SET completeness = 99 WHERE candidate_id = ?1",
+                [snapshot.candidate_id.as_bytes().as_slice()],
+            )
+            .expect("corrupt row");
+        assert!(matches!(
+            store.load_latest_active(
+                ResolverCacheTier::Name,
+                CacheCompleteness::Complete,
+                &Deadline::new(None),
+            ),
+            Err(CacheError::Corrupt)
+        ));
     }
 
     #[test]

@@ -476,11 +476,7 @@ fn cache_omission(omission: &OmittedFile) -> CacheOmission {
     }
 }
 fn cache_tier(tier: ResolverTier) -> ResolverCacheTier {
-    match tier {
-        ResolverTier::Name => ResolverCacheTier::Name,
-        ResolverTier::Scope => ResolverCacheTier::Scope,
-        ResolverTier::Dense => ResolverCacheTier::Dense,
-    }
+    tier.into()
 }
 
 fn scope_state(snapshot: &LoadedSnapshot) -> Result<Option<PriorScopeState>> {
