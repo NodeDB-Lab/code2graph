@@ -9,22 +9,44 @@ use crate::config::{
 };
 use crate::error::CliError;
 use crate::request::{CliRequest, CommandRequest, Selector, SourcePosition};
-use clap::{ArgGroup, Args, Parser, Subcommand};
+use clap::{ArgGroup, Args, Parser, Subcommand, error::ErrorKind};
 use code2graph::{Confidence, RefRole, SymbolId, SymbolIdWire, SymbolKind};
 
-/// Parse an owned request without reading the filesystem or invoking a resolver.
-pub fn parse_from<I, T>(args: I) -> Result<CliRequest, CliError>
+/// A successfully parsed CLI invocation.
+///
+/// Help and version are parser control flow, not executable requests or operational output.
+#[derive(Debug)]
+pub enum ParseOutcome {
+    Request(CliRequest),
+    Display(String),
+}
+
+/// Parse an owned CLI invocation without reading the filesystem or invoking a resolver.
+pub fn parse_from<I, T>(args: I) -> Result<ParseOutcome, CliError>
 where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
-    let parsed =
-        RawCli::try_parse_from(args).map_err(|error| CliError::Usage(error.to_string()))?;
-    parsed.into_request()
+    match RawCli::try_parse_from(args) {
+        Ok(parsed) => parsed.into_request().map(ParseOutcome::Request),
+        Err(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+            ) =>
+        {
+            Ok(ParseOutcome::Display(error.to_string()))
+        }
+        Err(error) => Err(CliError::Usage(error.to_string())),
+    }
 }
 
 #[derive(Parser)]
-#[command(name = "code2graph", disable_help_subcommand = true)]
+#[command(
+    name = "code2graph",
+    version = env!("CARGO_PKG_VERSION"),
+    disable_help_subcommand = true
+)]
 struct RawCli {
     #[command(flatten)]
     global: RawGlobal,
@@ -426,6 +448,17 @@ fn parse_kind(value: &str) -> Result<SymbolKind, String> {
 mod tests {
     use super::*;
 
+    fn parse_request<I, T>(args: I) -> CliRequest
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<OsString> + Clone,
+    {
+        match parse_from(args).unwrap() {
+            ParseOutcome::Request(request) => request,
+            ParseOutcome::Display(text) => panic!("expected request, got display output: {text}"),
+        }
+    }
+
     #[test]
     fn every_command_parses() {
         let cases: &[&[&str]] = &[
@@ -442,7 +475,24 @@ mod tests {
             &["code2graph", "references", "src/a.rs"],
         ];
         for args in cases {
-            assert!(parse_from(args.iter().copied()).is_ok(), "{args:?}");
+            assert!(
+                matches!(
+                    parse_from(args.iter().copied()),
+                    Ok(ParseOutcome::Request(_))
+                ),
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn help_and_version_are_display_control_flow() {
+        for args in [["code2graph", "--help"], ["code2graph", "--version"]] {
+            match parse_from(args) {
+                Ok(ParseOutcome::Display(text)) => assert!(!text.is_empty()),
+                Ok(ParseOutcome::Request(_)) => panic!("expected display control flow"),
+                Err(error) => panic!("expected display control flow: {error}"),
+            }
         }
     }
 
@@ -450,8 +500,7 @@ mod tests {
     fn selectors_are_exclusive_and_positions_are_one_based() {
         assert!(parse_from(["code2graph", "def", "name", "--scip", "local x"]).is_err());
         assert!(parse_from(["code2graph", "def", "--at-file", "src/a.rs", "--line", "0"]).is_err());
-        let request =
-            parse_from(["code2graph", "def", "--at-file", "src/a.rs", "--line", "3"]).unwrap();
+        let request = parse_request(["code2graph", "def", "--at-file", "src/a.rs", "--line", "3"]);
         let CommandRequest::Def {
             selector: Selector::Position(position),
             ..
@@ -471,13 +520,12 @@ mod tests {
 
     #[test]
     fn id_json_is_lossless_and_versioned() {
-        let request = parse_from([
+        let request = parse_request([
             "code2graph",
             "def",
             "--id-json",
             r#"{"version":1,"scip":"local x","file":"src/a.rs"}"#,
-        ])
-        .unwrap();
+        ]);
         let CommandRequest::Def {
             selector: Selector::Id(id),
             ..
@@ -486,13 +534,12 @@ mod tests {
             panic!("expected id selector")
         };
         assert_eq!(id, SymbolId::local("src/a.rs", "x"));
-        let global = parse_from([
+        let global = parse_request([
             "code2graph",
             "def",
             "--id-json",
             r#"{"version":1,"scip":"codegraph . . . run.","lang":"rust"}"#,
-        ])
-        .unwrap();
+        ]);
         let CommandRequest::Def {
             selector: Selector::Id(id),
             ..
@@ -533,7 +580,7 @@ mod tests {
 
     #[test]
     fn defaults_and_duration_units_are_preserved() {
-        let request = parse_from(["code2graph", "--timeout", "2m", "impact", "run"]).unwrap();
+        let request = parse_request(["code2graph", "--timeout", "2m", "impact", "run"]);
         assert_eq!(
             request.global.limits,
             ResourceLimits {
@@ -546,26 +593,25 @@ mod tests {
         };
         assert_eq!(depth, DEFAULT_IMPACT_DEPTH);
 
-        let callers = parse_from(["code2graph", "callers", "run"]).unwrap();
+        let callers = parse_request(["code2graph", "callers", "run"]);
         assert_eq!(
             callers.command.effective_relation_role(),
             Some(RefRole::Call)
         );
-        let usages = parse_from(["code2graph", "usages", "run"]).unwrap();
+        let usages = parse_request(["code2graph", "usages", "run"]);
         assert_eq!(usages.command.effective_relation_role(), None);
     }
 
     #[test]
     fn global_flags_work_after_commands_and_frozen_index_is_still_rejected() {
-        let request = parse_from([
+        let request = parse_request([
             "code2graph",
             "status",
             "--json",
             "--tier",
             "dense",
             "--include-hidden",
-        ])
-        .unwrap();
+        ]);
         assert!(request.global.json);
         assert!(request.global.include_hidden);
         assert_eq!(request.global.tier, ResolverTier::Dense);

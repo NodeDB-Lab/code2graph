@@ -1,11 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::process::Command;
+use std::io::Write;
+use std::process::{Command, Stdio};
 
 use code2graph::{Descriptor, SymbolId};
+use code2graph_cli::worker::{PROTOCOL_VERSION, WorkerRequest, WorkerResponse, validate_response};
 use code2graph_cli::{
-    CommandRequest, OutputEnvelope, OutputStatus, Selector, SelectorOutput, parse_from,
+    CommandRequest, OutputEnvelope, OutputStatus, ParseOutcome, Selector, SelectorOutput,
+    WORKER_SENTINEL, parse_from,
 };
+
+fn parse_request<I, T>(args: I) -> code2graph_cli::CliRequest
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
+    match parse_from(args).unwrap() {
+        ParseOutcome::Request(request) => request,
+        ParseOutcome::Display(text) => panic!("expected request, got display output: {text}"),
+    }
+}
 
 #[test]
 fn every_documented_usage_accepts_global_flags_after_the_command() {
@@ -57,13 +71,19 @@ fn every_documented_usage_accepts_global_flags_after_the_command() {
     ];
 
     for args in cases {
-        assert!(parse_from(args.iter().copied()).is_ok(), "{args:?}");
+        assert!(
+            matches!(
+                parse_from(args.iter().copied()),
+                Ok(ParseOutcome::Request(_))
+            ),
+            "{args:?}"
+        );
     }
 }
 
 #[test]
 fn windows_drive_paths_are_only_positions_when_explicitly_selected() {
-    let bare = parse_from(["code2graph", "def", r"C:\src\main.rs"]).unwrap();
+    let bare = parse_request(["code2graph", "def", r"C:\src\main.rs"]);
     let CommandRequest::Def {
         selector: Selector::Name(name),
         ..
@@ -73,15 +93,14 @@ fn windows_drive_paths_are_only_positions_when_explicitly_selected() {
     };
     assert_eq!(name, r"C:\src\main.rs");
 
-    let explicit = parse_from([
+    let explicit = parse_request([
         "code2graph",
         "def",
         "--at-file",
         r"C:\src\main.rs",
         "--line",
         "2",
-    ])
-    .unwrap();
+    ]);
     assert!(matches!(
         explicit.command,
         CommandRequest::Def {
@@ -132,7 +151,7 @@ fn selector_adversaries_are_rejected_without_guessing() {
 #[test]
 fn lossless_ids_survive_selector_and_output_json() {
     let local_json = r#"{"version":1,"scip":"local x","file":"src/a.rs"}"#;
-    let request = parse_from(["code2graph", "def", "--id-json", local_json]).unwrap();
+    let request = parse_request(["code2graph", "def", "--id-json", local_json]);
     let CommandRequest::Def {
         selector: Selector::Id(local),
         ..
@@ -196,6 +215,19 @@ fn binary_json_failures_keep_stdout_machine_only_and_stderr_diagnostic() {
 }
 
 #[test]
+fn binary_help_and_version_are_successful_stdout_display_only() {
+    for flag in ["--help", "--version"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_code2graph"))
+            .arg(flag)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{flag}");
+        assert!(!output.stdout.is_empty(), "{flag}");
+        assert!(output.stderr.is_empty(), "{flag}");
+    }
+}
+
+#[test]
 fn binary_usage_errors_map_to_two_and_emit_json_when_requested() {
     let output = Command::new(env!("CARGO_BIN_EXE_code2graph"))
         .args(["def", "--json"])
@@ -209,4 +241,43 @@ fn binary_usage_errors_map_to_two_and_emit_json_when_requested() {
             .unwrap()
             .starts_with("error: ")
     );
+}
+
+#[test]
+fn same_binary_hidden_worker_succeeds_before_clap_and_stays_out_of_help() {
+    let request = WorkerRequest {
+        version: PROTOCOL_VERSION,
+        kind: 1,
+        request_id: 73,
+        path: "src/a.rs".into(),
+        language: 0,
+        source: b"fn run() {}".to_vec(),
+    };
+    let payload = zerompk::to_msgpack_vec(&request).unwrap();
+    let mut frame = u32::try_from(payload.len()).unwrap().to_be_bytes().to_vec();
+    frame.extend_from_slice(&payload);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_code2graph"))
+        .arg(WORKER_SENTINEL)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(&frame).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let length = u32::from_be_bytes(output.stdout[..4].try_into().unwrap()) as usize;
+    assert_eq!(output.stdout.len(), length + 4);
+    let response: WorkerResponse = zerompk::from_msgpack(&output.stdout[4..]).unwrap();
+    assert!(validate_response(&response, &request).unwrap().is_ok());
+
+    let help = Command::new(env!("CARGO_BIN_EXE_code2graph"))
+        .arg("--help")
+        .output()
+        .unwrap();
+    assert!(help.status.success());
+    let help = String::from_utf8(help.stdout).unwrap();
+    assert!(!help.contains(WORKER_SENTINEL));
 }

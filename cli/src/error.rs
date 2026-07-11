@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use crate::exit::ExitCode;
 use crate::result::OutputStatus;
+use crate::worker::WorkerFailure;
 
 /// CLI-library result type.
 pub type Result<T> = std::result::Result<T, CliError>;
@@ -33,6 +34,10 @@ pub enum CliError {
     ProjectPathOutsideRoot { root: PathBuf, path: PathBuf },
     #[error("operation timed out")]
     Timeout,
+    #[error("operation cancelled")]
+    Cancelled,
+    #[error("worker failure: {0}")]
+    Worker(WorkerFailure),
     #[error("{command} execution is not implemented in this contract-only CLI shell")]
     Unavailable { command: String },
     #[error("fatal CLI failure: {0}")]
@@ -54,6 +59,8 @@ impl CliError {
             | Self::ProjectRelativePath { .. }
             | Self::ProjectPathOutsideRoot { .. }
             | Self::Timeout
+            | Self::Cancelled
+            | Self::Worker(_)
             | Self::Unavailable { .. }
             | Self::Fatal(_) => ExitCode::Operational,
         }
@@ -67,6 +74,7 @@ impl From<&CliError> for OutputStatus {
             CliError::Ambiguous => Self::Ambiguous,
             CliError::Unsupported(_) | CliError::Unavailable { .. } => Self::Unsupported,
             CliError::Timeout => Self::Timeout,
+            CliError::Cancelled => Self::Error,
             CliError::Usage(_)
             | CliError::Cache(_)
             | CliError::Index(_)
@@ -74,6 +82,7 @@ impl From<&CliError> for OutputStatus {
             | CliError::ProjectSymlink { .. }
             | CliError::ProjectRelativePath { .. }
             | CliError::ProjectPathOutsideRoot { .. }
+            | CliError::Worker(_)
             | CliError::Fatal(_) => Self::Error,
         }
     }
@@ -108,6 +117,8 @@ mod tests {
                 path: "source".into(),
             },
             CliError::Timeout,
+            CliError::Cancelled,
+            CliError::Worker(WorkerFailure::Spawn),
             CliError::Unavailable {
                 command: "status".into(),
             },
@@ -154,6 +165,8 @@ mod tests {
                 OutputStatus::Error,
             ),
             (CliError::Timeout, OutputStatus::Timeout),
+            (CliError::Cancelled, OutputStatus::Error),
+            (CliError::Worker(WorkerFailure::Spawn), OutputStatus::Error),
             (
                 CliError::Unavailable {
                     command: "status".into(),

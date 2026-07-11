@@ -3,18 +3,31 @@
 use std::ffi::OsString;
 use std::process::ExitCode as ProcessExitCode;
 
-use code2graph_cli::{CliError, ErrorEnvelope, OutputStatus, parse_from};
+use code2graph_cli::{
+    CliError, ErrorEnvelope, ExitCode, OutputStatus, ParseOutcome, is_worker_invocation,
+    parse_from, run_worker,
+};
 
 fn main() -> ProcessExitCode {
     let args: Vec<OsString> = std::env::args_os().collect();
+    if is_worker_invocation(&args) {
+        return match run_worker(&mut std::io::stdin().lock(), &mut std::io::stdout().lock()) {
+            Ok(()) => ProcessExitCode::SUCCESS,
+            Err(_) => ProcessExitCode::from(ExitCode::Operational.as_i32() as u8),
+        };
+    }
     let requested_json = requests_json(&args);
     match parse_from(args) {
-        Ok(request) => finish(
+        Ok(ParseOutcome::Request(request)) => finish(
             request.global.json,
             CliError::Unavailable {
                 command: request.command.name().to_owned(),
             },
         ),
+        Ok(ParseOutcome::Display(text)) => {
+            print!("{text}");
+            ProcessExitCode::SUCCESS
+        }
         Err(error) => finish(requested_json, error),
     }
 }
