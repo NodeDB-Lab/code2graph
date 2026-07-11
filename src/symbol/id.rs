@@ -12,6 +12,7 @@
 //! within a package); a consumer that knows the manifest can fill `package`
 //! later. Within a single repo, descriptors + lang carry identity already.
 
+use std::cmp::Ordering;
 use std::fmt;
 use std::sync::Arc;
 
@@ -20,7 +21,7 @@ use super::descriptor::{Descriptor, parse_descriptor};
 /// Package coordinates (SCIP `<manager> <package-name> <version>`). Any field
 /// may be empty when unknown — code2graph leaves these to the consumer.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Package {
     pub manager: String,
     pub name: String,
@@ -115,11 +116,60 @@ pub(crate) enum WireContextError {
 /// A symbol's identity.
 ///
 /// Internally an `Arc` over a private representation, so cloning is O(1)
-/// (one atomic refcount bump) for both the global and local variants.
-/// The representation is fully private; use the public constructors and
-/// accessor methods to create and inspect values.
+/// (one atomic refcount bump) for both the global and local variants. The
+/// representation is fully private; use the public constructors and accessor
+/// methods to create and inspect values.
+///
+/// [`Ord`] is a structural total order, not an order of the SCIP display string:
+/// global identities sort before local identities, then all stored coordinates
+/// sort in declaration order. This makes it consistent with [`Eq`] even where
+/// SCIP omits a language or local-file coordinate.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SymbolId(Arc<SymbolRepr>);
+
+impl Ord for SymbolId {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match (&*self.0, &*other.0) {
+            (
+                SymbolRepr::Global {
+                    scheme: a_scheme,
+                    package: a_package,
+                    lang: a_lang,
+                    descriptors: a_descriptors,
+                },
+                SymbolRepr::Global {
+                    scheme: b_scheme,
+                    package: b_package,
+                    lang: b_lang,
+                    descriptors: b_descriptors,
+                },
+            ) => (a_scheme, a_package, a_lang, a_descriptors).cmp(&(
+                b_scheme,
+                b_package,
+                b_lang,
+                b_descriptors,
+            )),
+            (
+                SymbolRepr::Local {
+                    file: a_file,
+                    id: a_id,
+                },
+                SymbolRepr::Local {
+                    file: b_file,
+                    id: b_id,
+                },
+            ) => (a_file, a_id).cmp(&(b_file, b_id)),
+            (SymbolRepr::Global { .. }, SymbolRepr::Local { .. }) => Ordering::Less,
+            (SymbolRepr::Local { .. }, SymbolRepr::Global { .. }) => Ordering::Greater,
+        }
+    }
+}
+
+impl PartialOrd for SymbolId {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
 
 impl SymbolId {
     /// Build a global symbol with the default scheme and an unknown package.
@@ -484,6 +534,114 @@ mod tests {
 
         assert_eq!(a.to_scip_string(), b.to_scip_string());
         assert_ne!(a, b, "local file is structural identity");
+    }
+
+    #[test]
+    fn structural_order_covers_every_symbol_id_coordinate() {
+        fn global(
+            scheme: &str,
+            package: Package,
+            lang: &str,
+            descriptors: Vec<Descriptor>,
+        ) -> SymbolId {
+            SymbolId(Arc::new(SymbolRepr::Global {
+                scheme: scheme.into(),
+                package,
+                lang: lang.into(),
+                descriptors,
+            }))
+        }
+
+        let descriptors = vec![
+            Descriptor::Namespace("pkg".into()),
+            Descriptor::Method {
+                name: "helper".into(),
+                disambiguator: MethodDisambiguator::new("1").unwrap(),
+            },
+        ];
+        let package = Package {
+            manager: "cargo".into(),
+            name: "pkg".into(),
+            version: "1.0.0".into(),
+        };
+        let base = global("codegraph", package.clone(), "rust", descriptors.clone());
+        let ids = [
+            base.clone(),
+            global("other", package.clone(), "rust", descriptors.clone()),
+            global(
+                "codegraph",
+                Package {
+                    manager: "npm".into(),
+                    ..package.clone()
+                },
+                "rust",
+                descriptors.clone(),
+            ),
+            global(
+                "codegraph",
+                Package {
+                    name: "other".into(),
+                    ..package.clone()
+                },
+                "rust",
+                descriptors.clone(),
+            ),
+            global(
+                "codegraph",
+                Package {
+                    version: "2.0.0".into(),
+                    ..package.clone()
+                },
+                "rust",
+                descriptors.clone(),
+            ),
+            global("codegraph", package.clone(), "python", descriptors.clone()),
+            global(
+                "codegraph",
+                package.clone(),
+                "rust",
+                vec![Descriptor::Term("helper".into())],
+            ),
+            SymbolId::local("src/a.rs", "x0"),
+            SymbolId::local("src/b.rs", "x0"),
+            SymbolId::local("src/a.rs", "x1"),
+        ];
+
+        assert_eq!(base.cmp(&base.clone()), Ordering::Equal);
+        for (index, id) in ids.iter().enumerate() {
+            let same = id.clone();
+            assert_eq!(id.cmp(&same), Ordering::Equal);
+            assert_eq!(id, &same);
+            for different in &ids[index + 1..] {
+                assert_ne!(id, different);
+                assert_ne!(id.cmp(different), Ordering::Equal);
+                assert_eq!(id.cmp(different), different.cmp(id).reverse());
+            }
+        }
+
+        let ordered: std::collections::BTreeSet<_> = ids.iter().cloned().collect();
+        assert_eq!(ordered.len(), ids.len());
+    }
+
+    #[test]
+    fn ordering_uses_global_language_not_scip_display() {
+        let rust = SymbolId::global("rust", vec![Descriptor::Term("helper".into())]);
+        let python = SymbolId::global("python", vec![Descriptor::Term("helper".into())]);
+
+        assert_eq!(rust.to_scip_string(), python.to_scip_string());
+        assert!(
+            python < rust,
+            "ordering compares the stored language coordinate"
+        );
+    }
+
+    #[test]
+    fn ordering_uses_local_file_not_scip_display() {
+        let a = SymbolId::local("src/a.rs", "x0");
+        let b = SymbolId::local("src/b.rs", "x0");
+
+        assert_eq!(a.to_scip_string(), b.to_scip_string());
+        assert!(a < b, "ordering compares the stored local-file coordinate");
     }
 
     // ── SCIP-compliance golden tests ──────────────────────────────────────────

@@ -150,8 +150,11 @@ pub struct Symbol {
 
 /// The role a reference plays. `Call`, `IsImplementation`, `Import`, `TypeRef`,
 /// and `ModuleRef` are live; `Read`/`Write` arrive with richer extractors.
+///
+/// Declaration order is the stable structural sort order used by [`EdgeKey`].
+/// New variants must be appended rather than reordered.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum RefRole {
     /// The reference is a call or object-creation site.
     Call,
@@ -335,6 +338,9 @@ pub enum Confidence {
 
 /// Which analysis derived an [`Edge`] — its provenance.
 ///
+/// Declaration order is the stable structural sort order used by [`EdgeKey`].
+/// New variants must be appended rather than reordered.
+///
 /// This is **orthogonal to [`Confidence`]**: confidence answers "how sure are we
 /// this binding is correct?", provenance answers "which mechanism produced it?".
 /// A consumer uses provenance to filter or weight edges by *how* they were found
@@ -342,7 +348,7 @@ pub enum Confidence {
 /// deterministic-but-cross-runtime FFI bridges specially — independently of the
 /// per-edge confidence.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Provenance {
     /// Derived by name-based matching against the global symbol table (the
     /// recall-first resolver). May over-connect on ambiguous names.
@@ -419,7 +425,8 @@ pub struct FfiExport {
 ///
 /// Confidence is deliberately excluded: changing confidence updates the same
 /// derived edge. Provenance is included because distinct resolver mechanisms can
-/// produce distinct facts at the same occurrence.
+/// produce distinct facts at the same occurrence. [`Ord`] compares exactly these
+/// fields lexicographically in their documented order.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct EdgeKey {
@@ -435,6 +442,33 @@ pub struct EdgeKey {
     pub occurrence_byte: usize,
     /// Resolver mechanism that derived the edge.
     pub provenance: Provenance,
+}
+
+impl Ord for EdgeKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (
+            &self.from,
+            &self.to,
+            self.role,
+            &self.occurrence_file,
+            self.occurrence_byte,
+            self.provenance,
+        )
+            .cmp(&(
+                &other.from,
+                &other.to,
+                other.role,
+                &other.occurrence_file,
+                other.occurrence_byte,
+                other.provenance,
+            ))
+    }
+}
+
+impl PartialOrd for EdgeKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 /// A resolved directed edge between two symbols.
@@ -616,6 +650,79 @@ mod confidence_tests {
         changed = edge.clone();
         changed.provenance = Provenance::ScopeGraph;
         assert_ne!(changed.key(), key);
+    }
+
+    #[test]
+    fn edge_key_component_enum_orders_are_stable() {
+        let roles = [
+            RefRole::Call,
+            RefRole::IsImplementation,
+            RefRole::Import,
+            RefRole::ModuleRef,
+            RefRole::TypeRef,
+            RefRole::Read,
+            RefRole::Write,
+        ];
+        assert!(roles.windows(2).all(|pair| pair[0] < pair[1]));
+
+        let provenances = [
+            Provenance::SymbolTable,
+            Provenance::ScopeGraph,
+            Provenance::FfiBridge,
+            Provenance::Conformance,
+            Provenance::NormalizedName,
+            Provenance::External,
+        ];
+        assert!(provenances.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn edge_key_ordering_uses_all_key_dimensions_and_ignores_confidence() {
+        use std::collections::BTreeSet;
+
+        let base = make_edge("from", "to", Confidence::NameOnly);
+        let same_key_different_confidence = make_edge("from", "to", Confidence::Exact);
+        assert_eq!(base.key(), same_key_different_confidence.key());
+
+        let mut changed_from = base.clone();
+        changed_from.from = make_id("other-from");
+        let mut changed_to = base.clone();
+        changed_to.to = make_id("other-to");
+        let mut changed_role = base.clone();
+        changed_role.role = RefRole::Read;
+        let mut changed_file = base.clone();
+        changed_file.occ.file = "src/b.rs".into();
+        let mut changed_byte = base.clone();
+        changed_byte.occ.byte = 1;
+        let mut changed_provenance = base.clone();
+        changed_provenance.provenance = Provenance::ScopeGraph;
+
+        let keys = [
+            base.key(),
+            changed_from.key(),
+            changed_to.key(),
+            changed_role.key(),
+            changed_file.key(),
+            changed_byte.key(),
+            changed_provenance.key(),
+        ];
+        let forward: BTreeSet<_> = keys.iter().cloned().collect();
+        let reverse: BTreeSet<_> = keys.iter().rev().cloned().collect();
+
+        assert_eq!(
+            forward.len(),
+            keys.len(),
+            "every key dimension participates"
+        );
+        assert_eq!(
+            forward, reverse,
+            "ordering is independent of insertion order"
+        );
+        assert_eq!(
+            forward.into_iter().collect::<Vec<_>>(),
+            reverse.into_iter().collect::<Vec<_>>(),
+            "ordered output is stable across insertion permutations"
+        );
     }
 
     #[test]

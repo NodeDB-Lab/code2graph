@@ -26,7 +26,7 @@
 /// escaping for this coordinate. The inner value is private so a public
 /// [`Descriptor::Method`] can never be constructed with an unrenderable value.
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct MethodDisambiguator(String);
 
 impl MethodDisambiguator {
@@ -59,6 +59,10 @@ impl<'de> serde::Deserialize<'de> for MethodDisambiguator {
 }
 
 /// One element of a fully-qualified symbol path.
+///
+/// Its explicit structural sort order is namespace, type, term, method, type
+/// parameter, parameter, meta, then macro. New variants must be appended (or
+/// assigned a new explicit rank) rather than reordered.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Descriptor {
@@ -89,6 +93,20 @@ pub enum Descriptor {
 }
 
 impl Descriptor {
+    /// Explicit, stable descriptor-kind rank used by structural ordering.
+    fn kind_rank(&self) -> u8 {
+        match self {
+            Self::Namespace(_) => 0,
+            Self::Type(_) => 1,
+            Self::Term(_) => 2,
+            Self::Method { .. } => 3,
+            Self::TypeParameter(_) => 4,
+            Self::Parameter(_) => 5,
+            Self::Meta(_) => 6,
+            Self::Macro(_) => 7,
+        }
+    }
+
     /// The bare identifier this descriptor names (used for name-only matching).
     pub fn name(&self) -> &str {
         match self {
@@ -146,6 +164,42 @@ impl Descriptor {
                 out.write_char('!')
             }
         }
+    }
+}
+
+impl Ord for Descriptor {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        let kind = self.kind_rank().cmp(&other.kind_rank());
+        if kind != core::cmp::Ordering::Equal {
+            return kind;
+        }
+
+        match (self, other) {
+            (Self::Namespace(a), Self::Namespace(b))
+            | (Self::Type(a), Self::Type(b))
+            | (Self::Term(a), Self::Term(b))
+            | (Self::TypeParameter(a), Self::TypeParameter(b))
+            | (Self::Parameter(a), Self::Parameter(b))
+            | (Self::Meta(a), Self::Meta(b))
+            | (Self::Macro(a), Self::Macro(b)) => a.cmp(b),
+            (
+                Self::Method {
+                    name: a_name,
+                    disambiguator: a_disambiguator,
+                },
+                Self::Method {
+                    name: b_name,
+                    disambiguator: b_disambiguator,
+                },
+            ) => (a_name, a_disambiguator).cmp(&(b_name, b_disambiguator)),
+            _ => unreachable!("equal descriptor ranks have the same variant"),
+        }
+    }
+}
+
+impl PartialOrd for Descriptor {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -299,6 +353,38 @@ mod tests {
         let mut s = String::new();
         Descriptor::Type("Foo Bar".into()).render(&mut s).unwrap();
         assert_eq!(s, "`Foo Bar`#");
+    }
+
+    #[test]
+    fn descriptor_order_is_explicit_and_consistent_with_equality() {
+        let descriptors = [
+            Descriptor::Namespace("item".into()),
+            Descriptor::Type("item".into()),
+            Descriptor::Term("item".into()),
+            Descriptor::Method {
+                name: "item".into(),
+                disambiguator: MethodDisambiguator::empty(),
+            },
+            Descriptor::TypeParameter("item".into()),
+            Descriptor::Parameter("item".into()),
+            Descriptor::Meta("item".into()),
+            Descriptor::Macro("item".into()),
+        ];
+
+        for (index, descriptor) in descriptors.iter().enumerate() {
+            assert_eq!(descriptor.cmp(descriptor), core::cmp::Ordering::Equal);
+            for later in &descriptors[index + 1..] {
+                assert_eq!(descriptor.cmp(later), core::cmp::Ordering::Less);
+                assert_eq!(later.cmp(descriptor), core::cmp::Ordering::Greater);
+            }
+        }
+
+        let overloaded = Descriptor::Method {
+            name: "item".into(),
+            disambiguator: MethodDisambiguator::new("1").unwrap(),
+        };
+        assert_ne!(descriptors[3], overloaded);
+        assert!(descriptors[3] < overloaded);
     }
 
     #[test]
