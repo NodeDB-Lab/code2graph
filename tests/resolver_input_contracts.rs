@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+#![cfg(feature = "rust")]
+
 use code2graph::extract::Extractor;
 use code2graph::{
     FileFacts,

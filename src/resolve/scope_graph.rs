@@ -119,17 +119,44 @@ impl Resolver for ScopeGraphResolver {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(
+    test,
+    any(
+        feature = "rust",
+        feature = "python",
+        feature = "typescript",
+        feature = "go",
+        feature = "ruby"
+    )
+))]
 mod tests {
     use super::*;
+    #[cfg(any(
+        feature = "rust",
+        feature = "python",
+        feature = "typescript",
+        feature = "go",
+        feature = "ruby"
+    ))]
     use crate::extract::Extractor;
+    #[cfg(feature = "python")]
     use crate::extract::PythonExtractor;
+    #[cfg(feature = "rust")]
     use crate::extract::RustExtractor;
-    use crate::graph::types::{Confidence, Provenance};
+    #[cfg(feature = "rust")]
+    use crate::graph::types::Confidence;
+    #[cfg(any(
+        feature = "rust",
+        feature = "python",
+        feature = "typescript",
+        feature = "go"
+    ))]
+    use crate::graph::types::Provenance;
 
     /// Python: an import disambiguates an otherwise-ambiguous cross-file call —
     /// the scope tier binds the call to the imported definition alone, where the
     /// name tier would fan out to every same-named def.
+    #[cfg(feature = "rust")]
     #[test]
     fn rejects_malformed_facts_at_checked_boundary() {
         let mut facts = RustExtractor.extract("fn run() {}", "src/a.rs").unwrap();
@@ -137,6 +164,7 @@ mod tests {
         assert!(ScopeGraphResolver.resolve(&[facts]).is_err());
     }
 
+    #[cfg(feature = "python")]
     #[test]
     fn python_import_disambiguates_ambiguous_call() {
         use crate::graph::types::RefRole;
@@ -174,6 +202,7 @@ mod tests {
 
     /// TypeScript: an import disambiguates an ambiguous cross-file call, exactly
     /// as for Python — the scope tier binds to the imported definition alone.
+    #[cfg(feature = "typescript")]
     #[test]
     fn typescript_import_disambiguates_ambiguous_call() {
         use crate::extract::TypeScriptExtractor;
@@ -211,6 +240,7 @@ mod tests {
     }
 
     /// All edges whose target renders as a `local …` SCIP string.
+    #[cfg(any(feature = "rust", feature = "python"))]
     fn local_edges(graph: &CodeGraph) -> Vec<&Edge> {
         graph
             .edges
@@ -219,6 +249,7 @@ mod tests {
             .collect()
     }
 
+    #[cfg(feature = "rust")]
     #[test]
     fn resolves_local_binding() {
         // `helper` binds to the `let helper`; `make()` binds to nothing → no edge.
@@ -248,6 +279,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "rust")]
     #[test]
     fn shadowing_latest_binding_wins() {
         // `val` is ≥ MIN_REF_LEN so the `val()` call is captured.
@@ -279,6 +311,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "rust")]
     #[test]
     fn resolves_param_binding() {
         // `callback` is a parameter; `callback()` resolves to it (tree-sitter
@@ -298,6 +331,7 @@ mod tests {
         assert_eq!(locals[0].confidence, Confidence::Exact);
     }
 
+    #[cfg(feature = "rust")]
     #[test]
     fn unbound_name_produces_no_edge() {
         let facts = RustExtractor
@@ -310,6 +344,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "python")]
     #[test]
     fn non_scope_language_is_graceful_noop() {
         // Python refs carry scope: None → no local edges, no panic.
@@ -322,6 +357,7 @@ mod tests {
         assert!(local_edges(&graph).is_empty());
     }
 
+    #[cfg(feature = "rust")]
     #[test]
     fn block_local_not_visible_to_outer_ref() {
         // `let val` lives in the inner block; `val()` is in the function scope
@@ -340,6 +376,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "rust")]
     #[test]
     fn ignores_role_noise_only_local_edges_counted() {
         // Sanity: `helper` has no definition or local in this file, so it binds to
@@ -356,6 +393,7 @@ mod tests {
 
     // ── U6: Definition arm ────────────────────────────────────────────────────
 
+    #[cfg(feature = "rust")]
     #[test]
     fn resolves_same_file_definition() {
         // `helper()` call inside `run()` must resolve to the top-level `helper`
@@ -400,6 +438,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "rust")]
     #[test]
     fn same_file_definition_wins_over_cross_file_fan_out() {
         // Three files each with a `helper` function. `caller.rs` also has `run`
@@ -454,6 +493,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "rust")]
     #[test]
     fn local_shadows_same_name_definition() {
         // `process` is both a top-level function and a `let` binding inside `run`.
@@ -489,6 +529,7 @@ mod tests {
     // ── U7: Import arm (cross-file import resolution) ─────────────────────────
 
     /// All Import-role edges in the graph.
+    #[cfg(feature = "rust")]
     fn import_edges(graph: &CodeGraph) -> Vec<&Edge> {
         graph
             .edges
@@ -497,6 +538,7 @@ mod tests {
             .collect()
     }
 
+    #[cfg(feature = "rust")]
     #[test]
     fn resolves_unique_cross_file_import_exact() {
         // `src/conf.rs` defines `Config` (namespace chain ["conf"]).
@@ -540,6 +582,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "go")]
     #[test]
     fn go_same_package_cross_file_call_resolves_scoped() {
         // Go same-package call with NO import: `Run` in main.go calls `Helper`
@@ -584,6 +627,7 @@ mod tests {
         assert_eq!(edges[0].provenance, Provenance::ScopeGraph);
     }
 
+    #[cfg(feature = "rust")]
     #[test]
     fn ambiguous_import_becomes_precise_single_exact_edge() {
         // Two files define `Config` in DIFFERENT namespaces:
@@ -628,6 +672,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "rust")]
     #[test]
     fn unmatched_import_yields_no_edge() {
         // Importer's from_path ("missing") matches no definition's namespace
@@ -647,6 +692,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "rust")]
     #[test]
     fn same_file_recursion_emits_no_self_edge() {
         // A recursive free function calls itself unqualified. The call binds to
@@ -677,6 +723,7 @@ mod tests {
     // ── U8b: Qualified-call resolution ────────────────────────────────────────
 
     /// Edges from `run` (the caller) that are NOT local edges and NOT Import edges.
+    #[cfg(any(feature = "rust", feature = "ruby"))]
     fn call_edges_from_run(graph: &CodeGraph) -> Vec<&Edge> {
         graph
             .edges
@@ -689,6 +736,7 @@ mod tests {
             .collect()
     }
 
+    #[cfg(feature = "rust")]
     #[test]
     fn qualified_call_unique_match_emits_exact_edge() {
         // `src/mod_a.rs` defines `process` → namespace chain ["mod_a"]
@@ -745,6 +793,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "ruby")]
     #[test]
     fn type_qualified_call_resolves_to_enclosing_type_member() {
         // A qualifier may name an enclosing TYPE, not just a namespace. Ruby's
@@ -798,6 +847,7 @@ mod tests {
         assert_eq!(call_edges[0].confidence, Confidence::Exact);
     }
 
+    #[cfg(feature = "rust")]
     #[test]
     fn qualified_call_unmatched_qualifier_yields_no_edge() {
         // `process` is defined in namespace ["conf"] but the caller writes
@@ -823,6 +873,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "rust")]
     #[test]
     fn unqualified_call_still_resolves_via_scope_walk() {
         // Regression: restructuring the loop must not break unqualified resolution.
@@ -862,6 +913,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "rust")]
     #[test]
     fn typeref_resolves_to_same_file_definition() {
         use crate::graph::types::RefRole;
@@ -919,6 +971,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "rust")]
     #[test]
     fn nested_qualifier_resolves_to_nested_namespace() {
         // `src/a/b.rs` → namespaces ["a", "b"] → SCIP id ends with `a/b/process().`
@@ -963,6 +1016,7 @@ mod tests {
     /// | Same-file top-level definition         | `Scoped`            |
     /// | Cross-file import (unique path-suffix) | `Exact`             |
     /// | Path-qualified call (unique ns-suffix) | `Exact`             |
+    #[cfg(feature = "rust")]
     #[test]
     fn confidence_contract_per_resolution_kind() {
         // ── 1. Local binding → Exact ─────────────────────────────────────────

@@ -61,6 +61,8 @@ pub(crate) struct MutationBounds {
 /// the same file set: both share the same per-file build and stitch passes.
 ///
 /// ```
+/// # #[cfg(feature = "rust")]
+/// # {
 /// use code2graph::{extract_path, resolve::IncrementalGraph};
 ///
 /// // `app` imports `Config` from `conf`.
@@ -79,6 +81,7 @@ pub(crate) struct MutationBounds {
 /// let app = extract_path("src/app.rs", "use conf::Config;\npub fn helper() {}").unwrap();
 /// graph.upsert(&app);
 /// assert!(resolves_import(graph.graph()));
+/// # }
 /// ```
 ///
 /// [`ScopeGraphResolver`]: super::super::ScopeGraphResolver
@@ -432,12 +435,22 @@ impl Default for IncrementalGraph {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(
+    test,
+    any(feature = "rust", feature = "python", feature = "ruby", feature = "go")
+))]
 mod tests {
     use super::*;
-    use crate::extract::{Extractor, PythonExtractor, RustExtractor};
+    #[cfg(any(feature = "rust", feature = "python", feature = "ruby", feature = "go"))]
+    use crate::extract::Extractor;
+    #[cfg(feature = "python")]
+    use crate::extract::PythonExtractor;
+    #[cfg(feature = "rust")]
+    use crate::extract::RustExtractor;
     use crate::graph::types::{CodeGraph, Confidence, Edge, EdgeKey};
-    use crate::resolve::{Resolver, ScopeGraphResolver, SymbolTableResolver};
+    #[cfg(feature = "rust")]
+    use crate::resolve::SymbolTableResolver;
+    use crate::resolve::{Resolver, ScopeGraphResolver};
 
     /// Stable per-edge key: structural edge identity plus its confidence.
     fn edge_key(e: &Edge) -> (EdgeKey, Confidence) {
@@ -467,6 +480,7 @@ mod tests {
 
     /// A small, realistic Rust file set exercising cross-file import, a same-file
     /// definition call, and a local binding.
+    #[cfg(feature = "rust")]
     fn rust_set() -> Vec<FileFacts> {
         let conf = RustExtractor
             .extract("pub struct Config {}", "src/conf.rs")
@@ -483,6 +497,7 @@ mod tests {
         vec![conf, app, util]
     }
 
+    #[cfg(feature = "rust")]
     #[test]
     fn incremental_matches_batch_same_set() {
         let files = rust_set();
@@ -495,6 +510,7 @@ mod tests {
     /// store keys by path (last upsert wins); the batch resolvers must agree —
     /// deduping to the LAST version — so the two paths never diverge, and no two
     /// symbols ever share a SymbolId.
+    #[cfg(feature = "rust")]
     #[test]
     fn duplicate_file_key_last_wins_matches_batch() {
         // v1 and v2 share the path `src/app.rs` but define different functions.
@@ -549,6 +565,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "python")]
     #[test]
     fn reupsert_changed_file_matches_batch_of_new_set() {
         // Two distinct definitions of `process`; B's import path selects which one
@@ -582,6 +599,7 @@ mod tests {
         assert_multiset_eq(&store.graph(), &batch);
     }
 
+    #[cfg(feature = "rust")]
     #[test]
     fn remove_drops_only_that_file() {
         let files = rust_set();
@@ -618,7 +636,7 @@ mod tests {
     ///
     /// This test is the contract that makes persistence safe: if it passes, a
     /// consumer can cache subgraphs to disk and reload them without loss or drift.
-    #[cfg(feature = "serde")]
+    #[cfg(all(feature = "serde", feature = "rust"))]
     #[test]
     fn reload_from_serialized_subgraphs_matches_original() {
         use crate::resolve::FileSubgraph;
@@ -645,6 +663,7 @@ mod tests {
         assert_multiset_eq(&restored.graph(), &store.graph());
     }
 
+    #[cfg(feature = "rust")]
     #[test]
     fn restoring_a_subgraph_under_a_different_key_leaves_existing_state_unchanged() {
         let original = RustExtractor
@@ -668,6 +687,7 @@ mod tests {
         assert_multiset_eq(&store.graph(), &before);
     }
 
+    #[cfg(feature = "rust")]
     #[test]
     fn restoring_a_subgraph_with_a_foreign_caller_leaves_state_unchanged() {
         let consumer = RustExtractor
@@ -696,6 +716,7 @@ mod tests {
         assert_multiset_eq(&store.graph(), &before);
     }
 
+    #[cfg(feature = "rust")]
     #[test]
     fn upsert_is_idempotent() {
         let files = rust_set();
@@ -716,6 +737,7 @@ mod tests {
         assert_multiset_eq(&twice.graph(), &once_graph);
     }
 
+    #[cfg(feature = "rust")]
     #[test]
     fn stored_pending_state_keeps_duplicate_occurrences_and_reconciles_provider_changes() {
         let consumer = RustExtractor
@@ -772,6 +794,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "rust")]
     #[test]
     fn checked_batch_is_atomic_when_a_later_upsert_is_malformed() {
         let original = RustExtractor
@@ -810,6 +833,7 @@ mod tests {
         assert_multiset_eq(&store.graph(), &before);
     }
 
+    #[cfg(feature = "rust")]
     #[test]
     fn checked_batch_rejects_duplicate_and_conflicting_targets_without_mutation() {
         let existing = RustExtractor
@@ -865,6 +889,7 @@ mod tests {
         assert_multiset_eq(&store.graph(), &before);
     }
 
+    #[cfg(feature = "rust")]
     #[test]
     fn typeref_module_preference_and_ordinary_fallback_restitch_unchanged_owner() {
         let consumer = RustExtractor
@@ -896,6 +921,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "rust")]
     #[test]
     fn qualified_namespace_candidate_add_remove_restitches_unchanged_owner() {
         let consumer = RustExtractor
@@ -959,6 +985,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "rust")]
     #[test]
     fn module_candidate_add_remove_restitches_unchanged_owner() {
         let consumer = RustExtractor
@@ -1060,6 +1087,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "rust")]
     #[test]
     fn restored_pending_state_tracks_later_provider_mutations() {
         let consumer = RustExtractor
@@ -1096,6 +1124,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "rust")]
     #[test]
     fn checked_mixed_batch_matches_fresh_scope_graph_resolution() {
         let old = RustExtractor

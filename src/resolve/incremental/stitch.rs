@@ -243,7 +243,7 @@ pub(crate) fn stitch(pending: &[PendingRef], index: &GlobalIndex) -> Vec<Edge> {
         .collect()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "rust"))]
 mod tests {
     use super::super::subgraph::build_subgraph;
     use super::*;

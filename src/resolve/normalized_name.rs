@@ -99,7 +99,9 @@ impl Resolver for NormalizedNameResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "rust")]
     use crate::extract::{Extractor, RustExtractor};
+    #[cfg(feature = "rust")]
     use crate::graph::types::{Occurrence, RefRole, Reference};
 
     /// A case-differing reference resolves to a `Heuristic`/`NormalizedName` edge.
@@ -107,6 +109,7 @@ mod tests {
     /// `fn process()` is defined in one file; a reference written `Process` (upper
     /// P) appears in another. The resolver must produce exactly one edge pointing
     /// at `process`, tagged `Confidence::Heuristic` + `Provenance::NormalizedName`.
+    #[cfg(feature = "rust")]
     #[test]
     fn case_differing_reference_resolves_at_heuristic() {
         // File A: defines `process`.
@@ -186,6 +189,7 @@ mod tests {
     /// `NormalizedNameResolver` only adds recall that `SymbolTableResolver` does
     /// not cover. When the reference name and the definition leaf name are
     /// identical in case, the resolver must produce no edge.
+    #[cfg(feature = "rust")]
     #[test]
     fn exact_case_match_not_emitted() {
         let lib = RustExtractor
@@ -232,6 +236,7 @@ mod tests {
     }
 
     /// A reference with no case-folded match produces no edge at all.
+    #[cfg(feature = "rust")]
     #[test]
     fn no_match_emits_nothing() {
         let lib = RustExtractor

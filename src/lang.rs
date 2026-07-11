@@ -5,6 +5,15 @@
 //! This is the single place that enumerates language coverage; extraction and
 //! resolution dispatch off it.
 
+/// Whether a language's extractor is included in this build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LanguageAvailability {
+    /// The Cargo feature for this language is enabled.
+    Enabled,
+    /// The Cargo feature for this language is disabled.
+    FeatureDisabled,
+}
+
 /// A source language code2graph knows how to parse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Language {
@@ -34,6 +43,36 @@ pub enum Language {
 }
 
 impl Language {
+    /// Reports whether this language's extractor is included in the current build.
+    pub const fn availability(self) -> LanguageAvailability {
+        match self {
+            Language::Rust => availability(cfg!(feature = "rust")),
+            Language::TypeScript | Language::JavaScript => {
+                availability(cfg!(feature = "typescript"))
+            }
+            Language::Python => availability(cfg!(feature = "python")),
+            Language::Go => availability(cfg!(feature = "go")),
+            Language::Shell => availability(cfg!(feature = "shell")),
+            Language::C => availability(cfg!(feature = "c")),
+            Language::Cpp => availability(cfg!(feature = "cpp")),
+            Language::Java => availability(cfg!(feature = "java")),
+            Language::Ruby => availability(cfg!(feature = "ruby")),
+            Language::Php => availability(cfg!(feature = "php")),
+            Language::Swift => availability(cfg!(feature = "swift")),
+            Language::Kotlin => availability(cfg!(feature = "kotlin")),
+            Language::Solidity => availability(cfg!(feature = "solidity")),
+            Language::Sql => availability(cfg!(feature = "sql")),
+            Language::Hcl => availability(cfg!(feature = "hcl")),
+            Language::CSharp => availability(cfg!(feature = "csharp")),
+            Language::Scala => availability(cfg!(feature = "scala")),
+            Language::Dart => availability(cfg!(feature = "dart")),
+            Language::Lua => availability(cfg!(feature = "lua")),
+            Language::Luau => availability(cfg!(feature = "luau")),
+            Language::Pascal => availability(cfg!(feature = "pascal")),
+            Language::Svelte => availability(cfg!(feature = "svelte")),
+        }
+    }
+
     /// Every `Language` variant. Kept exhaustive by the `all_is_exhaustive` test.
     pub const ALL: &[Language] = &[
         Language::Rust,
@@ -137,9 +176,60 @@ impl Language {
     }
 }
 
+const fn availability(enabled: bool) -> LanguageAvailability {
+    if enabled {
+        LanguageAvailability::Enabled
+    } else {
+        LanguageAvailability::FeatureDisabled
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn availability_matches_each_language_feature_in_every_build() {
+        macro_rules! assert_availability {
+            ($language:expr, $feature:literal) => {
+                assert_eq!(
+                    $language.availability(),
+                    if cfg!(feature = $feature) {
+                        LanguageAvailability::Enabled
+                    } else {
+                        LanguageAvailability::FeatureDisabled
+                    },
+                    "{language:?} must track the `{feature}` Cargo feature",
+                    language = $language,
+                    feature = $feature,
+                );
+            };
+        }
+
+        assert_availability!(Language::Rust, "rust");
+        assert_availability!(Language::TypeScript, "typescript");
+        assert_availability!(Language::JavaScript, "typescript");
+        assert_availability!(Language::Python, "python");
+        assert_availability!(Language::Go, "go");
+        assert_availability!(Language::Shell, "shell");
+        assert_availability!(Language::C, "c");
+        assert_availability!(Language::Cpp, "cpp");
+        assert_availability!(Language::Java, "java");
+        assert_availability!(Language::Ruby, "ruby");
+        assert_availability!(Language::Php, "php");
+        assert_availability!(Language::Swift, "swift");
+        assert_availability!(Language::Kotlin, "kotlin");
+        assert_availability!(Language::Solidity, "solidity");
+        assert_availability!(Language::Sql, "sql");
+        assert_availability!(Language::Hcl, "hcl");
+        assert_availability!(Language::CSharp, "csharp");
+        assert_availability!(Language::Scala, "scala");
+        assert_availability!(Language::Dart, "dart");
+        assert_availability!(Language::Lua, "lua");
+        assert_availability!(Language::Luau, "luau");
+        assert_availability!(Language::Pascal, "pascal");
+        assert_availability!(Language::Svelte, "svelte");
+    }
 
     #[test]
     fn extension_dispatch() {

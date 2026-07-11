@@ -150,8 +150,56 @@ pub fn svelte() -> Language {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(any(
+        feature = "rust",
+        feature = "python",
+        feature = "typescript",
+        feature = "go",
+        feature = "java",
+        feature = "c",
+        feature = "cpp",
+        feature = "ruby",
+        feature = "php",
+        feature = "shell",
+        feature = "swift",
+        feature = "kotlin",
+        feature = "solidity",
+        feature = "sql",
+        feature = "hcl",
+        feature = "csharp",
+        feature = "scala",
+        feature = "dart",
+        feature = "lua",
+        feature = "luau",
+        feature = "pascal",
+        feature = "svelte"
+    ))]
     use tree_sitter::{LANGUAGE_VERSION, MIN_COMPATIBLE_LANGUAGE_VERSION};
 
+    #[cfg(any(
+        feature = "rust",
+        feature = "python",
+        feature = "typescript",
+        feature = "go",
+        feature = "java",
+        feature = "c",
+        feature = "cpp",
+        feature = "ruby",
+        feature = "php",
+        feature = "shell",
+        feature = "swift",
+        feature = "kotlin",
+        feature = "solidity",
+        feature = "sql",
+        feature = "hcl",
+        feature = "csharp",
+        feature = "scala",
+        feature = "dart",
+        feature = "lua",
+        feature = "luau",
+        feature = "pascal",
+        feature = "svelte"
+    ))]
     fn check(name: &str, lang: tree_sitter::Language) {
         let v = lang.abi_version();
         assert!(
@@ -160,6 +208,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "_extractors")]
     #[test]
     fn abi_versions_are_compatible() {
         #[cfg(feature = "rust")]
@@ -206,5 +255,7 @@ mod tests {
         check("luau", super::luau());
         #[cfg(feature = "pascal")]
         check("pascal", super::pascal());
+        #[cfg(feature = "svelte")]
+        check("svelte", super::svelte());
     }
 }

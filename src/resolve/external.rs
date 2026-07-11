@@ -157,17 +157,24 @@ impl Resolver for ExternalResolver {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "python", feature = "rust")))]
 mod tests {
     use super::*;
-    use crate::extract::{Extractor, PythonExtractor, RustExtractor};
-    use crate::graph::types::{Occurrence, RefRole, Reference};
+    #[cfg(any(feature = "python", feature = "rust"))]
+    use crate::extract::Extractor;
+    #[cfg(feature = "python")]
+    use crate::extract::PythonExtractor;
+    #[cfg(feature = "rust")]
+    use crate::extract::RustExtractor;
+    #[cfg(feature = "rust")]
+    use crate::graph::types::{Occurrence, Reference};
 
     // ── Test 1: Python reachability happy path ────────────────────────────────
 
     /// `from requests import get` + `get()` → exactly one External Call edge
     /// whose `to` ends with `requests/get.`, `Confidence::NameOnly`,
     /// `Provenance::External`, and `from` is the `run` symbol.
+    #[cfg(feature = "python")]
     #[test]
     fn python_import_backed_call_emits_external_edge() {
         let file = PythonExtractor
@@ -231,6 +238,7 @@ mod tests {
 
     /// A call to `mystery()` with no import of `mystery` must produce ZERO
     /// external edges. Non-import-backed unresolved calls are silently skipped.
+    #[cfg(feature = "python")]
     #[test]
     fn non_import_backed_call_emits_nothing() {
         let file = PythonExtractor
@@ -270,6 +278,7 @@ mod tests {
     /// `src/main.rs` that imports `helper` via `use util::helper` (injected as an
     /// Import ref) and calls it. `ExternalResolver` must emit zero External edges
     /// because `helper` appears in the global by_name set.
+    #[cfg(feature = "rust")]
     #[test]
     fn internally_defined_name_not_shadowed_by_external_edge() {
         let lib = RustExtractor
@@ -343,6 +352,7 @@ mod tests {
     /// bare name when `use` is at the top level, we inject the import and call
     /// refs explicitly — the same technique used in the symbol-table and
     /// conformance tests.
+    #[cfg(feature = "rust")]
     #[test]
     fn rust_use_import_call_emits_external_edge() {
         // Extract a real Rust file for symbols so we have a containing span.
@@ -422,6 +432,7 @@ mod tests {
 
     /// Resolving the same input twice yields identical edge vectors (same SCIP
     /// strings in the same order).
+    #[cfg(feature = "python")]
     #[test]
     fn deterministic_on_repeated_resolution() {
         let file = PythonExtractor

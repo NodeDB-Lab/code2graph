@@ -231,6 +231,7 @@ mod tests {
     /// A `LayeredResolver::default_dense()` is a superset of `ScopeGraphResolver`
     /// for the same inputs: every edge produced by `ScopeGraphResolver` (matched
     /// by structural source/target identity and role) also appears in the layered output.
+    #[cfg(feature = "rust")]
     #[test]
     fn layered_is_superset_of_scope_graph() {
         use crate::extract::{Extractor, RustExtractor};

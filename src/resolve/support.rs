@@ -120,7 +120,7 @@ pub(crate) fn enclosing_path_ends_with<S: AsRef<str>>(candidate: &SymbolId, segs
         .all(|(a, b)| *a == b.as_ref())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "rust"))]
 mod tests {
     use super::*;
     use crate::extract::{Extractor, RustExtractor};

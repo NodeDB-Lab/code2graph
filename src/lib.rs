@@ -14,12 +14,15 @@
 //! ```
 //!
 //! ```
+//! # #[cfg(feature = "rust")]
+//! # {
 //! use code2graph::{extract_path, resolve::{Resolver, SymbolTableResolver}};
 //!
 //! let a = extract_path("src/util.rs", "pub fn helper() {}").unwrap();
 //! let b = extract_path("src/main.rs", "pub fn run() { helper() }").unwrap();
 //! let graph = SymbolTableResolver.resolve(&[a, b]).unwrap();
 //! assert_eq!(graph.edges.len(), 1); // run --calls--> helper
+//! # }
 //! ```
 //!
 //! ## Design
@@ -48,7 +51,9 @@
 //! ## Coverage
 //!
 //! All 23 languages ([`lang::Language`]) are implemented end-to-end, each
-//! behind the [`extract::Extractor`] trait.
+//! behind a Cargo feature that is enabled by default. Use
+//! [`Language::availability`] (and its [`LanguageAvailability`] result) before
+//! extraction when building with a selected feature subset.
 
 pub mod error;
 pub mod extract;
@@ -67,7 +72,7 @@ pub use graph::{
     EntryPoint, FfiAbi, FfiExport, FileFacts, Occurrence, Provenance, RefRole, Reference, Scope,
     ScopeId, ScopeKind, Symbol, SymbolKind, TypeRefContext, Visibility, validate_file_facts,
 };
-pub use lang::Language;
+pub use lang::{Language, LanguageAvailability};
 pub use resolve::{
     FILE_SUBGRAPH_SCHEMA_VERSION, FfiBridgeResolver, FileChange, FileSubgraph, IncrementalGraph,
     LayeredResolver, Resolver, ScopeGraphDelta, ScopeGraphResolver, ScopeSnapshotToken,

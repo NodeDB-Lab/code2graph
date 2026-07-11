@@ -57,7 +57,7 @@ pub fn validate_file_facts(facts: &[FileFacts]) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "rust"))]
 mod tests {
     use super::*;
     use crate::extract::{Extractor, RustExtractor};

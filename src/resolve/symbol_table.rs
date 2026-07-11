@@ -153,13 +153,32 @@ impl Resolver for SymbolTableResolver {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(
+    test,
+    any(
+        feature = "rust",
+        feature = "python",
+        feature = "java",
+        feature = "sql",
+        feature = "hcl"
+    )
+))]
 mod tests {
     use super::*;
+    #[cfg(any(
+        feature = "rust",
+        feature = "python",
+        feature = "java",
+        feature = "sql",
+        feature = "hcl"
+    ))]
     use crate::extract::Extractor;
+    #[cfg(feature = "java")]
     use crate::extract::JavaExtractor;
+    #[cfg(feature = "rust")]
     use crate::extract::RustExtractor;
 
+    #[cfg(feature = "rust")]
     #[test]
     fn resolves_cross_file_call() {
         let lib = RustExtractor
@@ -187,6 +206,7 @@ mod tests {
         assert_eq!(e.occ.file, "src/main.rs");
     }
 
+    #[cfg(feature = "rust")]
     #[test]
     fn unresolved_calls_produce_no_edge() {
         let main = RustExtractor
@@ -196,6 +216,7 @@ mod tests {
         assert!(graph.edges.is_empty());
     }
 
+    #[cfg(feature = "java")]
     #[test]
     fn resolves_cross_file_inheritance() {
         let base = JavaExtractor
@@ -232,6 +253,7 @@ mod tests {
         assert_eq!(e.occ.file, "src/p/Sub.java");
     }
 
+    #[cfg(feature = "rust")]
     #[test]
     fn resolves_cross_file_rust_trait_impl_inheritance() {
         // File A defines the trait.
@@ -273,6 +295,7 @@ mod tests {
         assert_eq!(e.occ.file, "src/p.rs");
     }
 
+    #[cfg(feature = "python")]
     #[test]
     fn resolves_cross_file_python_import_edge() {
         use crate::extract::PythonExtractor;
@@ -315,6 +338,7 @@ mod tests {
         assert_eq!(e.confidence, Confidence::Scoped);
     }
 
+    #[cfg(feature = "rust")]
     #[test]
     fn resolves_import_edge_from_module() {
         use crate::graph::types::{Occurrence, Reference};
@@ -371,6 +395,7 @@ mod tests {
         assert_eq!(e.confidence, Confidence::Scoped);
     }
 
+    #[cfg(feature = "rust")]
     #[test]
     fn ambiguous_name_fan_out_stays_name_only() {
         // Two files each define a function with the same leaf name "process".
@@ -437,6 +462,7 @@ mod tests {
     /// cleanly: `package com.example;` → namespaces `["com","example"]`, and
     /// `import com.example.Config` → `from_path = "com.example"`.  The suffix
     /// match is exact and unambiguous.
+    #[cfg(feature = "java")]
     #[test]
     fn import_disambiguation_promotes_matching_package() {
         // File 1: com.example package defines Config.
@@ -510,6 +536,7 @@ mod tests {
 
     /// Negative: `from_path` that matches no candidate's namespace leaves all
     /// edges at their existing Win-1 confidence (NameOnly for ambiguous fan-out).
+    #[cfg(feature = "java")]
     #[test]
     fn import_disambiguation_no_match_leaves_fan_out_name_only() {
         // Two classes named `Config` in unrelated packages.
@@ -562,6 +589,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "rust")]
     #[test]
     fn typeref_produces_typeref_edge() {
         // File A defines `Config`; file B uses it as a parameter type.
@@ -618,6 +646,7 @@ mod tests {
     /// Intra-SQL: a query file referencing a table defined in a schema file
     /// resolves to a TypeRef edge pointing at the table's SCIP symbol, Scoped
     /// (unique global candidate → Win-1).
+    #[cfg(feature = "sql")]
     #[test]
     fn intra_sql_typeref_edge_from_query_to_table() {
         use crate::extract::SqlExtractor;
@@ -672,6 +701,7 @@ mod tests {
     /// Code→SQL: a Rust file referencing the type name `users` resolves to the
     /// SQL `users` table definition.  Confidence is Scoped when `users` is the
     /// only global candidate (Win-1).
+    #[cfg(all(feature = "rust", feature = "sql"))]
     #[test]
     fn code_to_sql_typeref_edge_rust_to_table() {
         use crate::extract::SqlExtractor;
@@ -741,6 +771,7 @@ mod tests {
     /// The traversal emits a TypeRef ref (name `main`, qualifier `aws_subnet`).
     /// With `aws_subnet/main#` as the sole global candidate for name `main`,
     /// Win-1 fires → Confidence::Scoped.
+    #[cfg(feature = "hcl")]
     #[test]
     fn intra_hcl_typeref_edge_from_instance_to_subnet() {
         use crate::extract::HclExtractor;
@@ -809,6 +840,7 @@ resource "aws_instance" "web" { subnet_id = aws_subnet.main.id }
     /// `resource "aws_instance" "web" { x = module.vpc.id }`.
     /// Traversal → name `vpc`, qualifier `module`; `module/vpc#` is the sole
     /// candidate → Win-1 → Scoped.
+    #[cfg(feature = "hcl")]
     #[test]
     fn intra_hcl_typeref_edge_from_resource_to_module() {
         use crate::extract::HclExtractor;
@@ -866,6 +898,7 @@ resource "aws_instance" "web" { vpc_id = module.vpc.id }
     }
 
     /// Regression: single-candidate import (Win-1) remains Scoped with Win-2 in place.
+    #[cfg(feature = "java")]
     #[test]
     fn import_disambiguation_single_candidate_stays_scoped() {
         // Identical to the existing Python single-candidate test, using Java.
@@ -899,6 +932,7 @@ resource "aws_instance" "web" { vpc_id = module.vpc.id }
         );
     }
 
+    #[cfg(feature = "rust")]
     #[test]
     fn ordinary_references_do_not_target_same_named_modules() {
         let lib = RustExtractor

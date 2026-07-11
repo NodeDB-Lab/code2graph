@@ -135,7 +135,7 @@ Coverage spans systems, JVM, scripting, web (incl. embedded single-file componen
 
 > **Full coverage, honestly:** [`docs/supported-languages.md`](docs/supported-languages.md) — the per-language matrix (extraction depth, what each emits, and the candidate / not-feasible / out-of-scope lists). Cross-language FFI boundaries: [`docs/ffi-support-matrix.md`](docs/ffi-support-matrix.md).
 >
-> The **canonical, always-current set** is the `Language` enum + extension dispatch in [`src/lang.rs`](src/lang.rs) — read that, never a list cached in prose. Each language is a Cargo feature (all on by default). Adding one follows a mechanical recipe — see [CONTRIBUTING.md](CONTRIBUTING.md#adding-a-language).
+> The **canonical, always-current set** is the `Language` enum + extension dispatch in [`src/lang.rs`](src/lang.rs) — read that, never a list cached in prose. Each language is a Cargo feature (all on by default). Builds can select a smaller set with, for example, `default-features = false, features = ["rust"]`; check `Language::availability()` before extraction, because a disabled language returns `UnsupportedLanguage`. JavaScript shares the `typescript` feature, and `svelte` enables it transitively. Adding one follows a mechanical recipe — see [CONTRIBUTING.md](CONTRIBUTING.md#adding-a-language).
 
 ## Resolution tiers
 

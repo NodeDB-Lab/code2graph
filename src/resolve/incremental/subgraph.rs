@@ -361,7 +361,7 @@ fn is_visible(b: &Binding, ref_byte: usize) -> bool {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "rust"))]
 mod tests {
     use super::*;
     use crate::extract::{Extractor, RustExtractor};

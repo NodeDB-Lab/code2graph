@@ -221,10 +221,16 @@ fn find_inherited(
     None
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "java", feature = "rust")))]
 mod tests {
     use super::*;
-    use crate::extract::{Extractor, JavaExtractor, RustExtractor};
+    #[cfg(any(feature = "java", feature = "rust"))]
+    use crate::extract::Extractor;
+    #[cfg(feature = "java")]
+    use crate::extract::JavaExtractor;
+    #[cfg(feature = "rust")]
+    use crate::extract::RustExtractor;
+    #[cfg(feature = "java")]
     use crate::graph::types::{Occurrence, Reference};
 
     /// Build a synthetic, type-qualified member-call reference. No extractor
@@ -234,6 +240,7 @@ mod tests {
     /// same way the symbol-table tests inject `Import` references. The symbols
     /// and the supertype edges under test are still produced by the real
     /// extractor.
+    #[cfg(feature = "java")]
     fn qualified_call(name: &str, qualifier: &str, file: &str, byte: usize) -> Reference {
         Reference {
             name: name.to_owned(),
@@ -255,6 +262,7 @@ mod tests {
     /// `class Base { void process(){} }`, `class Sub extends Base {}`, and a
     /// caller that qualifies `Sub.process()`. The only definition of `process`
     /// lives on `Base`, so conformance must link the call to `Base#process()`.
+    #[cfg(feature = "java")]
     #[test]
     fn java_inherited_method_resolves_via_conformance() {
         let base = JavaExtractor
@@ -325,6 +333,7 @@ mod tests {
 
     /// Multi-level: `Sub extends Base`, `Base extends Root`, member only on
     /// `Root`. The depth-first walk must climb two levels to find it.
+    #[cfg(feature = "java")]
     #[test]
     fn java_multi_level_inheritance_walks_chain() {
         let root = JavaExtractor
@@ -384,6 +393,7 @@ mod tests {
     /// A direct member called qualified on its OWN type emits no conformance
     /// edge (the base resolvers already handle direct members; we must not
     /// duplicate at `Scoped`).
+    #[cfg(feature = "java")]
     #[test]
     fn direct_member_does_not_emit_conformance_edge() {
         let base = JavaExtractor
@@ -445,6 +455,7 @@ mod tests {
     ///   `type_name = "Person"`, no direct `hello` member, ancestor `"Greet"` has
     ///   `hello` → conformance emits `Call` edge to `Greet#hello().`,
     ///   `Confidence::Scoped`, `Provenance::Conformance`.
+    #[cfg(feature = "rust")]
     #[test]
     fn conformance_resolves_rust_inherited_trait_method_end_to_end() {
         let greet = RustExtractor
@@ -515,6 +526,7 @@ mod tests {
 
     /// An unqualified reference (no receiver type written) is deferred entirely:
     /// resolving it would need receiver-type inference, which v1 does not do.
+    #[cfg(feature = "java")]
     #[test]
     fn unqualified_reference_is_deferred() {
         let base = JavaExtractor

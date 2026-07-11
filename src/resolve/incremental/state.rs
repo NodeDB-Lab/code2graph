@@ -175,7 +175,7 @@ impl PendingState {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "rust"))]
 mod tests {
     use super::*;
     use crate::extract::{Extractor, RustExtractor};
