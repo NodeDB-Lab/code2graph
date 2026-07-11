@@ -13,10 +13,12 @@
 //!
 //! [`ScopeGraphResolver`]: super::ScopeGraphResolver
 
+mod delta;
 mod stitch;
 mod store;
 mod subgraph;
 
+pub use delta::{FileChange, ScopeGraphDelta, ScopeSnapshotToken};
 pub(crate) use stitch::{GlobalIndex, stitch};
 pub use store::IncrementalGraph;
 pub(crate) use subgraph::build_subgraph;
