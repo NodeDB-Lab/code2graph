@@ -15,6 +15,7 @@ pub mod project;
 pub mod refresh;
 pub mod request;
 pub mod result;
+pub mod selector;
 pub mod worker;
 
 pub use args::{ParseOutcome, parse_from};
@@ -59,6 +60,10 @@ pub use result::{
     RefRoleOutput, ReferenceOutput, RelationOutput, SelectorOutput, StableIoErrorOutput,
     StatusOutput, SymbolKindOutput, SymbolOutput, TypeRefContextOutput, success_exit_code,
     success_status,
+};
+pub use selector::{
+    SelectorContext, SelectorOptions, SelectorPurpose, SelectorRequest, SelectorResolution,
+    SelectorSummary, build_graph_index, resolve_selector,
 };
 pub use worker::{
     WORKER_SENTINEL, WorkerFailure, extract_inventory_file, is_worker_invocation, run_worker,
