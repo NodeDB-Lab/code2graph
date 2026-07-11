@@ -380,7 +380,11 @@ mod tests {
 
     #[test]
     fn every_fresh_tier_matches_its_direct_complete_resolver() {
-        let files = vec![facts("a.rs")];
+        let files = vec![
+            code2graph::extract_path("a.rs", "pub fn caller() { helper(); } pub fn helper() {}")
+                .expect("caller facts"),
+            code2graph::extract_path("b.rs", "pub fn unrelated() {}").expect("unrelated facts"),
+        ];
         let deadline = Deadline::new(None);
         for (tier, direct) in [
             (ResolverCacheTier::Name, SymbolTableResolver.resolve(&files)),
@@ -395,11 +399,17 @@ mod tests {
         ] {
             let resolved = resolve(tier, &files, None, None, &deadline, &NeverCancelled)
                 .expect("fresh resolution");
-            assert_eq!(
-                format!("{:?}", resolved.graph),
-                format!("{:?}", direct.unwrap())
+            let direct = direct.expect("direct complete resolution");
+            assert!(
+                !direct.symbols.is_empty(),
+                "{tier:?} symbols must be substantive"
             );
-            assert_eq!(resolved.file_subgraphs.len(), 1);
+            assert!(
+                !direct.edges.is_empty(),
+                "{tier:?} edges must be substantive"
+            );
+            assert_eq!(format!("{:?}", resolved.graph), format!("{:?}", direct));
+            assert_eq!(resolved.file_subgraphs.len(), 2);
             if tier == ResolverCacheTier::Scope {
                 assert!(resolved.file_subgraphs.values().all(Option::is_some));
             } else {

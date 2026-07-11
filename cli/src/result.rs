@@ -89,6 +89,10 @@ pub struct ProjectOutput {
     pub tier: ResolverTier,
     pub freshness: Freshness,
     pub cache: CacheDisposition,
+    pub completeness: CacheCompletenessOutput,
+    #[serde(rename = "omittedFiles")]
+    pub omitted_files: usize,
+    pub omissions: Vec<CacheOmissionOutput>,
 }
 
 /// Stable kebab-case spelling of [`SymbolKind`] in CLI output.
@@ -473,6 +477,7 @@ impl InventorySummaryOutput {
 pub struct CacheOmissionOutput {
     pub path: String,
     pub reason: String,
+    pub detail: String,
 }
 
 impl From<&CacheOmission> for CacheOmissionOutput {
@@ -480,6 +485,7 @@ impl From<&CacheOmission> for CacheOmissionOutput {
         Self {
             path: value.path.clone(),
             reason: value.reason.clone(),
+            detail: value.detail.clone(),
         }
     }
 }
@@ -683,6 +689,7 @@ mod tests {
         let omissions = vec![CacheOmission {
             path: "src/large.rs".into(),
             reason: "file-too-large".into(),
+            detail: "limit=1024".into(),
         }];
         LoadedSnapshot {
             candidate_id: crate::cache::CandidateId::new(
@@ -773,6 +780,19 @@ mod tests {
         );
     }
 
+    fn project_output_for_test(snapshot: &LoadedSnapshot, freshness: Freshness) -> ProjectOutput {
+        ProjectOutput {
+            root: "/project".into(),
+            snapshot: "snapshot".into(),
+            tier: ResolverTier::Scope,
+            freshness,
+            cache: CacheDisposition::Hit,
+            completeness: snapshot.completeness.into(),
+            omitted_files: snapshot.omissions.len(),
+            omissions: snapshot.omissions.iter().map(Into::into).collect(),
+        }
+    }
+
     #[test]
     fn index_output_and_cached_status_are_owned_stable_contracts() {
         let snapshot = loaded_snapshot(CacheCompleteness::Partial);
@@ -799,13 +819,7 @@ mod tests {
         assert_eq!(value["plan_decisions"]["extract"], 3);
 
         let status = StatusOutput::from_loaded_snapshot(
-            ProjectOutput {
-                root: "/project".into(),
-                snapshot: snapshot.input_digest.to_string(),
-                tier: ResolverTier::Scope,
-                freshness: Freshness::Frozen,
-                cache: CacheDisposition::Hit,
-            },
+            project_output_for_test(&snapshot, Freshness::Frozen),
             &snapshot,
             &ResourceLimits::default(),
         );
@@ -826,6 +840,7 @@ mod tests {
             omissions: vec![CacheOmissionOutput {
                 path: "src/large.rs".into(),
                 reason: "file-too-large".into(),
+                detail: "limit=1024".into(),
             }],
             changed: 2,
             deleted: 1,
@@ -840,25 +855,98 @@ mod tests {
             },
         };
         assert_eq!(
-            serde_json::to_string(&index).unwrap(),
-            r#"{"candidate":"candidate","snapshot":"snapshot","tier":"scope","completeness":"partial","inventory_file_count":3,"inventory_total_bytes":42,"omissions":[{"path":"src/large.rs","reason":"file-too-large"}],"changed":2,"deleted":1,"ignored_omissions":4,"attempts":3,"plan_decisions":{"need_hash":1,"reuse_facts":2,"extract":3,"remove":4,"omit":5}}"#
+            serde_json::to_value(&index).unwrap(),
+            serde_json::json!({
+                "candidate": "candidate",
+                "snapshot": "snapshot",
+                "tier": "scope",
+                "completeness": "partial",
+                "inventory_file_count": 3,
+                "inventory_total_bytes": 42,
+                "omissions": [{
+                    "path": "src/large.rs", "reason": "file-too-large", "detail": "limit=1024"
+                }],
+                "changed": 2,
+                "deleted": 1,
+                "ignored_omissions": 4,
+                "attempts": 3,
+                "plan_decisions": {
+                    "need_hash": 1, "reuse_facts": 2, "extract": 3, "remove": 4, "omit": 5
+                }
+            })
         );
 
         let snapshot = loaded_snapshot(CacheCompleteness::Partial);
         let status = StatusOutput::from_loaded_snapshot(
-            ProjectOutput {
-                root: "/project".into(),
-                snapshot: "snapshot".into(),
-                tier: ResolverTier::Scope,
-                freshness: Freshness::Stale,
-                cache: CacheDisposition::Hit,
-            },
+            project_output_for_test(&snapshot, Freshness::Stale),
             &snapshot,
             &ResourceLimits::default(),
         );
         assert_eq!(
-            serde_json::to_string(&status).unwrap(),
-            r#"{"project":{"root":"/project","snapshot":"snapshot","tier":"scope","freshness":"stale","cache":"hit"},"inventory":{"completeness":"partial","admitted_files":3,"admitted_bytes":42,"omitted_files":1,"omission_reasons":[]},"cached_omissions":[{"path":"src/large.rs","reason":"file-too-large"}],"max_files":1000,"max_file_bytes":1048576,"max_total_bytes":26214400,"max_depth":32,"result_limit":50,"impact_depth":2,"timeout_millis":null}"#
+            serde_json::to_value(&status).unwrap(),
+            serde_json::json!({
+                "project": {
+                    "root": "/project", "snapshot": "snapshot", "tier": "scope",
+                    "freshness": "stale", "cache": "hit", "completeness": "partial",
+                    "omittedFiles": 1,
+                    "omissions": [{
+                        "path": "src/large.rs", "reason": "file-too-large", "detail": "limit=1024"
+                    }]
+                },
+                "inventory": {
+                    "completeness": "partial", "admitted_files": 3, "admitted_bytes": 42,
+                    "omitted_files": 1, "omission_reasons": []
+                },
+                "cached_omissions": [{
+                    "path": "src/large.rs", "reason": "file-too-large", "detail": "limit=1024"
+                }],
+                "max_files": 1000,
+                "max_file_bytes": 1048576,
+                "max_total_bytes": 26214400,
+                "max_depth": 32,
+                "result_limit": 50,
+                "impact_depth": 2,
+                "timeout_millis": null
+            })
+        );
+    }
+
+    #[test]
+    fn project_metadata_json_is_complete_for_fresh_partial_stale_and_frozen() {
+        let snapshot = loaded_snapshot(CacheCompleteness::Partial);
+        for (freshness, spelling) in [
+            (Freshness::Fresh, "fresh"),
+            (Freshness::Stale, "stale"),
+            (Freshness::Frozen, "frozen"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(project_output_for_test(&snapshot, freshness)).unwrap(),
+                serde_json::json!({
+                    "root": "/project", "snapshot": "snapshot", "tier": "scope",
+                    "freshness": spelling, "cache": "hit", "completeness": "partial",
+                    "omittedFiles": 1,
+                    "omissions": [{
+                        "path": "src/large.rs", "reason": "file-too-large", "detail": "limit=1024"
+                    }]
+                })
+            );
+        }
+        let complete = ProjectOutput {
+            root: "/project".into(),
+            snapshot: "snapshot".into(),
+            tier: ResolverTier::Scope,
+            freshness: Freshness::Fresh,
+            cache: CacheDisposition::Hit,
+            completeness: CacheCompletenessOutput::Complete,
+            omitted_files: 0,
+            omissions: Vec::new(),
+        };
+        assert_eq!(
+            serde_json::to_value(complete).unwrap(),
+            serde_json::json!({
+                "root": "/project", "snapshot": "snapshot", "tier": "scope", "freshness": "fresh",
+                "cache": "hit", "completeness": "complete", "omittedFiles": 0, "omissions": []
+            })
         );
     }
 
@@ -920,6 +1008,9 @@ mod tests {
                         tier: ResolverTier::Dense,
                         freshness,
                         cache,
+                        completeness: snapshot.completeness.into(),
+                        omitted_files: snapshot.omissions.len(),
+                        omissions: snapshot.omissions.iter().map(Into::into).collect(),
                     },
                     &snapshot,
                     &ResourceLimits::default(),

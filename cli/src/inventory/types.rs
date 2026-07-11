@@ -111,6 +111,24 @@ impl OmissionReason {
             Self::ReadError { kind } => format!("read-error:{}", kind.as_str()),
         }
     }
+
+    /// Stable explanatory detail retained with persisted omission metadata.
+    pub fn detail(&self) -> String {
+        match self {
+            Self::UnrecognizedExtension => "unsupported file extension".into(),
+            Self::FeatureDisabled { language } => format!("language={}", language.as_str()),
+            Self::SymlinkFile => "symlink file is not followed".into(),
+            Self::SymlinkDirectory => "symlink directory is not followed".into(),
+            Self::NotRegularFile => "path is not a regular file".into(),
+            Self::FileTooLarge { limit } => format!("limit={limit}"),
+            Self::TotalBytesLimit { limit } => format!("limit={limit}"),
+            Self::FileCountLimit { limit } => format!("limit={limit}"),
+            Self::InvalidUtf8 => "source is not valid UTF-8".into(),
+            Self::ExtractionError => "isolated extraction failed".into(),
+            Self::ChangedDuringRead => "file changed while being read".into(),
+            Self::ReadError { kind } => format!("io-error={}", kind.as_str()),
+        }
+    }
 }
 
 /// A portable modification-time hint retained with admitted source bytes.

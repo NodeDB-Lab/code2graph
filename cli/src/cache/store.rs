@@ -229,8 +229,8 @@ impl CacheStore {
                 for omission in &encoded.omissions {
                     ensure_time(deadline)?;
                     self.connection.execute(
-                        "INSERT INTO candidate_omissions (candidate_id, path, reason) VALUES (?1, ?2, ?3)",
-                        params![encoded.candidate_id.as_slice(), omission.path, omission.reason],
+                        "INSERT INTO candidate_omissions (candidate_id, path, reason, detail) VALUES (?1, ?2, ?3, ?4)",
+                        params![encoded.candidate_id.as_slice(), omission.path, omission.reason, omission.detail],
                     ).map_err(|error| map_sqlite_error(error, deadline))?;
                 }
                 for file in &encoded.files {
@@ -462,13 +462,14 @@ impl CacheStore {
         let omissions = {
             let mut statement = self
                 .connection
-                .prepare("SELECT path, reason FROM candidate_omissions WHERE candidate_id = ?1 ORDER BY path ASC, reason ASC")
+                .prepare("SELECT path, reason, detail FROM candidate_omissions WHERE candidate_id = ?1 ORDER BY path ASC, reason ASC, detail ASC")
                 .map_err(|error| map_sqlite_error(error, deadline))?;
             statement
                 .query_map([candidate.candidate_id.as_slice()], |row| {
                     Ok(super::CacheOmission {
                         path: row.get(0)?,
                         reason: row.get(1)?,
+                        detail: row.get(2)?,
                     })
                 })
                 .map_err(|error| map_sqlite_error(error, deadline))?
@@ -577,13 +578,14 @@ impl CacheStore {
         let inventory_total_bytes = nonnegative(row.inventory_total_bytes)?;
         let omissions = {
             let mut statement = self.connection.prepare(
-                "SELECT path, reason FROM candidate_omissions WHERE candidate_id = ?1 ORDER BY path ASC, reason ASC",
+                "SELECT path, reason, detail FROM candidate_omissions WHERE candidate_id = ?1 ORDER BY path ASC, reason ASC, detail ASC",
             ).map_err(|error| map_sqlite_error(error, deadline))?;
             statement
                 .query_map([candidate_id.as_bytes().as_slice()], |row| {
                     Ok(super::CacheOmission {
                         path: row.get(0)?,
                         reason: row.get(1)?,
+                        detail: row.get(2)?,
                     })
                 })
                 .map_err(|error| map_sqlite_error(error, deadline))?
@@ -1473,10 +1475,12 @@ mod tests {
             super::super::CacheOmission {
                 path: "z".into(),
                 reason: "x".into(),
+                detail: "detail".into(),
             },
             super::super::CacheOmission {
                 path: "a".into(),
                 reason: "x".into(),
+                detail: "detail".into(),
             },
         ];
         unsorted.candidate_id = CandidateId::new(

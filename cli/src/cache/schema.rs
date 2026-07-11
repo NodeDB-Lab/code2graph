@@ -38,7 +38,7 @@ const TABLES: &[(&str, &str)] = &[
     ),
     (
         "candidate_omissions",
-        "CREATE TABLE candidate_omissions (candidate_id BLOB NOT NULL REFERENCES candidates(candidate_id) ON DELETE CASCADE, path TEXT NOT NULL CHECK (path <> '' AND instr(path, '\\') = 0), reason TEXT NOT NULL CHECK (reason <> ''), PRIMARY KEY (candidate_id, path, reason))",
+        "CREATE TABLE candidate_omissions (candidate_id BLOB NOT NULL REFERENCES candidates(candidate_id) ON DELETE CASCADE, path TEXT NOT NULL CHECK (path <> '' AND instr(path, '\\') = 0), reason TEXT NOT NULL CHECK (reason <> ''), detail TEXT NOT NULL, PRIMARY KEY (candidate_id, path, reason, detail))",
     ),
     (
         "candidate_files",

@@ -34,6 +34,7 @@ pub type CandidateCompleteness = CacheCompleteness;
 pub struct CacheOmission {
     pub path: String,
     pub reason: String,
+    pub detail: String,
 }
 
 /// Compatibility provenance recorded alongside a candidate.

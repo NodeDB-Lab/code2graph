@@ -473,6 +473,7 @@ fn cache_omission(omission: &OmittedFile) -> CacheOmission {
     CacheOmission {
         path: omission.path.as_str().to_owned(),
         reason: omission.reason.tag(),
+        detail: omission.reason.detail(),
     }
 }
 fn cache_tier(tier: ResolverTier) -> ResolverCacheTier {

@@ -760,6 +760,9 @@ fn project_output(
         tier,
         freshness,
         cache,
+        completeness: snapshot.completeness.into(),
+        omitted_files: snapshot.omissions.len(),
+        omissions: snapshot.omissions.iter().map(Into::into).collect(),
     }
 }
 

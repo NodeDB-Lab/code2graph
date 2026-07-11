@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::BTreeMap;
 use std::io::Write;
+use std::path::Path;
 use std::process::{Command, Stdio};
 
 use code2graph::{Descriptor, SymbolId};
@@ -604,6 +606,80 @@ fn binary_imports_references_and_module_deps_cover_resolved_raw_and_aggregate_co
     assert_eq!(no_match["status"], "no-match");
 }
 
+fn snapshot_tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
+    fn visit(root: &Path, path: &Path, snapshot: &mut BTreeMap<String, Vec<u8>>) {
+        let mut entries = std::fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        entries.sort();
+        for entry in entries {
+            let relative = entry
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            if entry.is_dir() {
+                snapshot.insert(format!("{relative}/"), Vec::new());
+                visit(root, &entry, snapshot);
+            } else {
+                snapshot.insert(relative, std::fs::read(&entry).unwrap());
+            }
+        }
+    }
+
+    let mut snapshot = BTreeMap::new();
+    visit(root, root, &mut snapshot);
+    snapshot
+}
+
+#[test]
+fn binary_zero_deadline_has_deterministic_timeout_json_and_exit_code() {
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join("a.rs"), "pub fn run() {}\n").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_code2graph"))
+        .current_dir(project.path())
+        .args(["status", "--timeout", "0ms", "--json"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(4));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+        serde_json::json!({
+            "schemaVersion": 1,
+            "status": "timeout",
+            "error": "operation timed out"
+        })
+    );
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "error: operation timed out\n"
+    );
+}
+
+#[test]
+fn binary_default_cache_does_not_create_or_modify_files_in_selected_project() {
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join("a.rs"), "pub fn run() {}\n").unwrap();
+    let before = snapshot_tree(project.path());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_code2graph"))
+        .current_dir(project.path())
+        .args(["status", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(matches!(
+        value["project"]["cache"].as_str(),
+        Some("miss" | "hit")
+    ));
+
+    assert_eq!(snapshot_tree(project.path()), before);
+}
+
 #[test]
 fn binary_index_uses_the_same_binary_worker_and_keeps_success_channels_clean() {
     let project = tempfile::tempdir().unwrap();
@@ -631,7 +707,7 @@ fn binary_index_uses_the_same_binary_worker_and_keeps_success_channels_clean() {
     assert!(human.stderr.is_empty());
     assert_eq!(
         String::from_utf8(human.stdout).unwrap(),
-        "indexed 1 files; 1 changed, 0 deleted; complete\n"
+        "indexed 1 files; 1 changed, 0 deleted; complete\npublication freshness=fresh cache=cache disabled\nomitted files=0\n"
     );
 }
 

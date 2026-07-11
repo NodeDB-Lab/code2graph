@@ -205,6 +205,7 @@ impl CandidateId {
                 let mut row = Vec::new();
                 append(&mut row, omission.path.as_bytes());
                 append(&mut row, omission.reason.as_bytes());
+                append(&mut row, omission.detail.as_bytes());
                 row
             })
             .collect();
@@ -312,6 +313,7 @@ mod tests {
             &[CacheOmission {
                 path: "a".into(),
                 reason: "too-large".into(),
+                detail: "limit=1".into(),
             }],
         );
         assert_ne!(complete, partial);
@@ -325,10 +327,12 @@ mod tests {
                 CacheOmission {
                     path: "a".into(),
                     reason: "bc".into(),
+                    detail: "detail".into(),
                 },
                 CacheOmission {
                     path: "ab".into(),
                     reason: "c".into(),
+                    detail: "detail".into(),
                 },
             ],
         );
@@ -340,10 +344,12 @@ mod tests {
                 CacheOmission {
                     path: "ab".into(),
                     reason: "c".into(),
+                    detail: "detail".into(),
                 },
                 CacheOmission {
                     path: "a".into(),
                     reason: "bc".into(),
+                    detail: "detail".into(),
                 },
             ],
         );
@@ -354,6 +360,7 @@ mod tests {
             &[CacheOmission {
                 path: "abc".into(),
                 reason: "".into(),
+                detail: "detail".into(),
             }],
         );
         assert_eq!(first, reordered);
