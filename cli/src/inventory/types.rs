@@ -107,6 +107,39 @@ pub struct MtimeHint {
     pub nanoseconds: u32,
 }
 
+/// Metadata-only identity fields used to detect replacement while materializing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StableIdentity {
+    pub device: Option<u64>,
+    pub inode: Option<u64>,
+}
+
+/// A deterministically discovered source path. Discovery never opens or hashes this file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceCandidate {
+    pub path: ProjectPath,
+    pub language: Option<Language>,
+    pub classification: FileClassification,
+    pub size_bytes: u64,
+    pub mtime: Option<MtimeHint>,
+    pub identity: StableIdentity,
+    pub(crate) absolute_path: std::path::PathBuf,
+}
+
+/// Metadata-only inventory discovery, including paths rejected before materialization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceDiscovery {
+    pub candidates: Vec<SourceCandidate>,
+    pub omitted: Vec<OmittedFile>,
+}
+
+/// Result of materializing one candidate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MaterializedCandidate {
+    File(InventoryFile),
+    Omitted(OmittedFile),
+}
+
 /// One admitted, UTF-8 source file. `bytes` are the exact hashed bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InventoryFile {

@@ -8,7 +8,8 @@ use std::io::{Read, Result as IoResult};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use crate::inventory::{InventoryFile, MtimeHint};
+use crate::inventory::{InventoryFile, MtimeHint, SourceCandidate};
+use crate::project::ProjectPath;
 
 use super::{
     ManifestInput, ManifestOutcome, ManifestParserKind, PackageAssignmentSet, PackageDiagnostic,
@@ -22,9 +23,26 @@ const MANIFEST_NAMES: &[&str] = &["Cargo.toml", "package.json", "go.mod", "pypro
 /// Discover relevant manifests and select the nearest successfully parsed one
 /// for every admitted source. `root` must be a canonical absolute project root;
 /// traversal is root-inclusive and never escapes it.
-pub fn assign_packages(
+pub trait PackageSourcePath {
+    fn package_source_path(&self) -> &ProjectPath;
+}
+
+impl PackageSourcePath for InventoryFile {
+    fn package_source_path(&self) -> &ProjectPath {
+        &self.path
+    }
+}
+
+impl PackageSourcePath for SourceCandidate {
+    fn package_source_path(&self) -> &ProjectPath {
+        &self.path
+    }
+}
+
+/// Package discovery requires source paths, not source bytes.
+pub fn assign_packages<T: PackageSourcePath>(
     root: &Path,
-    files: &[InventoryFile],
+    files: &[T],
     max_manifest_bytes: usize,
 ) -> PackageAssignmentSet {
     let candidates = candidate_paths(root, files);
@@ -90,7 +108,7 @@ pub fn assign_packages(
     });
     let mut assignments: Vec<_> = files
         .iter()
-        .map(|file| select_package(&file.path, &manifests))
+        .map(|file| select_package(file.package_source_path(), &manifests))
         .collect();
     assignments.sort_by(|left, right| left.source_path.cmp(&right.source_path));
 
@@ -101,11 +119,11 @@ pub fn assign_packages(
     }
 }
 
-fn candidate_paths(root: &Path, files: &[InventoryFile]) -> BTreeSet<PathBuf> {
+fn candidate_paths<T: PackageSourcePath>(root: &Path, files: &[T]) -> BTreeSet<PathBuf> {
     let mut candidates = BTreeSet::new();
     for file in files {
         let mut directory = root
-            .join(file.path.as_str())
+            .join(file.package_source_path().as_str())
             .parent()
             .map(Path::to_path_buf);
         while let Some(current) = directory {
@@ -379,6 +397,33 @@ mod tests {
             set.assignments[0].manifest_path.as_deref(),
             Some("crates/a/Cargo.toml")
         );
+    }
+
+    #[test]
+    fn metadata_candidates_and_materialized_files_have_identical_path_assignment() {
+        let temp = tempdir().expect("temp");
+        let root = temp.path();
+        fs::create_dir_all(root.join("crate/src")).expect("dirs");
+        fs::write(root.join("crate/Cargo.toml"), "[package]\nname='crate'").expect("manifest");
+        let source_path =
+            crate::project::ProjectPath::new(Path::new("crate/src/lib.rs")).expect("source path");
+        let candidate = SourceCandidate {
+            path: source_path,
+            language: Some(Language::Rust),
+            classification: crate::inventory::FileClassification::Enabled(Language::Rust),
+            size_bytes: 999,
+            mtime: None,
+            identity: crate::inventory::StableIdentity {
+                device: None,
+                inode: None,
+            },
+            absolute_path: root.join("crate/src/lib.rs"),
+        };
+        let from_candidate = assign_packages(root, &[candidate], 1024);
+        let from_file = assign(root, &["crate/src/lib.rs"]);
+        assert_eq!(from_candidate.assignments, from_file.assignments);
+        assert_eq!(from_candidate.manifests, from_file.manifests);
+        assert_eq!(from_candidate.diagnostics, from_file.diagnostics);
     }
 
     #[test]

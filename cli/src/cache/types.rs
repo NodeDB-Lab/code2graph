@@ -4,6 +4,8 @@
 
 use code2graph::{CodeGraph, FileFacts, FileSubgraph};
 
+use crate::inventory::MtimeHint;
+
 use super::{CandidateId, CompatibilityFingerprint, ProjectInputDigest};
 
 /// Resolver output stored in a cache graph snapshot.
@@ -45,7 +47,7 @@ pub struct CandidateFileRecord {
     pub language: String,
     pub content_hash: [u8; 32],
     pub size_bytes: u64,
-    pub mtime_ns: Option<u64>,
+    pub mtime: Option<MtimeHint>,
     pub facts: FileFacts,
     pub subgraph: Option<FileSubgraph>,
 }

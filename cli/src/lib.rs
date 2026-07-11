@@ -11,6 +11,7 @@ pub mod exit;
 pub mod inventory;
 pub mod package_assignment;
 pub mod project;
+pub mod refresh;
 pub mod request;
 pub mod result;
 pub mod worker;
@@ -24,14 +25,17 @@ pub use deadline::{Cancellation, Deadline, NeverCancelled};
 pub use error::{CliError, Result};
 pub use exit::ExitCode;
 pub use inventory::{
-    FileClassification, InventoryCompleteness, InventoryFile, InventorySummary, MtimeHint,
-    OmissionReason, OmittedFile, SourceInventory, StableIoErrorKind, build_inventory,
+    FileClassification, InventoryCompleteness, InventoryFile, InventorySummary,
+    MaterializedCandidate, MtimeHint, OmissionReason, OmittedFile, SourceCandidate,
+    SourceDiscovery, SourceInventory, StableIdentity, StableIoErrorKind, build_inventory,
+    discover_sources, materialize_candidate,
 };
 pub use package_assignment::{
     ManifestInput, ManifestOutcome, ManifestParserKind, PackageAssignmentSet, PackageDiagnostic,
-    PackageDiagnosticKind, SourcePackageAssignment, assign_packages,
+    PackageDiagnosticKind, PackageSourcePath, SourcePackageAssignment, assign_packages,
 };
 pub use project::{ProjectPath, ProjectSelection, SelectionProvenance, select_project};
+pub use refresh::{PriorFileRecord, RefreshDecision, RefreshEntry, RefreshInputs, RefreshPlan};
 pub use request::{CliRequest, CommandRequest, Selector, SourcePosition};
 pub use result::{
     CacheDisposition, ConfidenceOutput, ErrorEnvelope, Freshness, ImpactOutput,

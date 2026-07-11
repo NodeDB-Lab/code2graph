@@ -6,7 +6,8 @@ mod types;
 mod walk;
 
 pub use types::{
-    FileClassification, InventoryCompleteness, InventoryFile, InventorySummary, MtimeHint,
-    OmissionReason, OmittedFile, SourceInventory, StableIoErrorKind,
+    FileClassification, InventoryCompleteness, InventoryFile, InventorySummary,
+    MaterializedCandidate, MtimeHint, OmissionReason, OmittedFile, SourceCandidate,
+    SourceDiscovery, SourceInventory, StableIdentity, StableIoErrorKind,
 };
-pub use walk::build_inventory;
+pub use walk::{build_inventory, discover_sources, materialize_candidate};

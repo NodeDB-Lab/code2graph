@@ -6,7 +6,7 @@ mod apply;
 mod discover;
 mod types;
 
-pub use discover::assign_packages;
+pub use discover::{PackageSourcePath, assign_packages};
 pub use types::{
     ManifestInput, ManifestOutcome, ManifestParserKind, PackageAssignmentSet, PackageDiagnostic,
     PackageDiagnosticKind, SourcePackageAssignment,

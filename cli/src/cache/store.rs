@@ -11,6 +11,7 @@ use code2graph::{CodeGraph, IncrementalGraph};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
 use crate::Deadline;
+use crate::inventory::MtimeHint;
 
 use super::schema::{self, SCHEMA_VERSION};
 use super::{
@@ -27,7 +28,8 @@ struct CandidateFileRow {
     language: String,
     content_hash: Vec<u8>,
     size_bytes: i64,
-    mtime_ns: Option<i64>,
+    mtime_seconds: Option<i64>,
+    mtime_nanoseconds: Option<i64>,
     file_facts: Vec<u8>,
     file_subgraph: Option<Vec<u8>>,
 }
@@ -38,7 +40,8 @@ struct LoadedCandidateFileRow {
     language: String,
     content_hash: Vec<u8>,
     size_bytes: i64,
-    mtime_ns: Option<i64>,
+    mtime_seconds: Option<i64>,
+    mtime_nanoseconds: Option<i64>,
     file_facts: Vec<u8>,
     file_subgraph: Option<Vec<u8>>,
 }
@@ -223,8 +226,8 @@ impl CacheStore {
                 for file in &encoded.files {
                     ensure_time(deadline)?;
                     self.connection.execute(
-                        "INSERT INTO candidate_files (candidate_id, path, language, content_hash, size_bytes, mtime_ns, file_facts, file_subgraph) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                        params![encoded.candidate_id.as_slice(), file.path, file.language, file.content_hash.as_slice(), file.size_bytes, file.mtime_ns, file.facts, file.subgraph],
+                        "INSERT INTO candidate_files (candidate_id, path, language, content_hash, size_bytes, mtime_seconds, mtime_nanoseconds, file_facts, file_subgraph) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                        params![encoded.candidate_id.as_slice(), file.path, file.language, file.content_hash.as_slice(), file.size_bytes, file.mtime_seconds, file.mtime_nanoseconds, file.facts, file.subgraph],
                     ).map_err(|error| map_sqlite_error(error, deadline))?;
                 }
             }
@@ -429,16 +432,17 @@ impl CacheStore {
             let found: Option<CandidateFileRow> = self
                 .connection
                 .query_row(
-                    "SELECT language, content_hash, size_bytes, mtime_ns, file_facts, file_subgraph FROM candidate_files WHERE candidate_id = ?1 AND path = ?2",
+                    "SELECT language, content_hash, size_bytes, mtime_seconds, mtime_nanoseconds, file_facts, file_subgraph FROM candidate_files WHERE candidate_id = ?1 AND path = ?2",
                     params![candidate.candidate_id.as_slice(), file.path],
                     |row| {
                         Ok(CandidateFileRow {
                             language: row.get(0)?,
                             content_hash: row.get(1)?,
                             size_bytes: row.get(2)?,
-                            mtime_ns: row.get(3)?,
-                            file_facts: row.get(4)?,
-                            file_subgraph: row.get(5)?,
+                            mtime_seconds: row.get(3)?,
+                            mtime_nanoseconds: row.get(4)?,
+                            file_facts: row.get(5)?,
+                            file_subgraph: row.get(6)?,
                         })
                     },
                 )
@@ -450,7 +454,8 @@ impl CacheStore {
             if found.language != file.language
                 || found.content_hash != file.content_hash
                 || found.size_bytes != file.size_bytes
-                || found.mtime_ns != file.mtime_ns
+                || found.mtime_seconds != file.mtime_seconds
+                || found.mtime_nanoseconds != file.mtime_nanoseconds
                 || found.file_facts != file.facts
                 || found.file_subgraph != file.subgraph
             {
@@ -511,7 +516,7 @@ impl CacheStore {
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|error| map_sqlite_error(error, deadline))?
         };
-        let mut statement = self.connection.prepare("SELECT path, language, content_hash, size_bytes, mtime_ns, file_facts, file_subgraph FROM candidate_files WHERE candidate_id = ?1 ORDER BY path ASC").map_err(|error| map_sqlite_error(error, deadline))?;
+        let mut statement = self.connection.prepare("SELECT path, language, content_hash, size_bytes, mtime_seconds, mtime_nanoseconds, file_facts, file_subgraph FROM candidate_files WHERE candidate_id = ?1 ORDER BY path ASC").map_err(|error| map_sqlite_error(error, deadline))?;
         let rows = statement
             .query_map([candidate_id.as_bytes().as_slice()], |row| {
                 Ok(LoadedCandidateFileRow {
@@ -519,9 +524,10 @@ impl CacheStore {
                     language: row.get::<_, String>(1)?,
                     content_hash: row.get::<_, Vec<u8>>(2)?,
                     size_bytes: row.get::<_, i64>(3)?,
-                    mtime_ns: row.get::<_, Option<i64>>(4)?,
-                    file_facts: row.get::<_, Vec<u8>>(5)?,
-                    file_subgraph: row.get::<_, Option<Vec<u8>>>(6)?,
+                    mtime_seconds: row.get::<_, Option<i64>>(4)?,
+                    mtime_nanoseconds: row.get::<_, Option<i64>>(5)?,
+                    file_facts: row.get::<_, Vec<u8>>(6)?,
+                    file_subgraph: row.get::<_, Option<Vec<u8>>>(7)?,
                 })
             })
             .map_err(|error| map_sqlite_error(error, deadline))?;
@@ -551,7 +557,7 @@ impl CacheStore {
                 language: row.language,
                 content_hash: fixed_32(row.content_hash)?,
                 size_bytes: nonnegative(row.size_bytes)?,
-                mtime_ns: row.mtime_ns.map(nonnegative).transpose()?,
+                mtime: decode_mtime(row.mtime_seconds, row.mtime_nanoseconds)?,
                 facts,
                 subgraph,
             });
@@ -658,7 +664,8 @@ struct PreparedFile {
     language: String,
     content_hash: [u8; 32],
     size_bytes: i64,
-    mtime_ns: Option<i64>,
+    mtime_seconds: Option<i64>,
+    mtime_nanoseconds: Option<i64>,
     facts: Vec<u8>,
     subgraph: Option<Vec<u8>>,
 }
@@ -749,10 +756,7 @@ impl PreparedCandidate {
             }
             let size_bytes =
                 i64::try_from(file.size_bytes).map_err(|_| CacheError::InvalidCandidate)?;
-            let mtime_ns = file
-                .mtime_ns
-                .map(|value| i64::try_from(value).map_err(|_| CacheError::InvalidCandidate))
-                .transpose()?;
+            let (mtime_seconds, mtime_nanoseconds) = encode_mtime(file.mtime)?;
             let facts = encode_file_facts(&file.facts)?;
             let subgraph = match &file.subgraph {
                 Some(subgraph) => {
@@ -769,7 +773,8 @@ impl PreparedCandidate {
                 language: file.language.clone(),
                 content_hash: file.content_hash,
                 size_bytes,
-                mtime_ns,
+                mtime_seconds,
+                mtime_nanoseconds,
                 facts,
                 subgraph,
             });
@@ -827,6 +832,34 @@ fn fingerprint_from_blob(value: Vec<u8>) -> Result<CandidateId, CacheError> {
 
 fn nonnegative(value: i64) -> Result<u64, CacheError> {
     u64::try_from(value).map_err(|_| CacheError::Corrupt)
+}
+
+fn encode_mtime(mtime: Option<MtimeHint>) -> Result<(Option<i64>, Option<i64>), CacheError> {
+    match mtime {
+        None => Ok((None, None)),
+        Some(value) if value.nanoseconds < 1_000_000_000 => Ok((
+            Some(value.seconds_since_unix_epoch),
+            Some(i64::from(value.nanoseconds)),
+        )),
+        Some(_) => Err(CacheError::InvalidCandidate),
+    }
+}
+
+fn decode_mtime(
+    seconds: Option<i64>,
+    nanoseconds: Option<i64>,
+) -> Result<Option<MtimeHint>, CacheError> {
+    match (seconds, nanoseconds) {
+        (None, None) => Ok(None),
+        (Some(seconds_since_unix_epoch), Some(nanoseconds)) => Ok(Some(MtimeHint {
+            seconds_since_unix_epoch,
+            nanoseconds: u32::try_from(nanoseconds)
+                .ok()
+                .filter(|value| *value < 1_000_000_000)
+                .ok_or(CacheError::Corrupt)?,
+        })),
+        _ => Err(CacheError::Corrupt),
+    }
 }
 
 impl ResolverCacheTier {
@@ -1057,7 +1090,10 @@ mod tests {
             language: "rust".into(),
             content_hash: [3; 32],
             size_bytes: 0,
-            mtime_ns: Some(4),
+            mtime: Some(MtimeHint {
+                seconds_since_unix_epoch: 0,
+                nanoseconds: 4,
+            }),
             facts: empty_facts("src/a.rs"),
             subgraph: None,
         };
@@ -1157,6 +1193,44 @@ mod tests {
         store
             .publish_candidate(&complete, &Deadline::new(None))
             .expect("idempotent publish");
+    }
+
+    #[test]
+    fn signed_mtime_round_trips_before_the_unix_epoch() {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().join("project");
+        fs::create_dir(&root).expect("project");
+        let cache_location = location(&root, temp.path());
+        let store =
+            CacheStore::open_writable(&cache_location, &root, &Deadline::new(None)).expect("open");
+        let mut snapshot = candidate(CacheCompleteness::Complete, ResolverCacheTier::Name);
+        snapshot.files[0].mtime = Some(MtimeHint {
+            seconds_since_unix_epoch: -2,
+            nanoseconds: 999_999_999,
+        });
+        store
+            .publish_candidate(&snapshot, &Deadline::new(None))
+            .expect("publish");
+        let loaded = store
+            .load_active(
+                ResolverCacheTier::Name,
+                CacheCompleteness::Complete,
+                snapshot.compatibility.id,
+                &Deadline::new(None),
+            )
+            .expect("load")
+            .expect("active");
+        assert_eq!(loaded.files[0].mtime, snapshot.files[0].mtime);
+
+        let mut invalid = candidate(CacheCompleteness::Partial, ResolverCacheTier::Name);
+        invalid.files[0].mtime = Some(MtimeHint {
+            seconds_since_unix_epoch: -1,
+            nanoseconds: 1_000_000_000,
+        });
+        assert!(matches!(
+            store.publish_candidate(&invalid, &Deadline::new(None)),
+            Err(CacheError::InvalidCandidate)
+        ));
     }
 
     #[test]
