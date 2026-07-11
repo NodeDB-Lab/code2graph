@@ -6,7 +6,10 @@ use crate::graph::types::FfiAbi;
 pub(crate) const SPEC: super::spec::AbiSpec = super::spec::AbiSpec {
     abi: FfiAbi::NodeApi,
     consumers: &["javascript", "typescript"],
+    #[cfg(feature = "rust")]
     rust_attr_markers: &["napi"],
+    #[cfg(feature = "rust")]
     rust_name_override_markers: &["napi"],
+    #[cfg(any(feature = "rust", feature = "c"))]
     name_prefix: None,
 };

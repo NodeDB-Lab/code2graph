@@ -4,31 +4,61 @@ use crate::graph::types::FfiAbi;
 
 /// Everything per-ABI in one place. Add an ABI = add a sibling file with one of
 /// these consts + a line in `SPECS`.
+#[cfg(any(
+    feature = "rust",
+    feature = "c",
+    feature = "cpp",
+    feature = "python",
+    feature = "typescript",
+    feature = "java"
+))]
 pub(crate) struct AbiSpec {
     pub abi: FfiAbi,
     /// Language tags (`Language::as_str`) whose call sites may consume this ABI.
     pub consumers: &'static [&'static str],
     /// Rust attribute substrings that MARK a fn as exported under this ABI
-    /// (substring match against each `attribute_item`'s text). Empty for ABIs
-    /// not produced directly from a Rust attribute (e.g. JNI, which arrives via
-    /// the `name_prefix` rule).
+    /// (substring match against each `attribute_item`'s text).
+    #[cfg(feature = "rust")]
     pub rust_attr_markers: &'static [&'static str],
     /// Rust attribute substrings that carry a quoted export-name override.
+    #[cfg(feature = "rust")]
     pub rust_name_override_markers: &'static [&'static str],
     /// If set, ANY export whose final name starts with this prefix is
     /// re-classified to THIS abi (the `Java_` → `Jni` rule).
+    #[cfg(any(feature = "rust", feature = "c"))]
     pub name_prefix: Option<&'static str>,
 }
 
+#[cfg(any(
+    feature = "rust",
+    feature = "c",
+    feature = "cpp",
+    feature = "python",
+    feature = "typescript",
+    feature = "java"
+))]
 pub(crate) const SPECS: &[AbiSpec] = &[
+    #[cfg(any(feature = "rust", feature = "c", feature = "cpp"))]
     super::c::SPEC,
+    #[cfg(any(feature = "rust", feature = "python"))]
     super::python::SPEC,
+    #[cfg(any(feature = "rust", feature = "typescript"))]
     super::wasm::SPEC,
+    #[cfg(any(feature = "rust", feature = "typescript"))]
     super::node_api::SPEC,
+    #[cfg(any(feature = "rust", feature = "c", feature = "java"))]
     super::jni::SPEC,
 ];
 
 /// Consumer matrix lookup (replaces `FfiAbi::consumers`).
+#[cfg(any(
+    feature = "rust",
+    feature = "c",
+    feature = "cpp",
+    feature = "python",
+    feature = "typescript",
+    feature = "java"
+))]
 pub(crate) fn consumers(abi: FfiAbi) -> &'static [&'static str] {
     SPECS
         .iter()
@@ -36,13 +66,28 @@ pub(crate) fn consumers(abi: FfiAbi) -> &'static [&'static str] {
         .map_or(&[], |s| s.consumers)
 }
 
+/// No enabled extractor can consume an ABI in this configuration.
+#[cfg(not(any(
+    feature = "rust",
+    feature = "c",
+    feature = "cpp",
+    feature = "python",
+    feature = "typescript",
+    feature = "java"
+)))]
+pub(crate) fn consumers(_: FfiAbi) -> &'static [&'static str] {
+    &[]
+}
+
 /// Final-name re-classification (e.g. `Java_*` → `Jni`). Returns `base` if no
 /// prefix rule matches.
+#[cfg(feature = "rust")]
 fn reclassify_by_name(base: FfiAbi, name: &str) -> FfiAbi {
     c_name_export_abi(name).unwrap_or(base)
 }
 
 /// C-side by-name export classification (the `c.rs` `Java_` filter generalized).
+#[cfg(any(feature = "rust", feature = "c"))]
 pub(crate) fn c_name_export_abi(name: &str) -> Option<FfiAbi> {
     SPECS
         .iter()
@@ -53,6 +98,7 @@ pub(crate) fn c_name_export_abi(name: &str) -> Option<FfiAbi> {
 /// Classify a Rust fn's FFI exports from its accumulated attribute texts.
 /// Returns `(abi, export_name)` pairs in `SPECS` order — multi-ABI capable,
 /// reproducing the prior inline classifier exactly.
+#[cfg(feature = "rust")]
 pub(crate) fn rust_exports(attr_texts: &[&str], fn_name: &str) -> Vec<(FfiAbi, String)> {
     let mut out = Vec::new();
     for spec in SPECS {
@@ -88,6 +134,7 @@ pub(crate) fn rust_exports(attr_texts: &[&str], fn_name: &str) -> Vec<(FfiAbi, S
 
 /// Match an unconditional outer attribute by its exact top-level path.
 /// `cfg_attr` is excluded because its condition is unavailable in a build-free extractor.
+#[cfg(feature = "rust")]
 fn exact_rust_attribute(text: &str, marker: &str) -> bool {
     let body = text
         .trim()
@@ -110,6 +157,7 @@ fn exact_rust_attribute(text: &str, marker: &str) -> bool {
             .is_some_and(|tail| tail.starts_with('('))
 }
 
+#[cfg(feature = "rust")]
 fn exact_rust_attribute_assignment(text: &str, marker: &str) -> bool {
     let body = text
         .trim()
@@ -134,6 +182,7 @@ fn exact_rust_attribute_assignment(text: &str, marker: &str) -> bool {
     })
 }
 
+#[cfg(feature = "rust")]
 fn attribute_assignment_value(text: &str) -> Option<&str> {
     // Attribute texts are `#[key = "value"]`; retain only the exact quoted RHS.
     let body = text.trim().strip_prefix("#[")?.strip_suffix(']')?.trim();

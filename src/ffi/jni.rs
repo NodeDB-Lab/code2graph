@@ -7,7 +7,10 @@ use crate::graph::types::FfiAbi;
 pub(crate) const SPEC: super::spec::AbiSpec = super::spec::AbiSpec {
     abi: FfiAbi::Jni,
     consumers: &["java"],
+    #[cfg(feature = "rust")]
     rust_attr_markers: &[],
+    #[cfg(feature = "rust")]
     rust_name_override_markers: &[],
+    #[cfg(any(feature = "rust", feature = "c"))]
     name_prefix: Some("Java_"),
 };

@@ -119,12 +119,26 @@ impl Resolver for FfiBridgeResolver {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(any(feature = "rust", all(feature = "c", feature = "java")))]
     use super::*;
-    use crate::extract::{
-        CExtractor, Extractor, JavaExtractor, JavaScriptExtractor, PythonExtractor, RustExtractor,
-    };
+    #[cfg(any(
+        all(feature = "c", feature = "rust"),
+        all(feature = "c", feature = "java")
+    ))]
+    use crate::extract::CExtractor;
+    #[cfg(any(feature = "rust", all(feature = "c", feature = "java")))]
+    use crate::extract::Extractor;
+    #[cfg(all(feature = "java", any(feature = "rust", feature = "c")))]
+    use crate::extract::JavaExtractor;
+    #[cfg(all(feature = "typescript", feature = "rust"))]
+    use crate::extract::JavaScriptExtractor;
+    #[cfg(all(feature = "python", feature = "rust"))]
+    use crate::extract::PythonExtractor;
+    #[cfg(feature = "rust")]
+    use crate::extract::RustExtractor;
 
     /// Rust `#[no_mangle]` export, called from C → one FfiBridge edge.
+    #[cfg(all(feature = "rust", feature = "c"))]
     #[test]
     fn bridges_rust_no_mangle_export_to_c_call() {
         let rust = RustExtractor
@@ -161,6 +175,7 @@ mod tests {
     }
 
     /// `#[export_name = "..."]` overrides the bridged name.
+    #[cfg(all(feature = "rust", feature = "c"))]
     #[test]
     fn export_name_attribute_overrides_symbol_name() {
         let rust = RustExtractor
@@ -186,6 +201,7 @@ mod tests {
     }
 
     /// A same-language call to the exported name is NOT an FFI crossing.
+    #[cfg(feature = "rust")]
     #[test]
     fn same_language_call_is_not_bridged() {
         let lib = RustExtractor
@@ -206,6 +222,7 @@ mod tests {
     }
 
     /// A plain `extern "C"` function with no stable-export attribute is not an export.
+    #[cfg(feature = "rust")]
     #[test]
     fn extern_c_without_no_mangle_is_not_an_export() {
         let rust = RustExtractor
@@ -218,6 +235,7 @@ mod tests {
     }
 
     /// Rust PyO3 `#[pyfunction]` export, called from Python → one FfiBridge edge.
+    #[cfg(all(feature = "rust", feature = "python"))]
     #[test]
     fn bridges_rust_pyfunction_export_to_python_call() {
         let rust = RustExtractor
@@ -247,6 +265,7 @@ mod tests {
     }
 
     /// `#[pyo3(name = "…")]` overrides the Python-side name.
+    #[cfg(all(feature = "rust", feature = "python"))]
     #[test]
     fn pyo3_name_attribute_overrides_export_name() {
         let rust = RustExtractor
@@ -271,6 +290,7 @@ mod tests {
     }
 
     /// Rust `#[wasm_bindgen]` export, called from JavaScript → one FfiBridge edge.
+    #[cfg(all(feature = "rust", feature = "typescript"))]
     #[test]
     fn bridges_rust_wasm_bindgen_export_to_js_call() {
         let rust = RustExtractor
@@ -296,6 +316,7 @@ mod tests {
     }
 
     /// Rust `#[napi]` export, called from JavaScript → one FfiBridge edge.
+    #[cfg(all(feature = "rust", feature = "typescript"))]
     #[test]
     fn bridges_rust_napi_export_to_js_call() {
         let rust = RustExtractor
@@ -320,6 +341,7 @@ mod tests {
 
     /// JNI: a Java `native` method bridges to its Rust `Java_*` implementation
     /// via the mangled name, tagged with the JNI ABI.
+    #[cfg(all(feature = "rust", feature = "java"))]
     #[test]
     fn bridges_java_native_method_to_rust_jni_impl() {
         let java = JavaExtractor
@@ -364,6 +386,7 @@ mod tests {
 
     /// JNI: a Java `native` method bridges to a C implementation too (the common
     /// NDK case), via the `Java_*` export the C extractor emits.
+    #[cfg(all(feature = "c", feature = "java"))]
     #[test]
     fn bridges_java_native_method_to_c_jni_impl() {
         let java = JavaExtractor
@@ -394,6 +417,7 @@ mod tests {
         );
     }
 
+    #[cfg(all(feature = "rust", feature = "c"))]
     #[test]
     fn bridge_exports_must_belong_exactly_once_to_the_declaring_file() {
         let source = RustExtractor
@@ -443,6 +467,7 @@ mod tests {
 
     /// ABI isolation: a C call must NOT bridge to a Python-only (PyO3) export of
     /// the same name, nor a Python call to a C-only export.
+    #[cfg(all(feature = "rust", feature = "c", feature = "python"))]
     #[test]
     fn abi_consumers_are_isolated() {
         let py_export = RustExtractor

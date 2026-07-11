@@ -11,6 +11,7 @@ fn read_doc(rel: &str) -> String {
 fn ffi_markers_are_documented() {
     let doc = read_doc("docs/ffi-support-matrix.md");
     for spec in SPECS {
+        #[cfg(feature = "rust")]
         for marker in spec.rust_attr_markers {
             assert!(
                 doc.contains(marker),
@@ -19,6 +20,7 @@ fn ffi_markers_are_documented() {
                 spec.abi,
             );
         }
+        #[cfg(any(feature = "rust", feature = "c"))]
         if let Some(prefix) = spec.name_prefix {
             assert!(
                 doc.contains(prefix),
