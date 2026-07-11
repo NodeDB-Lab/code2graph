@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Construction of the immutable structural graph index.
+//! Construction of the structural graph index.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use code2graph::{CodeGraph, Edge, EdgeKey, Symbol, SymbolId};
+use code2graph::{CodeGraph, Edge, EdgeKey, ScopeSnapshotToken, Symbol, SymbolId};
 
 use crate::{QueryError, Result, order};
 
-/// An immutable, storage-free index over one resolved graph.
+/// A storage-free index over one resolved graph.
 ///
 /// All primary keys are structural identities. SCIP strings are secondary display
 /// keys only, because one display can correspond to multiple structural IDs.
@@ -23,6 +23,7 @@ pub struct GraphIndex {
     pub(crate) definitions_by_file: BTreeMap<String, Vec<SymbolId>>,
     pub(crate) outgoing: BTreeMap<SymbolId, Vec<EdgeKey>>,
     pub(crate) incoming: BTreeMap<SymbolId, Vec<EdgeKey>>,
+    pub(crate) snapshot: Option<ScopeSnapshotToken>,
 }
 
 impl GraphIndex {
@@ -32,7 +33,19 @@ impl GraphIndex {
     /// are included in the SCIP-display index for consumers that represent
     /// external or otherwise absent symbols.
     pub fn from_graph(graph: CodeGraph) -> Result<Self> {
-        let mut index = Self::default();
+        Self::build(graph, None)
+    }
+
+    /// Build an index bound to the snapshot represented by `graph`.
+    pub fn from_scope_graph(graph: CodeGraph, snapshot: ScopeSnapshotToken) -> Result<Self> {
+        Self::build(graph, Some(snapshot))
+    }
+
+    fn build(graph: CodeGraph, snapshot: Option<ScopeSnapshotToken>) -> Result<Self> {
+        let mut index = Self {
+            snapshot,
+            ..Self::default()
+        };
         for symbol in graph.symbols {
             let id = symbol.id.clone();
             if index.definitions.contains_key(&id) {

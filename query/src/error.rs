@@ -46,6 +46,12 @@ pub enum QueryError {
     #[error("missing removed edge: {0:?}")]
     MissingRemovedEdge(EdgeKey),
 
+    /// A scope delta declared the index's current token as its result.
+    ///
+    /// Retained as the typed public rejection for repeated transitions.
+    #[error("scope delta snapshot does not advance")]
+    ScopeDeltaSnapshotDoesNotAdvance,
+
     /// A delta lists a symbol identity for removal more than once.
     #[error("duplicate removed symbol in delta: {0}")]
     DuplicateRemovedSymbol(SymbolId),
@@ -54,10 +60,6 @@ pub enum QueryError {
     #[error("duplicate upserted symbol in delta: {0}")]
     DuplicateUpsertedSymbol(SymbolId),
 
-    /// A delta both removes and upserts one symbol identity.
-    #[error("conflicting symbol delta entries: {0}")]
-    ConflictingSymbolDelta(SymbolId),
-
     /// A delta lists an edge identity for removal more than once.
     #[error("duplicate removed edge in delta: {0:?}")]
     DuplicateRemovedEdge(EdgeKey),
@@ -65,10 +67,6 @@ pub enum QueryError {
     /// A delta lists an edge identity for upsert more than once.
     #[error("duplicate upserted edge in delta: {0:?}")]
     DuplicateUpsertedEdge(EdgeKey),
-
-    /// A delta both removes and upserts one edge identity.
-    #[error("conflicting edge delta entries: {0:?}")]
-    ConflictingEdgeDelta(EdgeKey),
 }
 
 /// A bounded, non-debug representation of an opaque snapshot token.

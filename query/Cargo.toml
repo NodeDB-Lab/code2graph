@@ -18,3 +18,8 @@ thiserror = "2"
 path = ".."
 version = "0.0.0"
 default-features = false
+
+[dev-dependencies.code2graph]
+path = ".."
+default-features = false
+features = ["rust"]

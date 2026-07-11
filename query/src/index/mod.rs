@@ -4,6 +4,7 @@
 
 mod build;
 mod lookup;
+mod update;
 
 pub use crate::impact::{ImpactOptions, ImpactResult, ImpactStep};
 pub use crate::relation::EdgeFilter;
