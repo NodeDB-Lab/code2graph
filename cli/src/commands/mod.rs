@@ -10,6 +10,8 @@ use code2graph_query::GraphIndex;
 use crate::{Cancellation, CliError, Deadline, LoadedGraph, Selector};
 
 mod definition;
+mod impact;
+mod relations;
 mod shared;
 mod symbols;
 
@@ -70,4 +72,6 @@ pub(crate) struct DefinitionCommandRequest<'a> {
 }
 
 pub(crate) use definition::execute_definition;
+pub(crate) use impact::{ImpactCommandRequest, execute_impact};
+pub(crate) use relations::{RelationCommandRequest, RelationDirection, execute_relations};
 pub(crate) use symbols::execute_symbols;

@@ -7,8 +7,9 @@ use crate::cache::{
     ResolverCacheTier,
 };
 use crate::commands::{
-    DefinitionCommandRequest, QueryCommandContext, SymbolsCommandRequest, execute_definition,
-    execute_symbols,
+    DefinitionCommandRequest, ImpactCommandRequest, QueryCommandContext, RelationCommandRequest,
+    RelationDirection, SymbolsCommandRequest, execute_definition, execute_impact,
+    execute_relations, execute_symbols,
 };
 use crate::refresh::{
     PrepareCandidateInputs, PreparedRefreshCandidate, prepare_and_publish,
@@ -31,6 +32,10 @@ pub enum CommandOutput {
     Status(OutputEnvelope<StatusOutput>),
     Symbols(OutputEnvelope<Vec<crate::SymbolOutput>>),
     Def(OutputEnvelope<Vec<crate::SymbolOutput>>),
+    Callers(OutputEnvelope<Vec<crate::RelationOutput>>),
+    Callees(OutputEnvelope<Vec<crate::RelationOutput>>),
+    Usages(OutputEnvelope<Vec<crate::RelationOutput>>),
+    Impact(OutputEnvelope<Vec<crate::ImpactOutput>>),
     LoadedGraph(LoadedGraph),
 }
 
@@ -79,6 +84,7 @@ impl<'a> ExecutionRefreshInputs<'a> {
 /// command-wide deadline and cancellation check have been established.
 pub fn execute(request: CliRequest, context: &ExecutionContext<'_>) -> Result<CommandOutput> {
     let result_limit = request.global.limits.result_limit;
+    let min_confidence = request.global.effective_min_confidence();
     match request.command.clone() {
         CommandRequest::Index { .. } => execute_index(request, context),
         CommandRequest::Status => execute_status(request, context),
@@ -114,6 +120,90 @@ pub fn execute(request: CliRequest, context: &ExecutionContext<'_>) -> Result<Co
                 result_limit,
             },
         ),
+        CommandRequest::Callers {
+            selector,
+            file,
+            kind,
+            require_unique,
+            role,
+        } => execute_relations_query(
+            request,
+            context,
+            RelationCommandRequest {
+                selector: &selector,
+                file: file.as_deref(),
+                kind,
+                require_unique,
+                role: Some(role.unwrap_or(code2graph::RefRole::Call)),
+                direction: RelationDirection::Incoming,
+                result_limit,
+                min_confidence,
+            },
+            CommandOutput::Callers,
+        ),
+        CommandRequest::Callees {
+            selector,
+            file,
+            kind,
+            require_unique,
+            role,
+        } => execute_relations_query(
+            request,
+            context,
+            RelationCommandRequest {
+                selector: &selector,
+                file: file.as_deref(),
+                kind,
+                require_unique,
+                role: Some(role.unwrap_or(code2graph::RefRole::Call)),
+                direction: RelationDirection::Outgoing,
+                result_limit,
+                min_confidence,
+            },
+            CommandOutput::Callees,
+        ),
+        CommandRequest::Usages {
+            selector,
+            file,
+            kind,
+            require_unique,
+            role,
+        } => execute_relations_query(
+            request,
+            context,
+            RelationCommandRequest {
+                selector: &selector,
+                file: file.as_deref(),
+                kind,
+                require_unique,
+                role,
+                direction: RelationDirection::Incoming,
+                result_limit,
+                min_confidence,
+            },
+            CommandOutput::Usages,
+        ),
+        CommandRequest::Impact {
+            selector,
+            file,
+            kind,
+            require_unique,
+            role,
+            depth,
+        } => execute_impact_query(
+            request,
+            context,
+            ImpactCommandRequest {
+                selector: &selector,
+                file: file.as_deref(),
+                kind,
+                require_unique,
+                role: Some(role.unwrap_or(code2graph::RefRole::Call)),
+                depth,
+                max_nodes: result_limit,
+                min_confidence,
+            },
+        ),
         command => Err(CliError::Unavailable {
             command: command.name().to_owned(),
         }),
@@ -137,6 +227,45 @@ fn execute_symbols_query(
         request.global.limits.max_file_bytes,
     )?;
     Ok(CommandOutput::Symbols(execute_symbols(&context, command)?))
+}
+
+fn execute_relations_query(
+    request: CliRequest,
+    execution: &ExecutionContext<'_>,
+    command: RelationCommandRequest<'_>,
+    output: fn(OutputEnvelope<Vec<crate::RelationOutput>>) -> CommandOutput,
+) -> Result<CommandOutput> {
+    let loaded = load_query_graph(&request, execution)?;
+    let deadline = Deadline::new(request.global.limits.timeout);
+    deadline.check(execution.cancellation)?;
+    let index = crate::build_graph_index(&loaded)?;
+    let context = QueryCommandContext::new(
+        &loaded,
+        &index,
+        &deadline,
+        execution.cancellation,
+        request.global.limits.max_file_bytes,
+    )?;
+    Ok(output(execute_relations(&context, command)?))
+}
+
+fn execute_impact_query(
+    request: CliRequest,
+    execution: &ExecutionContext<'_>,
+    command: ImpactCommandRequest<'_>,
+) -> Result<CommandOutput> {
+    let loaded = load_query_graph(&request, execution)?;
+    let deadline = Deadline::new(request.global.limits.timeout);
+    deadline.check(execution.cancellation)?;
+    let index = crate::build_graph_index(&loaded)?;
+    let context = QueryCommandContext::new(
+        &loaded,
+        &index,
+        &deadline,
+        execution.cancellation,
+        request.global.limits.max_file_bytes,
+    )?;
+    Ok(CommandOutput::Impact(execute_impact(&context, command)?))
 }
 
 fn execute_definition_query(

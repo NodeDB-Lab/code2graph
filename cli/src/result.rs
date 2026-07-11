@@ -288,6 +288,8 @@ pub struct RelationOutput {
 /// One bounded reverse-reachability row returned by `impact`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImpactOutput {
+    /// The selected structural identity whose independent traversal produced this row.
+    pub seed: SymbolId,
     pub symbol: SymbolId,
     pub parent: SymbolId,
     pub depth: u32,

@@ -179,7 +179,7 @@ fn lossless_ids_survive_selector_and_output_json() {
 #[test]
 fn binary_keeps_unimplemented_commands_operational_failures() {
     let output = Command::new(env!("CARGO_BIN_EXE_code2graph"))
-        .args(["callers", "run"])
+        .args(["imports", "src/a.rs"])
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(4));
@@ -187,14 +187,14 @@ fn binary_keeps_unimplemented_commands_operational_failures() {
     assert!(
         String::from_utf8(output.stderr)
             .unwrap()
-            .contains("callers execution is not implemented")
+            .contains("imports execution is not implemented")
     );
 }
 
 #[test]
 fn binary_json_failures_keep_stdout_machine_only_and_stderr_diagnostic() {
     let output = Command::new(env!("CARGO_BIN_EXE_code2graph"))
-        .args(["callers", "run", "--json"])
+        .args(["imports", "src/a.rs", "--json"])
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(4));
@@ -205,7 +205,7 @@ fn binary_json_failures_keep_stdout_machine_only_and_stderr_diagnostic() {
         value["error"]
             .as_str()
             .unwrap()
-            .contains("callers execution")
+            .contains("imports execution")
     );
     assert!(
         String::from_utf8(output.stderr)
@@ -356,6 +356,146 @@ fn binary_query_no_match_has_typed_json_human_output_and_exit_code() {
             .unwrap()
             .contains("error: no matching result")
     );
+}
+
+#[test]
+fn binary_relations_and_impact_cover_filters_limits_coordinates_and_no_match() {
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(
+        project.path().join("lib.rs"),
+        concat!(
+            "pub fn target() {}\n",
+            "pub fn middle() { target(); }\n",
+            "pub fn sibling() { target(); }\n",
+            "pub fn top() { middle(); }\n",
+        ),
+    )
+    .unwrap();
+
+    let json = |args: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_code2graph"))
+            .current_dir(project.path())
+            .args(args)
+            .args(["--no-cache", "--json"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stderr.is_empty(), "{args:?}");
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+
+    let callers = json(&["callers", "target"]);
+    assert_eq!(callers["total"], 2);
+    assert_eq!(callers["returned"], 2);
+    assert_eq!(callers["truncated"], false);
+    assert_eq!(callers["selector"]["matched"], 1);
+    assert!(
+        callers["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["role"] == "call" && row["confidence"] == "scoped")
+    );
+    assert!(
+        callers["results"][0]["occurrence"]["line"]
+            .as_u64()
+            .unwrap()
+            >= 2
+    );
+    assert!(callers["results"][0]["occurrence"]["column"].is_u64());
+
+    let callees = json(&["callees", "middle"]);
+    assert_eq!(callees["total"], 1);
+    assert_eq!(callees["results"][0]["to"], callers["selector"]["ids"][0]);
+
+    let usages = json(&["usages", "target"]);
+    assert_eq!(usages["total"], 2, "usages defaults to every role");
+    let read_only = json(&["usages", "target", "--role", "read"]);
+    assert_eq!(read_only["total"], 0);
+
+    let exact_only = json(&["callers", "target", "--min-confidence", "exact"]);
+    assert_eq!(
+        exact_only["total"], 0,
+        "explicit confidence overrides tier default"
+    );
+    let name_tier = json(&["callers", "target", "--tier", "name"]);
+    assert_eq!(name_tier["total"], 2);
+    assert!(
+        name_tier["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["confidence"] == "scoped"),
+        "the name tier admits its uniquely resolved scoped edges under the name-only default"
+    );
+
+    let limited = json(&["callers", "target", "--limit", "1"]);
+    assert_eq!(limited["total"], 2);
+    assert_eq!(limited["returned"], 1);
+    assert_eq!(limited["truncated"], true);
+    assert_eq!(limited["selector"]["matched"], 1);
+
+    let impact = json(&["impact", "target", "--depth", "5", "--limit", "2"]);
+    assert_eq!(impact["total"], 2);
+    assert_eq!(impact["returned"], 2);
+    assert_eq!(impact["truncated"], true);
+    assert!(
+        impact["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["seed"] == impact["selector"]["ids"][0])
+    );
+
+    let human = Command::new(env!("CARGO_BIN_EXE_code2graph"))
+        .current_dir(project.path())
+        .args(["callers", "target", "--no-cache", "--limit", "1"])
+        .output()
+        .unwrap();
+    assert!(human.status.success());
+    let human = String::from_utf8(human.stdout).unwrap();
+    let json_line = limited["results"][0]["occurrence"]["line"]
+        .as_u64()
+        .unwrap();
+    let json_column = limited["results"][0]["occurrence"]["column"]
+        .as_u64()
+        .unwrap();
+    assert!(
+        human.contains(&format!(":{json_line}:{} ", json_column + 1)),
+        "human columns must be one-based: {human}"
+    );
+    assert!(human.contains("truncated: returned 1 of 2 results"));
+
+    let impact_human = Command::new(env!("CARGO_BIN_EXE_code2graph"))
+        .current_dir(project.path())
+        .args([
+            "impact",
+            "target",
+            "--depth",
+            "5",
+            "--limit",
+            "2",
+            "--no-cache",
+        ])
+        .output()
+        .unwrap();
+    assert!(impact_human.status.success());
+    let impact_human = String::from_utf8(impact_human.stdout).unwrap();
+    assert!(impact_human.contains("seed codegraph"));
+    assert!(impact_human.contains("truncated: traversal bound omitted reachable results"));
+
+    let missing = Command::new(env!("CARGO_BIN_EXE_code2graph"))
+        .current_dir(project.path())
+        .args(["callers", "missing", "--no-cache", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(missing.status.code(), Some(1));
+    let missing: serde_json::Value = serde_json::from_slice(&missing.stdout).unwrap();
+    assert_eq!(missing["status"], "no-match");
 }
 
 #[test]

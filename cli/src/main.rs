@@ -49,6 +49,10 @@ fn finish_success(json: bool, output: CommandOutput) -> ProcessExitCode {
             CommandOutput::Status(envelope) => serde_json::to_string(envelope),
             CommandOutput::Symbols(envelope) => serde_json::to_string(envelope),
             CommandOutput::Def(envelope) => serde_json::to_string(envelope),
+            CommandOutput::Callers(envelope) => serde_json::to_string(envelope),
+            CommandOutput::Callees(envelope) => serde_json::to_string(envelope),
+            CommandOutput::Usages(envelope) => serde_json::to_string(envelope),
+            CommandOutput::Impact(envelope) => serde_json::to_string(envelope),
             CommandOutput::LoadedGraph(_) => {
                 eprintln!("graph loading is not a command output");
                 return ProcessExitCode::from(ExitCode::Operational.as_i32() as u8);
