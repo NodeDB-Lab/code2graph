@@ -32,6 +32,22 @@ pub enum CacheError {
     InvalidFacts,
     #[error("cache subgraph could not be restored")]
     InvalidSubgraph,
+    #[error("cache database is missing")]
+    Missing,
+    #[error("cache database uses an unsupported schema version")]
+    UnsupportedSchema,
+    #[error("cache database is corrupt")]
+    Corrupt,
+    #[error("cache database belongs to a different project")]
+    RootMismatch,
+    #[error("cache database is read-only")]
+    ReadOnly,
+    #[error("cache database is locked by another writer")]
+    LockContention,
+    #[error("cache database operation timed out")]
+    Timeout,
+    #[error("cache database could not be accessed")]
+    Access,
 }
 
 #[derive(Serialize, Deserialize)]

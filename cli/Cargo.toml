@@ -26,6 +26,7 @@ ignore = "0.4"
 blake3 = "1"
 directories.workspace = true
 zerompk = { version = "=0.5.0", features = ["derive"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

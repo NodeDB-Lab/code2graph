@@ -5,6 +5,8 @@
 mod codec;
 mod fingerprint;
 mod location;
+mod schema;
+mod store;
 mod types;
 
 pub use codec::{
@@ -16,4 +18,5 @@ pub use fingerprint::{
     PackageFingerprint, ProjectInputDigest,
 };
 pub use location::{CacheLocation, ProjectKey};
+pub use store::CacheStore;
 pub use types::{CacheOmission, CandidateCompleteness};

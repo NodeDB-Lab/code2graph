@@ -12,6 +12,11 @@ use directories::ProjectDirs;
 pub struct ProjectKey([u8; 32]);
 
 impl ProjectKey {
+    /// The opaque bytes persisted with the cache partition identity.
+    pub(crate) const fn as_bytes(self) -> [u8; 32] {
+        self.0
+    }
+
     /// Hash a canonical native path without converting it to lossy text.
     pub fn from_canonical_root(root: &Path) -> Self {
         let mut hasher = blake3::Hasher::new();
