@@ -583,6 +583,7 @@ if (!nativeBinding) {
 }
 
 module.exports = nativeBinding
+module.exports.GraphIndex = nativeBinding.GraphIndex
 module.exports.buildGraph = nativeBinding.buildGraph
 module.exports.extract = nativeBinding.extract
 module.exports.languageOf = nativeBinding.languageOf

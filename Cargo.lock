@@ -238,6 +238,7 @@ name = "code2graph-node"
 version = "0.0.0"
 dependencies = [
  "code2graph",
+ "code2graph-query",
  "napi",
  "napi-build",
  "napi-derive",
@@ -249,8 +250,10 @@ name = "code2graph-py"
 version = "0.0.0"
 dependencies = [
  "code2graph",
+ "code2graph-query",
  "pyo3",
  "pythonize",
+ "serde_json",
 ]
 
 [[package]]

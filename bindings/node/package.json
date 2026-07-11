@@ -27,10 +27,11 @@
     ]
   },
   "scripts": {
-    "build": "napi build --platform --release && npm run harden-loader",
-    "build:debug": "napi build --platform && npm run harden-loader",
+    "build": "napi build --platform --release && npm run harden-loader && npm run harden-types",
+    "build:debug": "napi build --platform && npm run harden-loader && npm run harden-types",
     "harden-loader": "node scripts/harden-loader.cjs",
-    "test": "node test/loader.test.cjs"
+    "harden-types": "node scripts/harden-types.cjs",
+    "test": "node test/loader.test.cjs && node test/query.test.cjs"
   },
   "devDependencies": {
     "@napi-rs/cli": "^3"
