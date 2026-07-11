@@ -34,19 +34,23 @@ const TABLES: &[(&str, &str)] = &[
     ),
     (
         "candidates",
-        "CREATE TABLE candidates (candidate_id BLOB PRIMARY KEY CHECK (length(candidate_id) = 32), compatibility_id BLOB NOT NULL REFERENCES compatibility(compatibility_id), input_digest BLOB NOT NULL CHECK (length(input_digest) = 32), completeness INTEGER NOT NULL CHECK (completeness IN (0, 1)), created_at_ns INTEGER NOT NULL CHECK (created_at_ns >= 0))",
+        "CREATE TABLE candidates (candidate_id BLOB PRIMARY KEY CHECK (length(candidate_id) = 32), compatibility_id BLOB NOT NULL REFERENCES compatibility(compatibility_id), input_digest BLOB NOT NULL CHECK (length(input_digest) = 32), completeness INTEGER NOT NULL CHECK (completeness IN (0, 1)), created_at_ns INTEGER NOT NULL CHECK (created_at_ns >= 0), inventory_file_count INTEGER NOT NULL CHECK (inventory_file_count >= 0), inventory_total_bytes INTEGER NOT NULL CHECK (inventory_total_bytes >= 0))",
+    ),
+    (
+        "candidate_omissions",
+        "CREATE TABLE candidate_omissions (candidate_id BLOB NOT NULL REFERENCES candidates(candidate_id) ON DELETE CASCADE, path TEXT NOT NULL CHECK (path <> '' AND instr(path, '\\') = 0), reason TEXT NOT NULL CHECK (reason <> ''), PRIMARY KEY (candidate_id, path, reason))",
     ),
     (
         "candidate_files",
-        "CREATE TABLE candidate_files (candidate_id BLOB NOT NULL REFERENCES candidates(candidate_id) ON DELETE CASCADE, path TEXT NOT NULL CHECK (path <> '' AND instr(path, '\\') = 0), language TEXT NOT NULL, content_hash BLOB NOT NULL CHECK (length(content_hash) = 32), size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0), mtime_ns INTEGER, file_facts BLOB NOT NULL, file_subgraph BLOB, PRIMARY KEY (candidate_id, path))",
+        "CREATE TABLE candidate_files (candidate_id BLOB NOT NULL REFERENCES candidates(candidate_id) ON DELETE CASCADE, path TEXT NOT NULL CHECK (path <> '' AND instr(path, '\\') = 0), language TEXT NOT NULL CHECK (language <> ''), content_hash BLOB NOT NULL CHECK (length(content_hash) = 32), size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0), mtime_ns INTEGER CHECK (mtime_ns IS NULL OR mtime_ns >= 0), file_facts BLOB NOT NULL CHECK (length(file_facts) <= 16777216), file_subgraph BLOB CHECK (file_subgraph IS NULL OR length(file_subgraph) <= 16777216), PRIMARY KEY (candidate_id, path))",
     ),
     (
         "graph_snapshots",
-        "CREATE TABLE graph_snapshots (snapshot_id INTEGER PRIMARY KEY, candidate_id BLOB NOT NULL REFERENCES candidates(candidate_id) ON DELETE CASCADE, resolver_tier TEXT NOT NULL CHECK (resolver_tier IN ('name', 'scope', 'dense')), graph BLOB NOT NULL, created_at_ns INTEGER NOT NULL CHECK (created_at_ns >= 0), UNIQUE (candidate_id, resolver_tier))",
+        "CREATE TABLE graph_snapshots (snapshot_id INTEGER PRIMARY KEY, candidate_id BLOB NOT NULL REFERENCES candidates(candidate_id) ON DELETE CASCADE, resolver_tier TEXT NOT NULL CHECK (resolver_tier IN ('name', 'scope', 'dense')), graph BLOB NOT NULL CHECK (length(graph) <= 16777216), created_at_ns INTEGER NOT NULL CHECK (created_at_ns >= 0), UNIQUE (candidate_id, resolver_tier))",
     ),
     (
         "active_snapshots",
-        "CREATE TABLE active_snapshots (resolver_tier TEXT PRIMARY KEY CHECK (resolver_tier IN ('name', 'scope', 'dense')), snapshot_id INTEGER NOT NULL REFERENCES graph_snapshots(snapshot_id) ON DELETE CASCADE)",
+        "CREATE TABLE active_snapshots (resolver_tier TEXT NOT NULL CHECK (resolver_tier IN ('name', 'scope', 'dense')), completeness INTEGER NOT NULL CHECK (completeness IN (0, 1)), snapshot_id INTEGER NOT NULL REFERENCES graph_snapshots(snapshot_id) ON DELETE CASCADE, PRIMARY KEY (resolver_tier, completeness))",
     ),
 ];
 

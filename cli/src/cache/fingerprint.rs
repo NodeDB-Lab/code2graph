@@ -20,6 +20,16 @@ macro_rules! fingerprint {
         #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
         pub struct $name([u8; 32]);
         impl $name {
+            /// Raw fixed-width cache key bytes for SQLite storage.
+            pub fn as_bytes(&self) -> &[u8; 32] {
+                &self.0
+            }
+
+            /// Restores a fingerprint read from a schema-checked 32-byte key.
+            pub fn from_bytes(bytes: [u8; 32]) -> Self {
+                Self(bytes)
+            }
+
             fn digest(parts: impl IntoIterator<Item = Vec<u8>>) -> Self {
                 let mut hasher = blake3::Hasher::new();
                 hasher.update(concat!("code2graph.cache.", stringify!($name), ".v1\0").as_bytes());
@@ -180,6 +190,7 @@ impl ProjectInputDigest {
 impl CandidateId {
     /// Include completeness and all canonical partial omissions in the identity.
     pub fn new(
+        compatibility: CompatibilityFingerprint,
         input: ProjectInputDigest,
         completeness: CandidateCompleteness,
         omissions: &[CacheOmission],
@@ -198,7 +209,7 @@ impl CandidateId {
             CandidateCompleteness::Complete => b"complete".to_vec(),
             CandidateCompleteness::Partial => b"partial".to_vec(),
         };
-        let mut parts = vec![input.0.to_vec(), state];
+        let mut parts = vec![compatibility.0.to_vec(), input.0.to_vec(), state];
         parts.extend(rows);
         Self::digest(parts)
     }
@@ -272,9 +283,14 @@ mod tests {
     #[test]
     fn candidates_distinguish_complete_partial_and_omissions() {
         let input = ProjectInputDigest::from_inputs([("a", "rust", [1_u8])]);
-        let complete = CandidateId::new(input, CandidateCompleteness::Complete, &[]);
-        let partial = CandidateId::new(input, CandidateCompleteness::Partial, &[]);
+        let compatibility = CompatibilityFingerprint::new(
+            LanguageFeatureFingerprint::current(),
+            PackageFingerprint::from_normalized(["test"]),
+        );
+        let complete = CandidateId::new(compatibility, input, CandidateCompleteness::Complete, &[]);
+        let partial = CandidateId::new(compatibility, input, CandidateCompleteness::Partial, &[]);
         let omitted = CandidateId::new(
+            compatibility,
             input,
             CandidateCompleteness::Partial,
             &[CacheOmission {
@@ -286,6 +302,7 @@ mod tests {
         assert_ne!(partial, omitted);
 
         let first = CandidateId::new(
+            compatibility,
             input,
             CandidateCompleteness::Partial,
             &[
@@ -300,6 +317,7 @@ mod tests {
             ],
         );
         let reordered = CandidateId::new(
+            compatibility,
             input,
             CandidateCompleteness::Partial,
             &[
@@ -314,6 +332,7 @@ mod tests {
             ],
         );
         let ambiguous_without_prefixes = CandidateId::new(
+            compatibility,
             input,
             CandidateCompleteness::Partial,
             &[CacheOmission {
@@ -323,6 +342,20 @@ mod tests {
         );
         assert_eq!(first, reordered);
         assert_ne!(first, ambiguous_without_prefixes);
+
+        let other_compatibility = CompatibilityFingerprint::new(
+            LanguageFeatureFingerprint::current(),
+            PackageFingerprint::from_normalized(["other"]),
+        );
+        assert_ne!(
+            complete,
+            CandidateId::new(
+                other_compatibility,
+                input,
+                CandidateCompleteness::Complete,
+                &[],
+            )
+        );
     }
 
     #[test]

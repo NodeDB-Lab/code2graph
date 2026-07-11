@@ -19,4 +19,7 @@ pub use fingerprint::{
 };
 pub use location::{CacheLocation, ProjectKey};
 pub use store::CacheStore;
-pub use types::{CacheOmission, CandidateCompleteness};
+pub use types::{
+    CacheCompleteness, CacheOmission, CandidateCompleteness, CandidateFileRecord,
+    CandidateSnapshot, CompatibilityRecord, LoadedSnapshot, ResolverCacheTier,
+};

@@ -48,9 +48,16 @@ pub enum CacheError {
     Timeout,
     #[error("cache database could not be accessed")]
     Access,
+    #[error("cache candidate is invalid or internally inconsistent")]
+    InvalidCandidate,
+    #[error("cache candidate conflicts with an existing candidate id")]
+    CandidateConflict,
+    #[error("requested cache snapshot is missing")]
+    SnapshotMissing,
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Envelope<T> {
     format: String,
     schema: u32,
