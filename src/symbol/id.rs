@@ -103,16 +103,6 @@ pub enum SymbolParseError {
     NoDescriptors,
 }
 
-/// Coordinate-combination errors in a versioned `SymbolId` wire value.
-#[cfg(feature = "serde")]
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum WireContextError {
-    #[error("global SymbolId wire requires lang and forbids file")]
-    Global,
-    #[error("local SymbolId wire requires file and forbids lang")]
-    Local,
-}
-
 /// A symbol's identity.
 ///
 /// Internally an `Arc` over a private representation, so cloning is O(1)
@@ -126,6 +116,45 @@ pub(crate) enum WireContextError {
 /// SCIP omits a language or local-file coordinate.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SymbolId(Arc<SymbolRepr>);
+
+/// Stable, versioned transport representation of a [`SymbolId`].
+///
+/// SCIP text omits code2graph's structural language/local-file coordinate, so
+/// transporting only [`SymbolId::to_scip_string`] is lossy. This value preserves
+/// that coordinate without exposing the private descriptor representation.
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(deny_unknown_fields)
+)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolIdWire {
+    pub version: u32,
+    pub scip: String,
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub lang: Option<String>,
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub file: Option<String>,
+}
+
+/// Errors converting a [`SymbolIdWire`] into a [`SymbolId`].
+#[derive(Debug, thiserror::Error)]
+pub enum SymbolIdWireError {
+    #[error("unsupported SymbolId wire version {0}")]
+    Version(u32),
+    #[error("invalid SCIP symbol: {0}")]
+    Parse(#[from] SymbolParseError),
+    #[error("global SymbolId wire requires lang and forbids file")]
+    GlobalContext,
+    #[error("local SymbolId wire requires file and forbids lang")]
+    LocalContext,
+}
 
 impl Ord for SymbolId {
     fn cmp(&self, other: &Self) -> Ordering {
@@ -208,23 +237,22 @@ impl SymbolId {
         }
     }
 
-    /// Identity coordinates omitted by SCIP's standard rendered form. Kept
-    /// crate-visible so serde can preserve structural identity without abusing
-    /// package coordinates or changing the required `codegraph` scheme.
-    #[cfg(feature = "serde")]
-    pub(crate) fn wire_context(&self) -> (Option<&str>, Option<&str>) {
-        (self.language(), self.local_file())
+    /// Convert to the stable transport representation.
+    pub fn to_wire(&self) -> SymbolIdWire {
+        SymbolIdWire {
+            version: 1,
+            scip: self.to_scip_string(),
+            lang: self.language().map(str::to_owned),
+            file: self.local_file().map(str::to_owned),
+        }
     }
 
-    /// Apply the identity coordinates from a versioned wire value to a parsed
-    /// SCIP display string. Global symbols require `lang`; local symbols require
-    /// `file`; the other coordinate is rejected in each case.
-    #[cfg(feature = "serde")]
-    pub(crate) fn from_wire(
-        parsed: Self,
-        lang: Option<String>,
-        file: Option<String>,
-    ) -> Result<Self, WireContextError> {
+    /// Reconstruct a symbol from its stable transport representation.
+    pub fn try_from_wire(wire: SymbolIdWire) -> Result<Self, SymbolIdWireError> {
+        if wire.version != 1 {
+            return Err(SymbolIdWireError::Version(wire.version));
+        }
+        let parsed = Self::from_scip_string(&wire.scip)?;
         match &*parsed.0 {
             SymbolRepr::Global {
                 scheme,
@@ -232,11 +260,11 @@ impl SymbolId {
                 descriptors,
                 ..
             } => {
-                let lang = lang.ok_or(WireContextError::Global)?;
-                if file.is_some() {
-                    return Err(WireContextError::Global);
+                let lang = wire.lang.ok_or(SymbolIdWireError::GlobalContext)?;
+                if wire.file.is_some() {
+                    return Err(SymbolIdWireError::GlobalContext);
                 }
-                Ok(SymbolId(Arc::new(SymbolRepr::Global {
+                Ok(Self(Arc::new(SymbolRepr::Global {
                     scheme: scheme.clone(),
                     package: package.clone(),
                     lang,
@@ -244,11 +272,11 @@ impl SymbolId {
                 })))
             }
             SymbolRepr::Local { id, .. } => {
-                let file = file.ok_or(WireContextError::Local)?;
-                if lang.is_some() {
-                    return Err(WireContextError::Local);
+                let file = wire.file.ok_or(SymbolIdWireError::LocalContext)?;
+                if wire.lang.is_some() {
+                    return Err(SymbolIdWireError::LocalContext);
                 }
-                Ok(SymbolId::local(file, id.clone()))
+                Ok(Self::local(file, id.clone()))
             }
         }
     }
@@ -380,6 +408,9 @@ impl SymbolId {
 
         // `local <id>` — the id is the whole remainder after the single space.
         if let Some(id) = s.strip_prefix("local ") {
+            if id.is_empty() {
+                return Err(SymbolParseError::ExpectedIdent);
+            }
             return Ok(SymbolId(Arc::new(SymbolRepr::Local {
                 file: String::new(),
                 id: id.to_owned(),
@@ -397,6 +428,14 @@ impl SymbolId {
         let name = parts.next().ok_or(SymbolParseError::MalformedHeader)?;
         let version = parts.next().ok_or(SymbolParseError::MalformedHeader)?;
         let descriptors_str = parts.next().ok_or(SymbolParseError::MalformedHeader)?;
+        if scheme.is_empty()
+            || manager.is_empty()
+            || name.is_empty()
+            || version.is_empty()
+            || descriptors_str.is_empty()
+        {
+            return Err(SymbolParseError::MalformedHeader);
+        }
 
         let unfield = |t: &str| {
             if t == "." {
@@ -834,11 +873,21 @@ mod tests {
     }
 
     #[test]
-    fn err_no_space_header() {
+    fn err_no_space_or_empty_header_coordinates() {
         assert_eq!(
             SymbolId::from_scip_string("codegraph"),
             Err(SymbolParseError::MalformedHeader)
         );
+        for value in [
+            "local ",
+            " codegraph . . run.",
+            "codegraph  . . run.",
+            "codegraph .  . run.",
+            "codegraph . .  run.",
+            "codegraph . . . ",
+        ] {
+            assert!(SymbolId::from_scip_string(value).is_err(), "{value:?}");
+        }
     }
 
     #[test]
@@ -878,6 +927,39 @@ mod tests {
     fn fromstr_parses() {
         let id: SymbolId = "codegraph . . . auth/".parse().unwrap();
         assert_eq!(id.to_scip_string(), "codegraph . . . auth/");
+    }
+
+    #[test]
+    fn stable_wire_round_trips_structural_display_collisions_and_rejects_mismatched_context() {
+        let ids = [
+            SymbolId::global("rust", vec![Descriptor::Term("run".into())]),
+            SymbolId::global("python", vec![Descriptor::Term("run".into())]),
+            SymbolId::local("src/main.rs", "x0"),
+            SymbolId::local("src/lib.rs", "x0"),
+        ];
+        assert_eq!(ids[0].to_scip_string(), ids[1].to_scip_string());
+        assert_eq!(ids[2].to_scip_string(), ids[3].to_scip_string());
+        for id in ids {
+            assert_eq!(SymbolId::try_from_wire(id.to_wire()).unwrap(), id);
+        }
+        assert!(matches!(
+            SymbolId::try_from_wire(SymbolIdWire {
+                version: 1,
+                scip: "local x0".into(),
+                lang: Some("rust".into()),
+                file: None
+            }),
+            Err(SymbolIdWireError::LocalContext)
+        ));
+        assert!(matches!(
+            SymbolId::try_from_wire(SymbolIdWire {
+                version: 2,
+                scip: "local x0".into(),
+                lang: None,
+                file: Some("src/main.rs".into())
+            }),
+            Err(SymbolIdWireError::Version(2))
+        ));
     }
 
     #[test]

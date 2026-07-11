@@ -8,4 +8,4 @@ pub mod id;
 mod serde_impl;
 
 pub use descriptor::{Descriptor, MethodDisambiguator};
-pub use id::{Package, SCHEME, SymbolId, SymbolParseError};
+pub use id::{Package, SCHEME, SymbolId, SymbolIdWire, SymbolIdWireError, SymbolParseError};

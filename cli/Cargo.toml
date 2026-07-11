@@ -24,6 +24,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 ignore = "0.4"
 blake3 = "1"
+zerompk = { version = "=0.5.0", features = ["derive"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -3,16 +3,14 @@
 use std::ffi::OsString;
 use std::time::Duration;
 
-use clap::{ArgGroup, Args, Parser, Subcommand};
-use code2graph::{Confidence, RefRole, SymbolId, SymbolKind};
-use serde::Deserialize;
-
 use crate::config::{
     DEFAULT_IMPACT_DEPTH, DEFAULT_LIMIT, DEFAULT_MAX_DEPTH, DEFAULT_MAX_FILE_BYTES,
     DEFAULT_MAX_FILES, DEFAULT_MAX_TOTAL_BYTES, GlobalOptions, ResolverTier, ResourceLimits,
 };
 use crate::error::CliError;
 use crate::request::{CliRequest, CommandRequest, Selector, SourcePosition};
+use clap::{ArgGroup, Args, Parser, Subcommand};
+use code2graph::{Confidence, RefRole, SymbolId, SymbolIdWire, SymbolKind};
 
 /// Parse an owned request without reading the filesystem or invoking a resolver.
 pub fn parse_from<I, T>(args: I) -> Result<CliRequest, CliError>
@@ -360,32 +358,10 @@ fn positive_u32(value: &str) -> Result<u32, String> {
     }
 }
 fn parse_symbol_id(value: &str) -> Result<SymbolId, String> {
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct StrictSymbolIdWire {
-        version: u8,
-        scip: String,
-        #[serde(default)]
-        lang: Option<String>,
-        #[serde(default)]
-        file: Option<String>,
-    }
-
-    let wire: StrictSymbolIdWire = serde_json::from_str(value)
+    let wire: SymbolIdWire = serde_json::from_str(value)
         .map_err(|error| format!("invalid lossless SymbolId JSON: {error}"))?;
-    if wire.version != 1 {
-        return Err(format!(
-            "invalid lossless SymbolId JSON: unsupported SymbolId wire version {}",
-            wire.version
-        ));
-    }
-    serde_json::from_value(serde_json::json!({
-        "version": wire.version,
-        "scip": wire.scip,
-        "lang": wire.lang,
-        "file": wire.file,
-    }))
-    .map_err(|error| format!("invalid lossless SymbolId JSON: {error}"))
+    SymbolId::try_from_wire(wire)
+        .map_err(|error| format!("invalid lossless SymbolId JSON: {error}"))
 }
 fn parse_duration(value: &str) -> Result<Duration, String> {
     let units = [("ms", 1_u64), ("s", 1_000), ("m", 60_000), ("h", 3_600_000)];

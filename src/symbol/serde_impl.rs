@@ -6,33 +6,11 @@
 //! versioned wire representation carries those coordinates explicitly while
 //! retaining a parseable standard SCIP string.
 
-use super::id::SymbolId;
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct SymbolIdWire {
-    #[serde(default = "wire_version")]
-    version: u8,
-    scip: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    lang: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    file: Option<String>,
-}
-
-const fn wire_version() -> u8 {
-    1
-}
+use super::id::{SymbolId, SymbolIdWire};
 
 impl serde::Serialize for SymbolId {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let (lang, file) = self.wire_context();
-        SymbolIdWire {
-            version: wire_version(),
-            scip: self.to_scip_string(),
-            lang: lang.map(str::to_owned),
-            file: file.map(str::to_owned),
-        }
-        .serialize(serializer)
+        self.to_wire().serialize(serializer)
     }
 }
 
@@ -46,18 +24,7 @@ impl<'de> serde::Deserialize<'de> for SymbolId {
         }
         match Input::deserialize(deserializer)? {
             Input::Legacy(s) => SymbolId::from_scip_string(&s).map_err(serde::de::Error::custom),
-            Input::Wire(w) => {
-                if w.version != wire_version() {
-                    return Err(serde::de::Error::custom(format!(
-                        "unsupported SymbolId wire version {}",
-                        w.version
-                    )));
-                }
-
-                let parsed =
-                    SymbolId::from_scip_string(&w.scip).map_err(serde::de::Error::custom)?;
-                SymbolId::from_wire(parsed, w.lang, w.file).map_err(serde::de::Error::custom)
-            }
+            Input::Wire(w) => SymbolId::try_from_wire(w).map_err(serde::de::Error::custom),
         }
     }
 }
@@ -134,5 +101,15 @@ mod tests {
                 .to_string()
                 .contains("unsupported SymbolId wire version")
         );
+    }
+
+    #[test]
+    fn version_is_required_and_unknown_wire_fields_are_rejected() {
+        for json in [
+            r#"{"scip":"local x","file":"src/a.rs"}"#,
+            r#"{"version":1,"scip":"local x","file":"src/a.rs","extra":0}"#,
+        ] {
+            assert!(serde_json::from_str::<SymbolId>(json).is_err(), "{json}");
+        }
     }
 }

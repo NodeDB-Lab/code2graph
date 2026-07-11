@@ -79,4 +79,4 @@ pub use resolve::{
     LayeredResolver, Resolver, ScopeGraphDelta, ScopeGraphResolver, ScopeSnapshotToken,
     SymbolTableResolver, TrackedIncrementalGraph,
 };
-pub use symbol::{Descriptor, Package, SymbolId};
+pub use symbol::{Descriptor, Package, SymbolId, SymbolIdWire, SymbolIdWireError};

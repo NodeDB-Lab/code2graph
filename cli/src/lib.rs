@@ -10,6 +10,7 @@ pub mod inventory;
 pub mod project;
 pub mod request;
 pub mod result;
+pub mod worker;
 
 pub use args::parse_from;
 pub use config::{
