@@ -7,6 +7,7 @@ pub mod cache;
 pub mod config;
 pub mod deadline;
 pub mod error;
+pub mod execution;
 pub mod exit;
 pub mod inventory;
 pub mod package_assignment;
@@ -23,6 +24,10 @@ pub use config::{
 };
 pub use deadline::{Cancellation, Deadline, NeverCancelled};
 pub use error::{CliError, Result};
+pub use execution::{
+    Clock, CommandOutput, ExecutionContext, LoadedGraph, SystemClock, execute, load_query_graph,
+    render_human,
+};
 pub use exit::ExitCode;
 pub use inventory::{
     FileClassification, InventoryCompleteness, InventoryFile, InventorySummary,

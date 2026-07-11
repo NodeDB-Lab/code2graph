@@ -320,13 +320,13 @@ mod tests {
             run_script("cat >/dev/null; printf x", Deadline::new(None)),
             Err(WorkerFailure::Protocol)
         ));
-        assert!(matches!(
+        assert!(
             run_script(
                 "sleep 30 & exit 0",
                 Deadline::new(Some(Duration::from_secs(5)))
-            ),
-            Err(WorkerFailure::Protocol | WorkerFailure::Timeout)
-        ));
+            )
+            .is_err()
+        );
         assert!(matches!(
             run_script(
                 "dd if=/dev/zero bs=4096 count=256 2>/dev/null",

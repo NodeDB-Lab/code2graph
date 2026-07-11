@@ -177,9 +177,9 @@ fn lossless_ids_survive_selector_and_output_json() {
 }
 
 #[test]
-fn binary_never_reports_unimplemented_execution_as_success() {
+fn binary_keeps_unimplemented_commands_operational_failures() {
     let output = Command::new(env!("CARGO_BIN_EXE_code2graph"))
-        .args(["status"])
+        .args(["symbols", "run"])
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(4));
@@ -187,14 +187,14 @@ fn binary_never_reports_unimplemented_execution_as_success() {
     assert!(
         String::from_utf8(output.stderr)
             .unwrap()
-            .contains("execution is not implemented")
+            .contains("symbols execution is not implemented")
     );
 }
 
 #[test]
 fn binary_json_failures_keep_stdout_machine_only_and_stderr_diagnostic() {
     let output = Command::new(env!("CARGO_BIN_EXE_code2graph"))
-        .args(["status", "--json"])
+        .args(["symbols", "run", "--json"])
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(4));
@@ -205,7 +205,7 @@ fn binary_json_failures_keep_stdout_machine_only_and_stderr_diagnostic() {
         value["error"]
             .as_str()
             .unwrap()
-            .contains("status execution")
+            .contains("symbols execution")
     );
     assert!(
         String::from_utf8(output.stderr)
@@ -240,6 +240,37 @@ fn binary_usage_errors_map_to_two_and_emit_json_when_requested() {
         String::from_utf8(output.stderr)
             .unwrap()
             .starts_with("error: ")
+    );
+}
+
+#[test]
+fn binary_index_uses_the_same_binary_worker_and_keeps_success_channels_clean() {
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join("a.rs"), "pub fn run() {}\n").unwrap();
+
+    let json = Command::new(env!("CARGO_BIN_EXE_code2graph"))
+        .current_dir(project.path())
+        .args(["index", "--no-cache", "--json"])
+        .output()
+        .unwrap();
+    assert!(json.status.success());
+    assert!(json.stderr.is_empty());
+    let value: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(value["status"], "ok");
+    assert_eq!(value["project"]["cache"], "disabled");
+    assert_eq!(value["results"]["inventory_file_count"], 1);
+    assert_eq!(value["results"]["changed"], 1);
+
+    let human = Command::new(env!("CARGO_BIN_EXE_code2graph"))
+        .current_dir(project.path())
+        .args(["index", "--no-cache"])
+        .output()
+        .unwrap();
+    assert!(human.status.success());
+    assert!(human.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8(human.stdout).unwrap(),
+        "indexed 1 files; 1 changed, 0 deleted; complete\n"
     );
 }
 

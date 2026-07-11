@@ -4,8 +4,9 @@ use std::ffi::OsString;
 use std::process::ExitCode as ProcessExitCode;
 
 use code2graph_cli::{
-    CliError, ErrorEnvelope, ExitCode, OutputStatus, ParseOutcome, is_worker_invocation,
-    parse_from, run_worker,
+    CliError, CommandOutput, ErrorEnvelope, ExecutionContext, ExitCode, NeverCancelled,
+    OutputStatus, ParseOutcome, SystemClock, execute, is_worker_invocation, parse_from,
+    render_human, run_worker,
 };
 
 fn main() -> ProcessExitCode {
@@ -18,18 +19,50 @@ fn main() -> ProcessExitCode {
     }
     let requested_json = requests_json(&args);
     match parse_from(args) {
-        Ok(ParseOutcome::Request(request)) => finish(
-            request.global.json,
-            CliError::Unavailable {
-                command: request.command.name().to_owned(),
-            },
-        ),
+        Ok(ParseOutcome::Request(request)) => {
+            let cwd = match std::env::current_dir() {
+                Ok(cwd) => cwd,
+                Err(error) => {
+                    return finish(request.global.json, CliError::Fatal(error.to_string()));
+                }
+            };
+            let cancellation = NeverCancelled;
+            let clock = SystemClock;
+            let context = ExecutionContext::new(cwd, None, &cancellation, &clock);
+            match execute(request.clone(), &context) {
+                Ok(output) => finish_success(request.global.json, output),
+                Err(error) => finish(request.global.json, error),
+            }
+        }
         Ok(ParseOutcome::Display(text)) => {
             print!("{text}");
             ProcessExitCode::SUCCESS
         }
         Err(error) => finish(requested_json, error),
     }
+}
+
+fn finish_success(json: bool, output: CommandOutput) -> ProcessExitCode {
+    if json {
+        let serialized = match &output {
+            CommandOutput::Index(envelope) => serde_json::to_string(envelope),
+            CommandOutput::Status(envelope) => serde_json::to_string(envelope),
+            CommandOutput::LoadedGraph(_) => {
+                eprintln!("graph loading is not a command output");
+                return ProcessExitCode::from(ExitCode::Operational.as_i32() as u8);
+            }
+        };
+        match serialized {
+            Ok(value) => println!("{value}"),
+            Err(error) => {
+                eprintln!("failed to serialize output envelope: {error}");
+                return ProcessExitCode::from(ExitCode::Operational.as_i32() as u8);
+            }
+        }
+    } else {
+        print!("{}", render_human(&output));
+    }
+    ProcessExitCode::SUCCESS
 }
 
 fn finish(json: bool, error: CliError) -> ProcessExitCode {

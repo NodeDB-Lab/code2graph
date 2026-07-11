@@ -38,6 +38,8 @@ pub enum CliError {
     Cancelled,
     #[error("partial refresh candidates require explicit allowance")]
     PartialNotAllowed,
+    #[error("no cached snapshot is available for frozen operation")]
+    FrozenSnapshotMissing,
     #[error("worker failure: {0}")]
     Worker(WorkerFailure),
     #[error("{command} execution is not implemented in this contract-only CLI shell")]
@@ -69,6 +71,7 @@ impl CliError {
             | Self::Timeout
             | Self::Cancelled
             | Self::PartialNotAllowed
+            | Self::FrozenSnapshotMissing
             | Self::Worker(_)
             | Self::Unavailable { .. }
             | Self::Fatal(_) => ExitCode::Operational,
@@ -83,7 +86,9 @@ impl From<&CliError> for OutputStatus {
             CliError::Ambiguous => Self::Ambiguous,
             CliError::Unsupported(_) | CliError::Unavailable { .. } => Self::Unsupported,
             CliError::Timeout => Self::Timeout,
-            CliError::Cancelled | CliError::PartialNotAllowed => Self::Error,
+            CliError::Cancelled | CliError::PartialNotAllowed | CliError::FrozenSnapshotMissing => {
+                Self::Error
+            }
             CliError::Usage(_)
             | CliError::Cache(_)
             | CliError::Index(_)
