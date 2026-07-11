@@ -3,6 +3,7 @@
 //! Public contracts and argument parsing for the `code2graph` CLI.
 
 pub mod args;
+pub mod cache;
 pub mod config;
 pub mod deadline;
 pub mod error;

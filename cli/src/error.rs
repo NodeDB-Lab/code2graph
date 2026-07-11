@@ -44,6 +44,12 @@ pub enum CliError {
     Fatal(String),
 }
 
+impl From<crate::cache::CacheError> for CliError {
+    fn from(error: crate::cache::CacheError) -> Self {
+        Self::Cache(error.to_string())
+    }
+}
+
 impl CliError {
     /// Exhaustive mapping required by the public process contract.
     pub const fn exit_code(&self) -> ExitCode {
@@ -126,6 +132,14 @@ mod tests {
         ] {
             assert_eq!(error.exit_code(), ExitCode::Operational);
         }
+    }
+
+    #[test]
+    fn cache_errors_map_to_the_public_operational_category() {
+        let error = CliError::from(crate::cache::CacheError::Incompatible);
+        assert!(matches!(error, CliError::Cache(_)));
+        assert_eq!(error.exit_code(), ExitCode::Operational);
+        assert_eq!(OutputStatus::from(&error), OutputStatus::Error);
     }
 
     #[test]

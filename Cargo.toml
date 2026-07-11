@@ -11,6 +11,7 @@ license = "Apache-2.0"
 
 [workspace.dependencies]
 code2graph = { path = ".", version = "0.0.0" }
+directories = "6"
 code2graph-query = { path = "query", version = "0.0.0" }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }

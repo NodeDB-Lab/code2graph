@@ -9,6 +9,11 @@
 
 use crate::symbol::SymbolId;
 
+/// Persistence schema for extracted per-file facts.
+pub const FILE_FACTS_SCHEMA_VERSION: u32 = 1;
+/// Persistence schema for resolved whole-project graphs.
+pub const CODE_GRAPH_SCHEMA_VERSION: u32 = 1;
+
 /// A half-open byte range `[start, end)` into a source file. Consumers slice
 /// their own text from this — code2graph never carries source bodies.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -549,6 +554,17 @@ impl CodeGraph {
             symbols: self.symbols.clone(),
             edges: self.edges_min_confidence(threshold).cloned().collect(),
         }
+    }
+}
+
+#[cfg(test)]
+mod schema_tests {
+    use super::*;
+
+    #[test]
+    fn cache_schema_epochs_are_stable() {
+        assert_eq!(FILE_FACTS_SCHEMA_VERSION, 1);
+        assert_eq!(CODE_GRAPH_SCHEMA_VERSION, 1);
     }
 }
 

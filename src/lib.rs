@@ -68,10 +68,11 @@ pub mod symbol;
 pub use error::{CodegraphError, Result};
 pub use extract::{Extractor, extract_file, extract_path};
 pub use graph::{
-    Binding, BindingKind, BindingTarget, ByteSpan, CodeGraph, Confidence, Edge, EdgeKey,
-    EntryPoint, FfiAbi, FfiExport, FileFacts, FileFactsValidationContext, Occurrence, Provenance,
-    RefRole, Reference, Scope, ScopeId, ScopeKind, Symbol, SymbolKind, TypeRefContext, Visibility,
-    validate_file_facts, validate_file_facts_with_context,
+    Binding, BindingKind, BindingTarget, ByteSpan, CODE_GRAPH_SCHEMA_VERSION, CodeGraph,
+    Confidence, Edge, EdgeKey, EntryPoint, FILE_FACTS_SCHEMA_VERSION, FfiAbi, FfiExport, FileFacts,
+    FileFactsValidationContext, Occurrence, Provenance, RefRole, Reference, Scope, ScopeId,
+    ScopeKind, Symbol, SymbolKind, TypeRefContext, Visibility, validate_file_facts,
+    validate_file_facts_with_context,
 };
 pub use lang::{Language, LanguageAvailability};
 pub use resolve::{
