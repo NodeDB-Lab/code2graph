@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "code2graph-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Standalone project query and indexing consumer for code2graph."
+repository = "https://github.com/nodedb-lab/code2graph"
+keywords = ["code-graph", "static-analysis", "cli", "symbols"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "code2graph"
+path = "src/main.rs"
+
+[dependencies]
+code2graph = { workspace = true, features = ["serde", "manifest"] }
+code2graph-query.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

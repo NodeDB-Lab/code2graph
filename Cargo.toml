@@ -1,5 +1,5 @@
 [workspace]
-members = ["eval", "bindings/python", "bindings/node", "query"]
+members = ["eval", "bindings/python", "bindings/node", "query", "cli"]
 
 # Single source of truth for the version shared by the crate and all bindings.
 # CI stamps this from the git tag and mirrors it into pyproject.toml / package.json.
@@ -8,6 +8,14 @@ version = "0.0.0"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
+
+[workspace.dependencies]
+code2graph = { path = ".", version = "0.0.0" }
+code2graph-query = { path = "query", version = "0.0.0" }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
 
 [package]
 name = "code2graph"

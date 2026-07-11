@@ -1,0 +1,212 @@
+// SPDX-License-Identifier: Apache-2.0
+
+use std::process::Command;
+
+use code2graph::{Descriptor, SymbolId};
+use code2graph_cli::{
+    CommandRequest, OutputEnvelope, OutputStatus, Selector, SelectorOutput, parse_from,
+};
+
+#[test]
+fn every_documented_usage_accepts_global_flags_after_the_command() {
+    let cases: &[&[&str]] = &[
+        &[
+            "code2graph",
+            "index",
+            ".",
+            "--force",
+            "--trust-mtime",
+            "--json",
+        ],
+        &["code2graph", "status", "--json"],
+        &[
+            "code2graph",
+            "symbols",
+            "run",
+            "--file",
+            "src/main.rs",
+            "--kind",
+            "function",
+            "--case-sensitive",
+            "--json",
+        ],
+        &["code2graph", "def", "run", "--require-unique", "--json"],
+        &["code2graph", "callers", "run", "--role", "call", "--json"],
+        &[
+            "code2graph",
+            "callees",
+            "run",
+            "--role",
+            "type-ref",
+            "--json",
+        ],
+        &["code2graph", "impact", "run", "--depth", "3", "--json"],
+        &["code2graph", "usages", "run", "--role", "read", "--json"],
+        &["code2graph", "imports", "src/main.rs", "--json"],
+        &["code2graph", "module-deps", "--json"],
+        &[
+            "code2graph",
+            "references",
+            "src/main.rs",
+            "--name",
+            "run",
+            "--role",
+            "call",
+            "--json",
+        ],
+    ];
+
+    for args in cases {
+        assert!(parse_from(args.iter().copied()).is_ok(), "{args:?}");
+    }
+}
+
+#[test]
+fn windows_drive_paths_are_only_positions_when_explicitly_selected() {
+    let bare = parse_from(["code2graph", "def", r"C:\src\main.rs"]).unwrap();
+    let CommandRequest::Def {
+        selector: Selector::Name(name),
+        ..
+    } = bare.command
+    else {
+        panic!("bare positional selectors must remain names")
+    };
+    assert_eq!(name, r"C:\src\main.rs");
+
+    let explicit = parse_from([
+        "code2graph",
+        "def",
+        "--at-file",
+        r"C:\src\main.rs",
+        "--line",
+        "2",
+    ])
+    .unwrap();
+    assert!(matches!(
+        explicit.command,
+        CommandRequest::Def {
+            selector: Selector::Position(_),
+            ..
+        }
+    ));
+}
+
+#[test]
+fn selector_adversaries_are_rejected_without_guessing() {
+    let bad: &[&[&str]] = &[
+        &["code2graph", "def"],
+        &["code2graph", "def", "run", "--scip", "local run"],
+        &["code2graph", "def", "--line", "1"],
+        &[
+            "code2graph",
+            "def",
+            "--at-file",
+            "src/main.rs",
+            "--line",
+            "1",
+            "--column",
+            "0",
+        ],
+        &[
+            "code2graph",
+            "def",
+            "--id-json",
+            r#"{"version":1,"scip":"local x","file":"src/a.rs","unknown":0}"#,
+        ],
+        &[
+            "code2graph",
+            "def",
+            "--id-json",
+            r#"{"version":1,"scip":"local x","file":"src/a.rs"}"#,
+            "--kind",
+            "other",
+        ],
+        &["code2graph", "index", "--frozen"],
+    ];
+
+    for args in bad {
+        assert!(parse_from(args.iter().copied()).is_err(), "{args:?}");
+    }
+}
+
+#[test]
+fn lossless_ids_survive_selector_and_output_json() {
+    let local_json = r#"{"version":1,"scip":"local x","file":"src/a.rs"}"#;
+    let request = parse_from(["code2graph", "def", "--id-json", local_json]).unwrap();
+    let CommandRequest::Def {
+        selector: Selector::Id(local),
+        ..
+    } = request.command
+    else {
+        panic!("expected exact ID selector")
+    };
+
+    let global = SymbolId::global("rust", vec![Descriptor::Term("x".into())]);
+    let mut envelope = OutputEnvelope::new(OutputStatus::Ok, Vec::<String>::new());
+    envelope.selector = Some(SelectorOutput {
+        matched: 2,
+        ambiguous: true,
+        ids: vec![global, local],
+        symbols: Vec::new(),
+    });
+    let value = serde_json::to_value(envelope).unwrap();
+    let ids = value["selector"]["ids"].as_array().unwrap();
+    assert_eq!(ids[0]["lang"], "rust");
+    assert!(ids[0].get("file").is_none());
+    assert_eq!(ids[1]["file"], "src/a.rs");
+    assert!(ids[1].get("lang").is_none());
+}
+
+#[test]
+fn binary_never_reports_unimplemented_execution_as_success() {
+    let output = Command::new(env!("CARGO_BIN_EXE_code2graph"))
+        .args(["status"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(4));
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("execution is not implemented")
+    );
+}
+
+#[test]
+fn binary_json_failures_keep_stdout_machine_only_and_stderr_diagnostic() {
+    let output = Command::new(env!("CARGO_BIN_EXE_code2graph"))
+        .args(["status", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(4));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["schemaVersion"], 1);
+    assert_eq!(value["status"], "unsupported");
+    assert!(
+        value["error"]
+            .as_str()
+            .unwrap()
+            .contains("status execution")
+    );
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .starts_with("error: ")
+    );
+}
+
+#[test]
+fn binary_usage_errors_map_to_two_and_emit_json_when_requested() {
+    let output = Command::new(env!("CARGO_BIN_EXE_code2graph"))
+        .args(["def", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["status"], "error");
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .starts_with("error: ")
+    );
+}
