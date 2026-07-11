@@ -8,7 +8,64 @@ use code2graph::{
     SymbolId, SymbolIdWire, SymbolKind, TypeRefContext, Visibility,
     validate_file_facts_with_context,
 };
-use zerompk::{FromMessagePack, Read, ToMessagePack, Write};
+use zerompk::{Error as MessagePackError, FromMessagePack, Read, ToMessagePack, Write};
+
+fn read_string_capped<'a, R: Read<'a>>(reader: &mut R) -> zerompk::Result<String> {
+    let value = reader.read_string()?;
+    if value.len() > MAX_STRING_BYTES {
+        return Err(MessagePackError::ArrayLengthMismatch {
+            expected: MAX_STRING_BYTES,
+            actual: value.len(),
+        });
+    }
+    Ok(value.into_owned())
+}
+
+macro_rules! impl_numeric_map_codec {
+    ($type:ty { required { $($required_key:literal => $required_field:ident : $required_type:ty),* $(,)? } optional { $($optional_key:literal => $optional_field:ident : $optional_type:ty),* $(,)? } }) => {
+        impl ToMessagePack for $type {
+            fn write<W: Write>(&self, writer: &mut W) -> zerompk::Result<()> {
+                writer.write_map_len(0 $(+ { let _ = &$required_key; 1 })* $(+ { let _ = &$optional_key; 1 })*)?;
+                $(writer.write_u8($required_key)?; <$required_type as ToMessagePack>::write(&self.$required_field, writer)?;)*
+                $(writer.write_u8($optional_key)?; <$optional_type as ToMessagePack>::write(&self.$optional_field, writer)?;)*
+                Ok(())
+            }
+        }
+
+        impl<'a> FromMessagePack<'a> for $type {
+            fn read<R: Read<'a>>(reader: &mut R) -> zerompk::Result<Self> {
+                reader.increment_depth()?;
+                let result = (|| {
+                    let len = reader.read_map_len()?;
+                    if len > MAX_COLLECTION_ITEMS {
+                        return Err(MessagePackError::MapLengthMismatch { expected: MAX_COLLECTION_ITEMS, actual: len });
+                    }
+                    $(let mut $required_field: Option<$required_type> = None;)*
+                    $(let mut $optional_field: Option<$optional_type> = None;)*
+                    for _ in 0..len {
+                        match reader.read_u64()? {
+                            $($required_key => {
+                                if $required_field.is_some() { return Err(MessagePackError::KeyDuplicated(stringify!($required_field).into())); }
+                                $required_field = Some(<$required_type as FromMessagePack<'a>>::read(reader)?);
+                            })*
+                            $($optional_key => {
+                                if $optional_field.is_some() { return Err(MessagePackError::KeyDuplicated(stringify!($optional_field).into())); }
+                                $optional_field = Some(<$optional_type as FromMessagePack<'a>>::read(reader)?);
+                            })*
+                            _ => reader.skip_value()?,
+                        }
+                    }
+                    Ok(Self {
+                        $($required_field: $required_field.ok_or_else(|| MessagePackError::KeyNotFound(stringify!($required_field).into()))?,)*
+                        $($optional_field: $optional_field.unwrap_or_default(),)*
+                    })
+                })();
+                reader.decrement_depth();
+                result
+            }
+        }
+    };
+}
 
 use crate::{InventoryFile, ProjectPath};
 
@@ -18,6 +75,7 @@ pub const RESPONSE_FRAME_MAX: usize = 64 * 1024 * 1024;
 pub const MAX_DEPTH: usize = 64;
 pub const MAX_STRING_BYTES: usize = 1024 * 1024;
 pub const MAX_COLLECTION_ITEMS: usize = 1_000_000;
+pub const MAX_ERROR_MESSAGE_BYTES: usize = 64 * 1024;
 
 pub type RequestId = u64;
 
@@ -35,12 +93,14 @@ pub enum WorkerProtocolError {
     Decode(zerompk::Error),
     #[error("worker MessagePack encode failed: {0}")]
     Encode(zerompk::Error),
+    #[error("worker frame I/O failed: {0}")]
+    Io(#[from] std::io::Error),
     #[error("worker facts are invalid: {0}")]
     Facts(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-/// Fixed field order: version, kind, request ID, path, language, source.
+/// Stable numeric keys: version, kind, request ID, path, language, source.
 pub struct WorkerRequest {
     pub version: u16,
     pub kind: u8,
@@ -50,34 +110,8 @@ pub struct WorkerRequest {
     pub source: Vec<u8>,
 }
 
-impl ToMessagePack for WorkerRequest {
-    fn write<W: Write>(&self, writer: &mut W) -> zerompk::Result<()> {
-        writer.write_array_len(6)?;
-        self.version.write(writer)?;
-        self.kind.write(writer)?;
-        self.request_id.write(writer)?;
-        self.path.write(writer)?;
-        self.language.write(writer)?;
-        writer.write_binary(&self.source)
-    }
-}
-
-impl<'a> FromMessagePack<'a> for WorkerRequest {
-    fn read<R: Read<'a>>(reader: &mut R) -> zerompk::Result<Self> {
-        reader.check_array_len(6)?;
-        Ok(Self {
-            version: u16::read(reader)?,
-            kind: u8::read(reader)?,
-            request_id: u64::read(reader)?,
-            path: String::read(reader)?,
-            language: u16::read(reader)?,
-            source: reader.read_binary()?.into_owned(),
-        })
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, ToMessagePack, FromMessagePack)]
-/// Fixed field order: version, kind, request ID, facts, error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// Stable numeric keys: version, kind, request ID, facts, error.
 pub struct WorkerResponse {
     pub version: u16,
     pub kind: u8,
@@ -86,13 +120,42 @@ pub struct WorkerResponse {
     pub error: Option<WorkerErrorWire>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, ToMessagePack, FromMessagePack)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u16)]
+pub enum WorkerErrorCode {
+    Extraction = 1,
+    InvalidRequest = 2,
+    Internal = 3,
+}
+
+impl WorkerErrorCode {
+    fn from_wire(value: u16) -> Result<Self, WorkerProtocolError> {
+        match value {
+            1 => Ok(Self::Extraction),
+            2 => Ok(Self::InvalidRequest),
+            3 => Ok(Self::Internal),
+            _ => Err(WorkerProtocolError::Facts(
+                "unknown worker error code".into(),
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerErrorWire {
     pub code: u16,
     pub message: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, ToMessagePack, FromMessagePack)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerRemoteError {
+    pub code: WorkerErrorCode,
+    pub message: String,
+}
+
+pub type WorkerResponseResult = Result<FileFacts, WorkerRemoteError>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileFactsWire {
     pub file: String,
     pub lang: String,
@@ -102,14 +165,14 @@ pub struct FileFactsWire {
     pub bindings: Vec<BindingWire>,
     pub ffi_exports: Vec<FfiExportWire>,
 }
-#[derive(Debug, Clone, PartialEq, Eq, ToMessagePack, FromMessagePack)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SymbolIdWireDto {
     pub version: u32,
     pub scip: String,
     pub lang: Option<String>,
     pub file: Option<String>,
 }
-#[derive(Debug, Clone, PartialEq, Eq, ToMessagePack, FromMessagePack)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SymbolWire {
     pub id: SymbolIdWireDto,
     pub name: String,
@@ -122,19 +185,19 @@ pub struct SymbolWire {
     pub span_end: u64,
     pub signature: String,
 }
-#[derive(Debug, Clone, PartialEq, Eq, ToMessagePack, FromMessagePack)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EntryPointWire {
     pub tag: u8,
     pub value: Option<String>,
 }
-#[derive(Debug, Clone, PartialEq, Eq, ToMessagePack, FromMessagePack)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OccurrenceWire {
     pub file: String,
     pub line: u32,
     pub col: u32,
     pub byte: u64,
 }
-#[derive(Debug, Clone, PartialEq, Eq, ToMessagePack, FromMessagePack)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReferenceWire {
     pub name: String,
     pub occ: OccurrenceWire,
@@ -145,14 +208,14 @@ pub struct ReferenceWire {
     pub scope: Option<u64>,
     pub type_ref_ctx: Option<u8>,
 }
-#[derive(Debug, Clone, PartialEq, Eq, ToMessagePack, FromMessagePack)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScopeWire {
     pub parent: Option<u64>,
     pub start: u64,
     pub end: u64,
     pub kind: u8,
 }
-#[derive(Debug, Clone, PartialEq, Eq, ToMessagePack, FromMessagePack)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BindingWire {
     pub scope: u64,
     pub name: String,
@@ -162,12 +225,182 @@ pub struct BindingWire {
     pub target_value: Option<String>,
     pub target_id: Option<SymbolIdWireDto>,
 }
-#[derive(Debug, Clone, PartialEq, Eq, ToMessagePack, FromMessagePack)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FfiExportWire {
     pub symbol: SymbolIdWireDto,
     pub abi: u8,
     pub export_name: String,
 }
+
+impl ToMessagePack for WorkerRequest {
+    fn write<W: Write>(&self, writer: &mut W) -> zerompk::Result<()> {
+        writer.write_map_len(6)?;
+        writer.write_u8(0)?;
+        self.version.write(writer)?;
+        writer.write_u8(1)?;
+        self.kind.write(writer)?;
+        writer.write_u8(2)?;
+        self.request_id.write(writer)?;
+        writer.write_u8(3)?;
+        self.path.write(writer)?;
+        writer.write_u8(4)?;
+        self.language.write(writer)?;
+        writer.write_u8(5)?;
+        writer.write_binary(&self.source)?;
+        Ok(())
+    }
+}
+
+impl<'a> FromMessagePack<'a> for WorkerRequest {
+    fn read<R: Read<'a>>(reader: &mut R) -> zerompk::Result<Self> {
+        reader.increment_depth()?;
+        let result = (|| {
+            let len = reader.read_map_len()?;
+            if len > MAX_COLLECTION_ITEMS {
+                return Err(MessagePackError::MapLengthMismatch {
+                    expected: MAX_COLLECTION_ITEMS,
+                    actual: len,
+                });
+            }
+            let mut version = None;
+            let mut kind = None;
+            let mut request_id = None;
+            let mut path = None;
+            let mut language = None;
+            let mut source = None;
+            for _ in 0..len {
+                match reader.read_u64()? {
+                    0 if version.is_none() => version = Some(reader.read_u16()?),
+                    1 if kind.is_none() => kind = Some(reader.read_u8()?),
+                    2 if request_id.is_none() => request_id = Some(reader.read_u64()?),
+                    3 if path.is_none() => path = Some(read_string_capped(reader)?),
+                    4 if language.is_none() => language = Some(reader.read_u16()?),
+                    5 if source.is_none() => source = Some(reader.read_binary()?.into_owned()),
+                    0 => return Err(MessagePackError::KeyDuplicated("version".into())),
+                    1 => return Err(MessagePackError::KeyDuplicated("kind".into())),
+                    2 => return Err(MessagePackError::KeyDuplicated("request_id".into())),
+                    3 => return Err(MessagePackError::KeyDuplicated("path".into())),
+                    4 => return Err(MessagePackError::KeyDuplicated("language".into())),
+                    5 => return Err(MessagePackError::KeyDuplicated("source".into())),
+                    _ => reader.skip_value()?,
+                }
+            }
+            let source = source.ok_or_else(|| MessagePackError::KeyNotFound("source".into()))?;
+            if source.len() > REQUEST_FRAME_MAX {
+                return Err(MessagePackError::ArrayLengthMismatch {
+                    expected: REQUEST_FRAME_MAX,
+                    actual: source.len(),
+                });
+            }
+            Ok(Self {
+                version: version.ok_or_else(|| MessagePackError::KeyNotFound("version".into()))?,
+                kind: kind.ok_or_else(|| MessagePackError::KeyNotFound("kind".into()))?,
+                request_id: request_id
+                    .ok_or_else(|| MessagePackError::KeyNotFound("request_id".into()))?,
+                path: path.ok_or_else(|| MessagePackError::KeyNotFound("path".into()))?,
+                language: language
+                    .ok_or_else(|| MessagePackError::KeyNotFound("language".into()))?,
+                source,
+            })
+        })();
+        reader.decrement_depth();
+        result
+    }
+}
+impl_numeric_map_codec!(WorkerResponse {
+    required { 0 => version: u16, 1 => kind: u8, 2 => request_id: RequestId }
+    optional { 3 => facts: Option<FileFactsWire>, 4 => error: Option<WorkerErrorWire> }
+});
+impl_numeric_map_codec!(WorkerErrorWire {
+    required { 0 => code: u16, 1 => message: String }
+    optional {}
+});
+impl_numeric_map_codec!(FileFactsWire {
+    required { 0 => file: String, 1 => lang: String, 2 => symbols: Vec<SymbolWire>, 3 => references: Vec<ReferenceWire>, 4 => scopes: Vec<ScopeWire>, 5 => bindings: Vec<BindingWire>, 6 => ffi_exports: Vec<FfiExportWire> }
+    optional {}
+});
+impl_numeric_map_codec!(SymbolIdWireDto {
+    required { 0 => version: u32, 1 => scip: String }
+    optional { 2 => lang: Option<String>, 3 => file: Option<String> }
+});
+impl_numeric_map_codec!(SymbolWire {
+    required { 0 => id: SymbolIdWireDto, 1 => name: String, 2 => kind: u8, 3 => visibility: u8, 4 => entry_points: Vec<EntryPointWire>, 5 => file: String, 6 => line: u32, 7 => span_start: u64, 8 => span_end: u64, 9 => signature: String }
+    optional {}
+});
+impl_numeric_map_codec!(EntryPointWire {
+    required { 0 => tag: u8 }
+    optional { 1 => value: Option<String> }
+});
+impl_numeric_map_codec!(OccurrenceWire {
+    required { 0 => file: String, 1 => line: u32, 2 => col: u32, 3 => byte: u64 }
+    optional {}
+});
+impl_numeric_map_codec!(ReferenceWire {
+    required { 0 => name: String, 1 => occ: OccurrenceWire, 2 => role: u8 }
+    optional { 3 => source_module: Option<String>, 4 => from_path: Option<String>, 5 => qualifier: Option<String>, 6 => scope: Option<u64>, 7 => type_ref_ctx: Option<u8> }
+});
+impl ToMessagePack for ScopeWire {
+    fn write<W: Write>(&self, writer: &mut W) -> zerompk::Result<()> {
+        writer.write_map_len(4)?;
+        writer.write_u8(0)?;
+        self.parent.write(writer)?;
+        writer.write_u8(1)?;
+        self.start.write(writer)?;
+        writer.write_u8(2)?;
+        self.end.write(writer)?;
+        writer.write_u8(3)?;
+        self.kind.write(writer)?;
+        Ok(())
+    }
+}
+
+impl<'a> FromMessagePack<'a> for ScopeWire {
+    fn read<R: Read<'a>>(reader: &mut R) -> zerompk::Result<Self> {
+        reader.increment_depth()?;
+        let result = (|| {
+            let len = reader.read_map_len()?;
+            if len > MAX_COLLECTION_ITEMS {
+                return Err(MessagePackError::MapLengthMismatch {
+                    expected: MAX_COLLECTION_ITEMS,
+                    actual: len,
+                });
+            }
+            let mut parent = None;
+            let mut start = None;
+            let mut end = None;
+            let mut kind = None;
+            for _ in 0..len {
+                match reader.read_u64()? {
+                    0 if parent.is_none() => parent = Some(Option::<u64>::read(reader)?),
+                    1 if start.is_none() => start = Some(reader.read_u64()?),
+                    2 if end.is_none() => end = Some(reader.read_u64()?),
+                    3 if kind.is_none() => kind = Some(reader.read_u8()?),
+                    0 => return Err(MessagePackError::KeyDuplicated("parent".into())),
+                    1 => return Err(MessagePackError::KeyDuplicated("start".into())),
+                    2 => return Err(MessagePackError::KeyDuplicated("end".into())),
+                    3 => return Err(MessagePackError::KeyDuplicated("kind".into())),
+                    _ => reader.skip_value()?,
+                }
+            }
+            Ok(Self {
+                parent: parent.unwrap_or_default(),
+                start: start.ok_or_else(|| MessagePackError::KeyNotFound("start".into()))?,
+                end: end.ok_or_else(|| MessagePackError::KeyNotFound("end".into()))?,
+                kind: kind.ok_or_else(|| MessagePackError::KeyNotFound("kind".into()))?,
+            })
+        })();
+        reader.decrement_depth();
+        result
+    }
+}
+impl_numeric_map_codec!(BindingWire {
+    required { 0 => scope: u64, 1 => name: String, 2 => intro: u64, 3 => kind: u8, 4 => target_tag: u8 }
+    optional { 5 => target_value: Option<String>, 6 => target_id: Option<SymbolIdWireDto> }
+});
+impl_numeric_map_codec!(FfiExportWire {
+    required { 0 => symbol: SymbolIdWireDto, 1 => abi: u8, 2 => export_name: String }
+    optional {}
+});
 
 impl WorkerRequest {
     /// Build and validate a request from an admitted inventory file.
@@ -257,11 +490,11 @@ fn validate_inventory_file(file: &InventoryFile) -> Result<(), WorkerProtocolErr
     Ok(())
 }
 
-/// Validate a response's identity and facts against the request that produced it.
-pub fn validate_response_facts(
+/// Validate response identity and its exactly-one-of facts/error payload.
+pub fn validate_response(
     response: &WorkerResponse,
     request: &WorkerRequest,
-) -> Result<FileFacts, WorkerProtocolError> {
+) -> Result<WorkerResponseResult, WorkerProtocolError> {
     let language = validate_request(request)?;
     if response.version != PROTOCOL_VERSION {
         return Err(WorkerProtocolError::Version(response.version));
@@ -274,26 +507,48 @@ pub fn validate_response_facts(
             "response request ID mismatch",
         ));
     }
-    if response.error.is_some() {
-        return Err(WorkerProtocolError::Malformed(
-            "response carries an error instead of success facts",
-        ));
+    match (&response.facts, &response.error) {
+        (Some(facts), None) => {
+            let facts: FileFacts = facts.clone().try_into()?;
+            validate_file_facts_with_context(
+                &facts,
+                FileFactsValidationContext {
+                    expected_file: &request.path,
+                    expected_language: language,
+                    source_len: request.source.len(),
+                },
+            )
+            .map_err(|error| WorkerProtocolError::Facts(error.to_string()))?;
+            Ok(Ok(facts))
+        }
+        (None, Some(error)) => {
+            if error.message.len() > MAX_ERROR_MESSAGE_BYTES {
+                return Err(WorkerProtocolError::Facts(
+                    "worker error message exceeds limit".into(),
+                ));
+            }
+            Ok(Err(WorkerRemoteError {
+                code: WorkerErrorCode::from_wire(error.code)?,
+                message: error.message.clone(),
+            }))
+        }
+        (Some(_), Some(_)) => Err(WorkerProtocolError::Malformed(
+            "response carries both facts and error",
+        )),
+        (None, None) => Err(WorkerProtocolError::Malformed(
+            "response carries neither facts nor error",
+        )),
     }
-    let facts = response
-        .facts
-        .clone()
-        .ok_or(WorkerProtocolError::Malformed("missing success facts"))?
-        .try_into()?;
-    validate_file_facts_with_context(
-        &facts,
-        FileFactsValidationContext {
-            expected_file: &request.path,
-            expected_language: language,
-            source_len: request.source.len(),
-        },
-    )
-    .map_err(|error| WorkerProtocolError::Facts(error.to_string()))?;
-    Ok(facts)
+}
+
+/// Validate and require a successful response.
+pub fn validate_response_facts(
+    response: &WorkerResponse,
+    request: &WorkerRequest,
+) -> Result<FileFacts, WorkerProtocolError> {
+    validate_response(response, request)?.map_err(|_| {
+        WorkerProtocolError::Malformed("response carries an error instead of success facts")
+    })
 }
 
 /// Append-only language tags; never use a Rust enum ordinal on the wire.
@@ -910,6 +1165,28 @@ mod tests {
     }
 
     #[test]
+    fn manual_codecs_round_trip_nested_records_and_default_optional_fields() {
+        let wire = FileFactsWire::from(&facts());
+        let encoded = zerompk::to_msgpack_vec(&wire).unwrap();
+        assert_eq!(
+            zerompk::from_msgpack::<FileFactsWire>(&encoded).unwrap(),
+            wire
+        );
+
+        let response_without_optional_payloads = [0x83, 0x00, 0x01, 0x01, 0x02, 0x02, 0x07];
+        assert_eq!(
+            zerompk::from_msgpack::<WorkerResponse>(&response_without_optional_payloads).unwrap(),
+            WorkerResponse {
+                version: 1,
+                kind: 2,
+                request_id: 7,
+                facts: None,
+                error: None
+            }
+        );
+    }
+
+    #[test]
     fn response_validation_binds_facts_to_request_context() {
         let request = request();
         let response = WorkerResponse {
@@ -989,9 +1266,119 @@ mod tests {
         assert_eq!(
             zerompk::to_msgpack_vec(&request).unwrap(),
             [
-                0x96, 0x01, 0x01, 0x07, 0xa4, b'a', b'.', b'r', b's', 0x00, 0xc4, 0x01, 0xff,
+                0x86, 0x00, 0x01, 0x01, 0x01, 0x02, 0x07, 0x03, 0xa4, b'a', b'.', b'r', b's', 0x04,
+                0x00, 0x05, 0xc4, 0x01, 0xff,
             ]
         );
+    }
+
+    #[test]
+    fn every_codec_emits_its_complete_map_in_ascending_numeric_key_order() {
+        let response = WorkerResponse {
+            version: 1,
+            kind: 2,
+            request_id: 7,
+            facts: None,
+            error: None,
+        };
+        assert_eq!(
+            zerompk::to_msgpack_vec(&response).unwrap(),
+            [0x85, 0, 1, 1, 2, 2, 7, 3, 0xc0, 4, 0xc0]
+        );
+        assert_eq!(
+            zerompk::to_msgpack_vec(&ScopeWire {
+                parent: None,
+                start: 1,
+                end: 2,
+                kind: 3,
+            })
+            .unwrap(),
+            [0x84, 0, 0xc0, 1, 1, 2, 2, 3, 3]
+        );
+
+        let wire = FileFactsWire::from(&facts());
+        let encoded = zerompk::to_msgpack_vec(&wire).unwrap();
+        assert_eq!(encoded[0], 0x87);
+        assert_eq!(
+            zerompk::from_msgpack::<FileFactsWire>(&encoded).unwrap(),
+            wire
+        );
+    }
+
+    #[test]
+    fn numeric_map_decode_is_order_independent_and_strict_about_required_keys() {
+        let reordered = [
+            0x86, 0x05, 0xc4, 0x01, 0xff, 0x04, 0x00, 0x03, 0xa4, b'a', b'.', b'r', b's', 0x02,
+            0x07, 0x01, 0x01, 0x00, 0x01,
+        ];
+        assert_eq!(
+            zerompk::from_msgpack::<WorkerRequest>(&reordered)
+                .unwrap()
+                .request_id,
+            7
+        );
+        let with_unknown = [
+            0x87, 0x00, 0x01, 0x01, 0x01, 0x02, 0x07, 0x03, 0xa4, b'a', b'.', b'r', b's', 0x04,
+            0x00, 0x05, 0xc4, 0x01, 0xff, 0x63, 0xc0,
+        ];
+        assert!(zerompk::from_msgpack::<WorkerRequest>(&with_unknown).is_ok());
+        let missing = [0x81, 0x00, 0x01];
+        assert!(zerompk::from_msgpack::<WorkerRequest>(&missing).is_err());
+        let duplicate = [
+            0x87, 0x00, 0x01, 0x00, 0x01, 0x01, 0x01, 0x02, 0x07, 0x03, 0xa4, b'a', b'.', b'r',
+            b's', 0x04, 0x00, 0x05, 0xc4, 0x01, 0xff,
+        ];
+        assert!(zerompk::from_msgpack::<WorkerRequest>(&duplicate).is_err());
+
+        // Future unsigned keys are not restricted to the current u8 key range,
+        // and their values may have any bounded MessagePack shape.
+        let future_key_and_nested_value = [
+            0x87, 0x00, 0x01, 0x01, 0x01, 0x02, 0x07, 0x03, 0xa4, b'a', b'.', b'r', b's', 0x04,
+            0x00, 0x05, 0xc4, 0x01, 0xff, 0xcd, 0x01, 0x2c, 0x92, 0x81, 0xa1, b'x', 0xd4, 0x01,
+            0xff, 0xc0,
+        ];
+        assert!(zerompk::from_msgpack::<WorkerRequest>(&future_key_and_nested_value).is_ok());
+
+        let duplicate_optional_nil = [0x86, 0, 1, 1, 2, 2, 7, 3, 0xc0, 3, 0xc0, 4, 0xc0];
+        assert!(zerompk::from_msgpack::<WorkerResponse>(&duplicate_optional_nil).is_err());
+        assert!(zerompk::from_msgpack::<WorkerErrorWire>(&[0x81, 0, 1]).is_err());
+        assert!(zerompk::from_msgpack::<ScopeWire>(&[0x83, 0, 0xc0, 2, 2, 3, 3]).is_err());
+    }
+
+    #[test]
+    fn response_validation_enforces_xor_error_code_and_message_cap() {
+        let request = request();
+        let success = WorkerResponse {
+            version: PROTOCOL_VERSION,
+            kind: 2,
+            request_id: request.request_id,
+            facts: Some(FileFactsWire::from(&facts())),
+            error: None,
+        };
+        assert!(matches!(validate_response(&success, &request), Ok(Ok(_))));
+
+        let mut response = success.clone();
+        response.facts = None;
+        response.error = Some(WorkerErrorWire {
+            code: WorkerErrorCode::Extraction as u16,
+            message: "failed".into(),
+        });
+        assert!(matches!(validate_response(&response, &request), Ok(Err(_))));
+        response.error.as_mut().unwrap().code = u16::MAX;
+        assert!(validate_response(&response, &request).is_err());
+        response.error.as_mut().unwrap().code = WorkerErrorCode::Internal as u16;
+        response.error.as_mut().unwrap().message = "x".repeat(MAX_ERROR_MESSAGE_BYTES + 1);
+        assert!(validate_response(&response, &request).is_err());
+
+        let mut both = success.clone();
+        both.error = Some(WorkerErrorWire {
+            code: 1,
+            message: String::new(),
+        });
+        assert!(validate_response(&both, &request).is_err());
+        let mut neither = success;
+        neither.facts = None;
+        assert!(validate_response(&neither, &request).is_err());
     }
 
     #[test]

@@ -6,6 +6,8 @@ use super::protocol::{
     MAX_DEPTH, REQUEST_FRAME_MAX, RESPONSE_FRAME_MAX, WorkerProtocolError, WorkerRequest,
     WorkerResponse,
 };
+use std::io::{Read as IoRead, Write as IoWrite};
+
 use zerompk::{FromMessagePack, ToMessagePack};
 
 pub fn encode_frame<T: ToMessagePack>(
@@ -27,6 +29,70 @@ pub fn encode_frame<T: ToMessagePack>(
     Ok(frame)
 }
 
+/// Read one bounded length-prefixed frame. Clean EOF before a prefix is `None`.
+pub fn read_frame<R: IoRead>(
+    reader: &mut R,
+    max: usize,
+) -> Result<Option<Vec<u8>>, WorkerProtocolError> {
+    let mut prefix = [0_u8; 4];
+    match reader.read_exact(&mut prefix[..1]) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(error) => return Err(WorkerProtocolError::Io(error)),
+    }
+    reader
+        .read_exact(&mut prefix[1..])
+        .map_err(|error| match error.kind() {
+            std::io::ErrorKind::UnexpectedEof => {
+                WorkerProtocolError::Malformed("truncated length prefix")
+            }
+            _ => WorkerProtocolError::Io(error),
+        })?;
+    let length = u32::from_be_bytes(prefix) as usize;
+    if length == 0 {
+        return Err(WorkerProtocolError::Malformed("empty payload"));
+    }
+    if length > max {
+        return Err(WorkerProtocolError::FrameTooLarge);
+    }
+    let capacity = length
+        .checked_add(4)
+        .ok_or(WorkerProtocolError::FrameTooLarge)?;
+    let mut frame = Vec::with_capacity(capacity);
+    frame.extend_from_slice(&prefix);
+    frame.resize(capacity, 0);
+    reader
+        .read_exact(&mut frame[4..])
+        .map_err(|error| match error.kind() {
+            std::io::ErrorKind::UnexpectedEof => WorkerProtocolError::Malformed("truncated frame"),
+            _ => WorkerProtocolError::Io(error),
+        })?;
+    Ok(Some(frame))
+}
+
+/// Write one bounded length-prefixed frame.
+pub fn write_frame<W: IoWrite, T: ToMessagePack>(
+    writer: &mut W,
+    value: &T,
+    max: usize,
+) -> Result<(), WorkerProtocolError> {
+    writer.write_all(&encode_frame(value, max)?)?;
+    writer.flush()?;
+    Ok(())
+}
+
+/// Require EOF after one frame, rejecting trailing bytes or a second frame.
+pub fn reject_trailing_bytes<R: IoRead>(reader: &mut R) -> Result<(), WorkerProtocolError> {
+    let mut byte = [0_u8; 1];
+    if reader.read(&mut byte)? == 0 {
+        Ok(())
+    } else {
+        Err(WorkerProtocolError::Malformed(
+            "trailing bytes or second frame",
+        ))
+    }
+}
+
 pub fn decode_request_frame(frame: &[u8]) -> Result<WorkerRequest, WorkerProtocolError> {
     decode_frame(frame, REQUEST_FRAME_MAX)
 }
@@ -41,7 +107,10 @@ fn decode_frame<T: for<'a> FromMessagePack<'a>>(
     if frame.len() < 4 {
         return Err(WorkerProtocolError::Malformed("missing length prefix"));
     }
-    let length = u32::from_be_bytes(frame[..4].try_into().expect("fixed length")) as usize;
+    let prefix: [u8; 4] = frame[..4]
+        .try_into()
+        .map_err(|_| WorkerProtocolError::Malformed("missing length prefix"))?;
+    let length = u32::from_be_bytes(prefix) as usize;
     if length == 0 {
         return Err(WorkerProtocolError::Malformed("empty payload"));
     }
@@ -106,6 +175,24 @@ fn scan_many(
     }
     Ok(())
 }
+
+fn scan_map(
+    bytes: &[u8],
+    p: &mut usize,
+    pairs: usize,
+    depth: usize,
+) -> Result<(), WorkerProtocolError> {
+    if pairs > super::protocol::MAX_COLLECTION_ITEMS {
+        return Err(WorkerProtocolError::Malformed("collection exceeds limit"));
+    }
+    let values = pairs
+        .checked_mul(2)
+        .ok_or(WorkerProtocolError::Malformed("length overflow"))?;
+    for _ in 0..values {
+        scan_value(bytes, p, depth)?;
+    }
+    Ok(())
+}
 fn string(bytes: &[u8], p: &mut usize, n: usize) -> Result<(), WorkerProtocolError> {
     if n > super::protocol::MAX_STRING_BYTES {
         return Err(WorkerProtocolError::Malformed("string value exceeds limit"));
@@ -145,7 +232,7 @@ fn scan_value(bytes: &[u8], p: &mut usize, depth: usize) -> Result<(), WorkerPro
     *p += 1;
     match marker {
         0x00..=0x7f | 0xe0..=0xff | 0xc0 | 0xc2 | 0xc3 => Ok(()),
-        0x80..=0x8f => scan_many(bytes, p, 2 * (marker & 15) as usize, depth + 1),
+        0x80..=0x8f => scan_map(bytes, p, (marker & 15) as usize, depth + 1),
         0x90..=0x9f => scan_many(bytes, p, (marker & 15) as usize, depth + 1),
         0xa0..=0xbf => string(bytes, p, (marker & 31) as usize),
         0xc4 => {
@@ -209,23 +296,11 @@ fn scan_value(bytes: &[u8], p: &mut usize, depth: usize) -> Result<(), WorkerPro
         }
         0xde => {
             let n = count(bytes, p, 2)?;
-            scan_many(
-                bytes,
-                p,
-                n.checked_mul(2)
-                    .ok_or(WorkerProtocolError::Malformed("length overflow"))?,
-                depth + 1,
-            )
+            scan_map(bytes, p, n, depth + 1)
         }
         0xdf => {
             let n = count(bytes, p, 4)?;
-            scan_many(
-                bytes,
-                p,
-                n.checked_mul(2)
-                    .ok_or(WorkerProtocolError::Malformed("length overflow"))?,
-                depth + 1,
-            )
+            scan_map(bytes, p, n, depth + 1)
         }
         0xc1 => Err(WorkerProtocolError::Malformed(
             "reserved MessagePack marker",
@@ -327,6 +402,119 @@ mod tests {
             encode_frame(&request, 1),
             Err(WorkerProtocolError::FrameTooLarge)
         ));
+    }
+
+    #[test]
+    fn streaming_frame_io_distinguishes_eof_truncation_oversize_and_trailing() {
+        let request = WorkerRequest {
+            version: super::super::protocol::PROTOCOL_VERSION,
+            kind: 1,
+            request_id: 9,
+            path: "src/a.rs".into(),
+            language: 0,
+            source: b"fn run() {}".to_vec(),
+        };
+        let mut output = Vec::new();
+        write_frame(&mut output, &request, REQUEST_FRAME_MAX).unwrap();
+        let mut input = std::io::Cursor::new(output.clone());
+        assert!(read_frame(&mut input, REQUEST_FRAME_MAX).unwrap().is_some());
+        assert!(reject_trailing_bytes(&mut input).is_ok());
+
+        assert!(
+            read_frame(
+                &mut std::io::Cursor::new(Vec::<u8>::new()),
+                REQUEST_FRAME_MAX
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(read_frame(&mut std::io::Cursor::new(vec![0, 0]), REQUEST_FRAME_MAX).is_err());
+        let mut truncated = output.clone();
+        truncated.pop();
+        assert!(read_frame(&mut std::io::Cursor::new(truncated), REQUEST_FRAME_MAX).is_err());
+        let oversized = u32::try_from(REQUEST_FRAME_MAX + 1).unwrap().to_be_bytes();
+        assert!(matches!(
+            read_frame(&mut std::io::Cursor::new(oversized), REQUEST_FRAME_MAX),
+            Err(WorkerProtocolError::FrameTooLarge)
+        ));
+        output.push(0);
+        let mut trailing = std::io::Cursor::new(output);
+        assert!(
+            read_frame(&mut trailing, REQUEST_FRAME_MAX)
+                .unwrap()
+                .is_some()
+        );
+        assert!(reject_trailing_bytes(&mut trailing).is_err());
+    }
+
+    #[test]
+    fn streaming_read_tolerates_interruption_and_short_reads() {
+        struct AdversarialReader {
+            bytes: Vec<u8>,
+            position: usize,
+            interrupt_once: bool,
+        }
+        impl std::io::Read for AdversarialReader {
+            fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+                if self.interrupt_once {
+                    self.interrupt_once = false;
+                    return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+                }
+                if self.position == self.bytes.len() {
+                    return Ok(0);
+                }
+                let amount = output.len().min(1);
+                output[..amount]
+                    .copy_from_slice(&self.bytes[self.position..self.position + amount]);
+                self.position += amount;
+                Ok(amount)
+            }
+        }
+
+        let frame = encode_frame(
+            &WorkerRequest {
+                version: super::super::protocol::PROTOCOL_VERSION,
+                kind: 1,
+                request_id: 9,
+                path: "src/a.rs".into(),
+                language: 0,
+                source: b"fn run() {}".to_vec(),
+            },
+            REQUEST_FRAME_MAX,
+        )
+        .unwrap();
+        let mut reader = AdversarialReader {
+            bytes: frame.clone(),
+            position: 0,
+            interrupt_once: true,
+        };
+        assert_eq!(
+            read_frame(&mut reader, REQUEST_FRAME_MAX).unwrap(),
+            Some(frame)
+        );
+        assert!(
+            read_frame(&mut reader, REQUEST_FRAME_MAX)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn adversarial_frames_return_errors_without_panicking() {
+        let corpus: &[&[u8]] = &[
+            &[],
+            &[0, 0, 0],
+            &[0, 0, 0, 1, 0xc1],
+            &[0, 0, 0, 2, 0x91, 0x91],
+            &[0, 0, 0, 5, 0xdb, 0xff, 0xff, 0xff, 0xff],
+            &[0, 0, 0, 5, 0xdf, 0xff, 0xff, 0xff, 0xff],
+            &[0, 0, 0, 6, 0xc9, 0xff, 0xff, 0xff, 0xff, 0],
+        ];
+        for frame in corpus {
+            let result = std::panic::catch_unwind(|| decode_request_frame(frame));
+            assert!(result.is_ok(), "decoder panicked for {frame:x?}");
+            assert!(result.unwrap().is_err(), "decoder accepted {frame:x?}");
+        }
     }
 
     #[test]
