@@ -11,6 +11,9 @@ use crate::{Cancellation, CliError, Deadline, LoadedGraph, Selector};
 
 mod definition;
 mod impact;
+mod imports;
+mod module_deps;
+mod references;
 mod relations;
 mod shared;
 mod symbols;
@@ -73,5 +76,10 @@ pub(crate) struct DefinitionCommandRequest<'a> {
 
 pub(crate) use definition::execute_definition;
 pub(crate) use impact::{ImpactCommandRequest, execute_impact};
-pub(crate) use relations::{RelationCommandRequest, RelationDirection, execute_relations};
+pub(crate) use imports::{ImportsCommandRequest, execute_imports};
+pub(crate) use module_deps::{ModuleDepsCommandRequest, execute_module_deps};
+pub(crate) use references::{ReferencesCommandRequest, execute_references};
+pub(crate) use relations::{
+    RelationCommandRequest, RelationDirection, execute_relations, relation_output,
+};
 pub(crate) use symbols::execute_symbols;

@@ -75,7 +75,7 @@ pub enum CommandRequest {
 }
 
 impl CommandRequest {
-    /// Stable command spelling for diagnostics and unavailable-operation errors.
+    /// Stable command spelling for diagnostics and host capability errors.
     pub const fn name(&self) -> &'static str {
         match self {
             Self::Index { .. } => "index",

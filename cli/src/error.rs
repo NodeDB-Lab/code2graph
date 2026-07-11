@@ -42,7 +42,7 @@ pub enum CliError {
     FrozenSnapshotMissing,
     #[error("worker failure: {0}")]
     Worker(WorkerFailure),
-    #[error("{command} execution is not implemented in this contract-only CLI shell")]
+    #[error("{command} is unavailable in this host")]
     Unavailable { command: String },
     #[error("fatal CLI failure: {0}")]
     Fatal(String),

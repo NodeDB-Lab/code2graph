@@ -177,36 +177,23 @@ fn lossless_ids_survive_selector_and_output_json() {
 }
 
 #[test]
-fn binary_keeps_unimplemented_commands_operational_failures() {
+fn binary_imports_missing_snapshot_file_is_a_no_match() {
+    let project = tempfile::tempdir().unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_code2graph"))
-        .args(["imports", "src/a.rs"])
+        .args([
+            "--root",
+            project.path().to_str().unwrap(),
+            "--no-cache",
+            "imports",
+            "src/a.rs",
+            "--json",
+        ])
         .output()
         .unwrap();
-    assert_eq!(output.status.code(), Some(4));
-    assert!(output.stdout.is_empty());
-    assert!(
-        String::from_utf8(output.stderr)
-            .unwrap()
-            .contains("imports execution is not implemented")
-    );
-}
-
-#[test]
-fn binary_json_failures_keep_stdout_machine_only_and_stderr_diagnostic() {
-    let output = Command::new(env!("CARGO_BIN_EXE_code2graph"))
-        .args(["imports", "src/a.rs", "--json"])
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(4));
+    assert_eq!(output.status.code(), Some(1));
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["schemaVersion"], 1);
-    assert_eq!(value["status"], "unsupported");
-    assert!(
-        value["error"]
-            .as_str()
-            .unwrap()
-            .contains("imports execution")
-    );
+    assert_eq!(value["status"], "no-match");
     assert!(
         String::from_utf8(output.stderr)
             .unwrap()
@@ -496,6 +483,125 @@ fn binary_relations_and_impact_cover_filters_limits_coordinates_and_no_match() {
     assert_eq!(missing.status.code(), Some(1));
     let missing: serde_json::Value = serde_json::from_slice(&missing.stdout).unwrap();
     assert_eq!(missing["status"], "no-match");
+}
+
+#[test]
+fn binary_imports_references_and_module_deps_cover_resolved_raw_and_aggregate_contracts() {
+    let project = tempfile::tempdir().unwrap();
+    std::fs::create_dir(project.path().join("src")).unwrap();
+    std::fs::write(
+        project.path().join("src/main.rs"),
+        concat!(
+            "mod dep;\n",
+            "use crate::dep::helper;\n",
+            "fn run() { dep::helper(); missing::call(); }\n",
+        ),
+    )
+    .unwrap();
+    std::fs::write(project.path().join("src/dep.rs"), "pub fn helper() {}\n").unwrap();
+
+    let run_json = |args: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_code2graph"))
+            .current_dir(project.path())
+            .args(args)
+            .args(["--no-cache", "--json"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stderr.is_empty());
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+
+    let imports = run_json(&["imports", "src//main.rs"]);
+    assert_eq!(imports["status"], "ok");
+    assert!(imports["total"].as_u64().unwrap() >= 1);
+    assert!(imports["results"].as_array().unwrap().iter().all(|row| {
+        matches!(row["role"].as_str(), Some("import" | "module-ref"))
+            && row["confidence"].is_string()
+            && row["occurrence"]["file"] == "src/main.rs"
+    }));
+
+    let references = run_json(&["references", "src//main.rs"]);
+    assert_eq!(references["status"], "ok");
+    assert!(references["results"].as_array().unwrap().iter().all(|row| {
+        row.get("confidence").is_none() && row["occurrence"]["file"] == "src/main.rs"
+    }));
+    let qualified = references["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == "call")
+        .unwrap();
+    assert_eq!(qualified["qualifier"], "missing");
+    assert_eq!(qualified["role"], "call");
+
+    let unresolved = run_json(&[
+        "references",
+        "src/main.rs",
+        "--name",
+        "call",
+        "--role",
+        "call",
+    ]);
+    assert_eq!(unresolved["total"], 1);
+    assert_eq!(unresolved["results"][0]["name"], "call");
+    assert!(unresolved["results"][0].get("confidence").is_none());
+
+    let dependencies = run_json(&["module-deps"]);
+    assert_eq!(dependencies["status"], "ok");
+    assert!(dependencies["total"].as_u64().unwrap() >= 1);
+    assert!(
+        dependencies["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| {
+                row["source_file"] == "src/main.rs"
+                    && row["count"] == row["evidence"].as_array().unwrap().len()
+                    && !row["evidence"].as_array().unwrap().is_empty()
+            })
+    );
+
+    let limited = run_json(&["module-deps", "--limit", "0"]);
+    assert_eq!(limited["returned"], 0);
+    assert_eq!(limited["truncated"], true);
+    assert!(limited["total"].as_u64().unwrap() >= 1);
+
+    for args in [
+        &["imports", "src/main.rs"][..],
+        &["references", "src/main.rs"][..],
+        &["module-deps"][..],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_code2graph"))
+            .current_dir(project.path())
+            .args(args)
+            .args(["--no-cache"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{args:?}");
+        assert!(!output.stdout.is_empty(), "{args:?}");
+        assert!(output.stderr.is_empty(), "{args:?}");
+    }
+
+    let no_match = Command::new(env!("CARGO_BIN_EXE_code2graph"))
+        .current_dir(project.path())
+        .args([
+            "references",
+            "src/main.rs",
+            "--name",
+            "absent",
+            "--no-cache",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(no_match.status.code(), Some(1));
+    let no_match: serde_json::Value = serde_json::from_slice(&no_match.stdout).unwrap();
+    assert_eq!(no_match["status"], "no-match");
 }
 
 #[test]

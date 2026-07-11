@@ -38,7 +38,10 @@ pub fn render_human(output: &CommandOutput) -> String {
         }
         CommandOutput::Callers(envelope)
         | CommandOutput::Callees(envelope)
-        | CommandOutput::Usages(envelope) => render_relations(envelope),
+        | CommandOutput::Usages(envelope)
+        | CommandOutput::Imports(envelope) => render_relations(envelope),
+        CommandOutput::References(envelope) => render_references(envelope),
+        CommandOutput::ModuleDeps(envelope) => render_module_deps(envelope),
         CommandOutput::Impact(envelope) => {
             let mut output = envelope
                 .results
@@ -72,6 +75,64 @@ fn render_relations(envelope: &crate::OutputEnvelope<Vec<crate::RelationOutput>>
         .results
         .iter()
         .map(|relation| format!("{}\n", relation_text(relation)))
+        .collect::<String>();
+    if envelope.truncated {
+        output.push_str(&format!(
+            "truncated: returned {} of {} results\n",
+            envelope.returned, envelope.total
+        ));
+    }
+    output
+}
+
+fn render_references(envelope: &crate::OutputEnvelope<Vec<crate::ReferenceOutput>>) -> String {
+    let mut output = envelope
+        .results
+        .iter()
+        .map(|reference| {
+            format!(
+                "{}:{}:{} {} {} qualifier={} from-path={}\n",
+                reference.occurrence.file,
+                reference.occurrence.line,
+                reference.occurrence.column.saturating_add(1),
+                reference.name,
+                role(reference.role),
+                reference.qualifier.as_deref().unwrap_or("-"),
+                reference.from_path.as_deref().unwrap_or("-"),
+            )
+        })
+        .collect::<String>();
+    if envelope.truncated {
+        output.push_str(&format!(
+            "truncated: returned {} of {} results\n",
+            envelope.returned, envelope.total
+        ));
+    }
+    output
+}
+
+fn render_module_deps(
+    envelope: &crate::OutputEnvelope<Vec<crate::ModuleDependencyOutput>>,
+) -> String {
+    let mut output = envelope
+        .results
+        .iter()
+        .map(|dependency| {
+            let target = match &dependency.target {
+                crate::ModuleDependencyTargetOutput::File { file } => file.clone(),
+                crate::ModuleDependencyTargetOutput::External { id_display, .. } => {
+                    id_display.clone()
+                }
+            };
+            format!(
+                "{} -> {} {} count={} evidence={}\n",
+                dependency.source_file,
+                target,
+                role(dependency.role),
+                dependency.count,
+                dependency.evidence.len()
+            )
+        })
         .collect::<String>();
     if envelope.truncated {
         output.push_str(&format!(

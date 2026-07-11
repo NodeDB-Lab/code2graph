@@ -7,9 +7,11 @@ use crate::cache::{
     ResolverCacheTier,
 };
 use crate::commands::{
-    DefinitionCommandRequest, ImpactCommandRequest, QueryCommandContext, RelationCommandRequest,
-    RelationDirection, SymbolsCommandRequest, execute_definition, execute_impact,
-    execute_relations, execute_symbols,
+    DefinitionCommandRequest, ImpactCommandRequest, ImportsCommandRequest,
+    ModuleDepsCommandRequest, QueryCommandContext, ReferencesCommandRequest,
+    RelationCommandRequest, RelationDirection, SymbolsCommandRequest, execute_definition,
+    execute_impact, execute_imports, execute_module_deps, execute_references, execute_relations,
+    execute_symbols,
 };
 use crate::refresh::{
     PrepareCandidateInputs, PreparedRefreshCandidate, prepare_and_publish,
@@ -36,6 +38,9 @@ pub enum CommandOutput {
     Callees(OutputEnvelope<Vec<crate::RelationOutput>>),
     Usages(OutputEnvelope<Vec<crate::RelationOutput>>),
     Impact(OutputEnvelope<Vec<crate::ImpactOutput>>),
+    Imports(OutputEnvelope<Vec<crate::RelationOutput>>),
+    References(OutputEnvelope<Vec<crate::ReferenceOutput>>),
+    ModuleDeps(OutputEnvelope<Vec<crate::ModuleDependencyOutput>>),
     LoadedGraph(LoadedGraph),
 }
 
@@ -183,6 +188,33 @@ pub fn execute(request: CliRequest, context: &ExecutionContext<'_>) -> Result<Co
             },
             CommandOutput::Usages,
         ),
+        CommandRequest::Imports { file } => execute_imports_query(
+            request,
+            context,
+            ImportsCommandRequest {
+                file: &file,
+                result_limit,
+                min_confidence,
+            },
+        ),
+        CommandRequest::References { file, name, role } => execute_references_query(
+            request,
+            context,
+            ReferencesCommandRequest {
+                file: &file,
+                name: name.as_deref(),
+                role,
+                result_limit,
+            },
+        ),
+        CommandRequest::ModuleDeps => execute_module_deps_query(
+            request,
+            context,
+            ModuleDepsCommandRequest {
+                result_limit,
+                min_confidence,
+            },
+        ),
         CommandRequest::Impact {
             selector,
             file,
@@ -204,10 +236,68 @@ pub fn execute(request: CliRequest, context: &ExecutionContext<'_>) -> Result<Co
                 min_confidence,
             },
         ),
-        command => Err(CliError::Unavailable {
-            command: command.name().to_owned(),
-        }),
     }
+}
+
+fn execute_imports_query(
+    request: CliRequest,
+    execution: &ExecutionContext<'_>,
+    command: ImportsCommandRequest<'_>,
+) -> Result<CommandOutput> {
+    let loaded = load_query_graph(&request, execution)?;
+    let deadline = Deadline::new(request.global.limits.timeout);
+    deadline.check(execution.cancellation)?;
+    let index = crate::build_graph_index(&loaded)?;
+    let context = QueryCommandContext::new(
+        &loaded,
+        &index,
+        &deadline,
+        execution.cancellation,
+        request.global.limits.max_file_bytes,
+    )?;
+    Ok(CommandOutput::Imports(execute_imports(&context, command)?))
+}
+
+fn execute_references_query(
+    request: CliRequest,
+    execution: &ExecutionContext<'_>,
+    command: ReferencesCommandRequest<'_>,
+) -> Result<CommandOutput> {
+    let loaded = load_query_graph(&request, execution)?;
+    let deadline = Deadline::new(request.global.limits.timeout);
+    deadline.check(execution.cancellation)?;
+    let index = crate::build_graph_index(&loaded)?;
+    let context = QueryCommandContext::new(
+        &loaded,
+        &index,
+        &deadline,
+        execution.cancellation,
+        request.global.limits.max_file_bytes,
+    )?;
+    Ok(CommandOutput::References(execute_references(
+        &context, command,
+    )?))
+}
+
+fn execute_module_deps_query(
+    request: CliRequest,
+    execution: &ExecutionContext<'_>,
+    command: ModuleDepsCommandRequest,
+) -> Result<CommandOutput> {
+    let loaded = load_query_graph(&request, execution)?;
+    let deadline = Deadline::new(request.global.limits.timeout);
+    deadline.check(execution.cancellation)?;
+    let index = crate::build_graph_index(&loaded)?;
+    let context = QueryCommandContext::new(
+        &loaded,
+        &index,
+        &deadline,
+        execution.cancellation,
+        request.global.limits.max_file_bytes,
+    )?;
+    Ok(CommandOutput::ModuleDeps(execute_module_deps(
+        &context, command,
+    )?))
 }
 
 fn execute_symbols_query(

@@ -2,15 +2,20 @@
 
 //! Shared owned-output conversion and query envelope construction.
 
+use std::path::Path;
+
 use code2graph::Symbol;
 
 use crate::result::{OutputEnvelope, SymbolOutput, success_status};
 use crate::{LoadedGraph, ProjectPath};
 
+pub(super) fn normalized_project_path(path: &str) -> String {
+    ProjectPath::new(Path::new(path)).map_or_else(|_| path.to_owned(), |path| path.to_string())
+}
+
 pub(super) fn symbol_output(symbol: &Symbol) -> SymbolOutput {
     let mut output = SymbolOutput::from(symbol);
-    output.file = ProjectPath::new(std::path::Path::new(&symbol.file))
-        .map_or_else(|_| symbol.file.clone(), |path| path.to_string());
+    output.file = normalized_project_path(&symbol.file);
     output
 }
 

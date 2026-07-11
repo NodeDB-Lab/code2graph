@@ -139,7 +139,7 @@ impl From<SymbolKind> for SymbolKindOutput {
 }
 
 /// Stable kebab-case spelling of [`RefRole`] in CLI output.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RefRoleOutput {
     Call,
