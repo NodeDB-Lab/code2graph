@@ -19,11 +19,11 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::error::{CodegraphError, Result};
-use crate::graph::types::{CodeGraph, FileFacts};
+use crate::graph::types::{CodeGraph, Edge, FileFacts, Symbol};
 use crate::validate_file_facts;
 
 use super::delta::FileChange;
-use super::state::PendingState;
+use super::state::{PendingRefId, PendingState};
 use super::stitch::GlobalIndex;
 use super::subgraph::{FILE_SUBGRAPH_SCHEMA_VERSION, FileSubgraph, build_subgraph};
 
@@ -39,6 +39,17 @@ enum PreparedChange {
     Remove {
         file: String,
     },
+}
+
+/// The bounded portion of graph state that a mutation can change.
+///
+/// This is deliberately crate-private: tracked snapshots turn it into the
+/// public delta contract without exposing store bookkeeping.
+pub(crate) struct MutationBounds {
+    pub(crate) before_symbols: Vec<Symbol>,
+    pub(crate) after_symbols: Vec<Symbol>,
+    pub(crate) before_edges: Vec<Edge>,
+    pub(crate) after_edges: Vec<Edge>,
 }
 
 /// Incremental Tier-B resolution store. Holds one isolated subgraph per file
@@ -151,7 +162,7 @@ impl IncrementalGraph {
     /// ownership. On error neither the file store nor global index changes.
     pub fn try_upsert_subgraph(&mut self, file: String, sub: FileSubgraph) -> Result<()> {
         let prepared = Self::prepare_restored_change(file, sub)?;
-        self.commit_prepared(std::iter::once(prepared));
+        self.commit_prepared_bounded(std::iter::once(prepared));
         Ok(())
     }
 
@@ -162,9 +173,18 @@ impl IncrementalGraph {
     /// tracked incremental layer. Duplicate targets (including an upsert and a
     /// remove for the same path) are rejected before any state changes.
     pub(crate) fn try_apply_changes(&mut self, changes: &[FileChange<'_>]) -> Result<()> {
+        self.try_apply_changes_bounded(changes).map(|_| ())
+    }
+
+    /// Apply a validated batch and retain only the state whose value can change.
+    /// The capture contains every changed file's symbols/intra-file edges and
+    /// every unchanged pending edge selected by the reverse pending index.
+    pub(crate) fn try_apply_changes_bounded(
+        &mut self,
+        changes: &[FileChange<'_>],
+    ) -> Result<MutationBounds> {
         let prepared = Self::prepare_changes(changes)?;
-        self.commit_prepared(prepared);
-        Ok(())
+        Ok(self.commit_prepared_bounded(prepared))
     }
 
     /// Drop the file `file` from the store, removing its definitions from the
@@ -258,9 +278,12 @@ impl IncrementalGraph {
         Ok(())
     }
 
-    fn commit_prepared(&mut self, changes: impl IntoIterator<Item = PreparedChange>) {
+    fn commit_prepared_bounded(
+        &mut self,
+        changes: impl IntoIterator<Item = PreparedChange>,
+    ) -> MutationBounds {
         let changes: Vec<_> = changes.into_iter().collect();
-        let targets: Vec<String> = changes
+        let targets: HashSet<String> = changes
             .iter()
             .map(|change| match change {
                 PreparedChange::Upsert { file, .. } | PreparedChange::Remove { file } => {
@@ -270,9 +293,7 @@ impl IncrementalGraph {
             .collect();
         let mut affected = HashSet::new();
 
-        // Select unchanged refs against BOTH sides of every definition change,
-        // before the old pending records are deleted. This makes a batch resolve
-        // only against its final index, never an intermediate file ordering.
+        // Select unchanged refs against BOTH sides before removing old records.
         for change in &changes {
             match change {
                 PreparedChange::Upsert { file, subgraph } => {
@@ -294,8 +315,10 @@ impl IncrementalGraph {
                 }
             }
         }
+        let before_symbols = self.bound_symbols(&targets);
+        let before_edges = self.bound_edges(&targets, &affected);
 
-        // First establish the complete final definition index and file set.
+        // Establish the complete final definition index and file set.
         for change in changes {
             match change {
                 PreparedChange::Upsert { file, subgraph } => {
@@ -313,15 +336,58 @@ impl IncrementalGraph {
             }
         }
 
-        // Replace installed refs only after the final index exists. New refs are
-        // always affected; deleted refs lose both lookup and resolved state.
-        for owner in targets {
-            self.pending_state.remove_owner(&owner);
-            if let Some(subgraph) = self.files.get(&owner) {
-                affected.extend(self.pending_state.install(&owner, &subgraph.pending));
+        // New refs are always selected. Include every target ref in the final
+        // capture, while unchanged files retain only reverse-index selections.
+        for owner in &targets {
+            self.pending_state.remove_owner(owner);
+            if let Some(subgraph) = self.files.get(owner) {
+                affected.extend(self.pending_state.install(owner, &subgraph.pending));
             }
         }
-        self.pending_state.resolve(affected, &self.index);
+        self.pending_state.resolve(affected.clone(), &self.index);
+        let after_symbols = self.bound_symbols(&targets);
+        let after_edges = self.bound_edges(&targets, &affected);
+        MutationBounds {
+            before_symbols,
+            after_symbols,
+            before_edges,
+            after_edges,
+        }
+    }
+
+    fn bound_symbols(&self, targets: &HashSet<String>) -> Vec<Symbol> {
+        targets
+            .iter()
+            .filter_map(|file| self.files.get(file))
+            .flat_map(|subgraph| subgraph.symbols.iter().cloned())
+            .collect()
+    }
+
+    fn bound_edges(
+        &self,
+        targets: &HashSet<String>,
+        affected: &HashSet<PendingRefId>,
+    ) -> Vec<Edge> {
+        let mut edges = Vec::new();
+        for owner in targets {
+            if let Some(subgraph) = self.files.get(owner) {
+                edges.extend(subgraph.intra_edges.iter().cloned());
+                for id in self.pending_state.owner_ids(owner) {
+                    if let Some(Some(edge)) = self.pending_state.resolved_id(id) {
+                        edges.push(edge.clone());
+                    }
+                }
+            }
+        }
+        for id in affected {
+            if targets.contains(id.owner()) {
+                continue;
+            }
+            if let Some(Some(edge)) = self.pending_state.resolved_id(id) {
+                edges.push(edge.clone());
+            }
+        }
+        edges
     }
 
     /// Return the full [`CodeGraph`] from stored resolved cross-file state.

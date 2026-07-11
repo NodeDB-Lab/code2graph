@@ -29,7 +29,7 @@ pub use external::ExternalResolver;
 pub use ffi_bridge::FfiBridgeResolver;
 pub use incremental::{
     FILE_SUBGRAPH_SCHEMA_VERSION, FileChange, FileSubgraph, IncrementalGraph, ScopeGraphDelta,
-    ScopeSnapshotToken,
+    ScopeSnapshotToken, TrackedIncrementalGraph,
 };
 pub use layered::LayeredResolver;
 pub use normalized_name::NormalizedNameResolver;

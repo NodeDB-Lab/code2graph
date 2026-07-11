@@ -24,6 +24,10 @@ impl PendingRefId {
             ordinal,
         }
     }
+
+    pub(crate) fn owner(&self) -> &str {
+        &self.owner_file
+    }
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -109,8 +113,19 @@ impl PendingState {
         } else {
             &[PendingDomain::Ordinary, PendingDomain::Qualified]
         };
+        // Use the same lookup key as GlobalIndex: module buckets are keyed by
+        // the symbol payload name, ordinary buckets by the structural ID leaf.
+        // FileFacts validation does not require those two strings to agree, so
+        // using `symbol.name` for ordinary definitions could miss a caller that
+        // the resolver itself can match.
+        let name = if symbol.kind == SymbolKind::Module {
+            symbol.name.as_str()
+        } else if let Some(name) = symbol.id.leaf_name() {
+            name
+        } else {
+            return affected;
+        };
         for domain in domains {
-            let name = &symbol.name;
             let Some(ids) = self
                 .by_domain_name
                 .get(domain)
@@ -144,8 +159,19 @@ impl PendingState {
         }
     }
 
+    pub(crate) fn owner_ids(&self, owner: &str) -> impl Iterator<Item = &PendingRefId> {
+        self.by_owner
+            .get(owner)
+            .into_iter()
+            .flat_map(|ids| ids.iter())
+    }
+
+    pub(crate) fn resolved_id(&self, id: &PendingRefId) -> Option<&Option<Edge>> {
+        self.resolved.get(id)
+    }
+
     pub(crate) fn resolved(&self, owner: &str, ordinal: usize) -> Option<&Option<Edge>> {
-        self.resolved.get(&PendingRefId::new(owner, ordinal))
+        self.resolved_id(&PendingRefId::new(owner, ordinal))
     }
 }
 
@@ -218,6 +244,31 @@ mod tests {
         for ordinal in call_ordinals {
             assert!(state.resolved(&consumer_sub.owner_file, ordinal).is_none());
         }
+    }
+
+    #[test]
+    fn ordinary_reverse_lookup_uses_the_same_structural_leaf_as_resolution() {
+        let consumer = RustExtractor
+            .extract("pub fn run() { provider::helper() }", "src/consumer.rs")
+            .expect("extract consumer");
+        let provider = RustExtractor
+            .extract("pub fn helper() {}", "src/provider.rs")
+            .expect("extract provider");
+        let consumer_sub = build_subgraph(&consumer);
+        let mut helper = provider
+            .symbols
+            .iter()
+            .find(|symbol| symbol.id.leaf_name() == Some("helper"))
+            .expect("helper symbol")
+            .clone();
+        helper.name = "payload-name-that-differs".into();
+
+        let mut state = PendingState::default();
+        state.install(&consumer_sub.owner_file, &consumer_sub.pending);
+        assert!(
+            !state.affected_by_symbol(&helper).is_empty(),
+            "reverse selection must use the GlobalIndex leaf-name key"
+        );
     }
 
     #[test]
