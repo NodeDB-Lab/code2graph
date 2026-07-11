@@ -15,13 +15,29 @@
 //! [`ScopeGraphResolver`]: super::super::ScopeGraphResolver
 //! [`graph`]: IncrementalGraph::graph
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::error::{CodegraphError, Result};
 use crate::graph::types::{CodeGraph, FileFacts};
+use crate::validate_file_facts;
 
+use super::delta::FileChange;
 use super::stitch::{GlobalIndex, stitch};
 use super::subgraph::{FILE_SUBGRAPH_SCHEMA_VERSION, FileSubgraph, build_subgraph};
+
+/// A fully validated, isolated file mutation ready to commit.
+///
+/// Constructing this value performs every fallible operation; committing it
+/// only updates the file store and its derived global index.
+enum PreparedChange {
+    Upsert {
+        file: String,
+        subgraph: FileSubgraph,
+    },
+    Remove {
+        file: String,
+    },
+}
 
 /// Incremental Tier-B resolution store. Holds one isolated subgraph per file
 /// plus a global definition index, so re-extracting a single changed file
@@ -87,7 +103,9 @@ impl IncrementalGraph {
     /// If a subgraph already existed for this key, its definitions are removed
     /// from the global index first, so the index reflects only the current set.
     pub fn upsert(&mut self, facts: &FileFacts) {
-        self.upsert_subgraph(facts.file.clone(), build_subgraph(facts));
+        // Legacy infallible API: extractor-produced facts are valid. Keep its
+        // historical no-op-on-invalid behavior while sharing the checked path.
+        let _ = self.try_apply_changes(&[FileChange::Upsert(facts)]);
     }
 
     /// Return the stored [`FileSubgraph`] for a file key, or `None` if the file
@@ -118,9 +136,8 @@ impl IncrementalGraph {
     /// file), its symbols are removed from the index first, exactly as `upsert`
     /// does, so the index never accumulates stale entries.
     ///
-    /// All of `upsert`'s index-bookkeeping lives here; `upsert` itself delegates
-    /// to this method (after calling `build_subgraph`) so the two paths can never
-    /// drift.
+    /// Restore and fact upserts share one prepared commit path, so their index
+    /// bookkeeping cannot drift.
     pub fn upsert_subgraph(&mut self, file: String, sub: FileSubgraph) {
         // Compatibility wrapper; callers needing malformed-cache diagnostics use
         // `try_upsert_subgraph`.
@@ -130,8 +147,70 @@ impl IncrementalGraph {
     /// Atomically restore a persisted subgraph after validating its schema and
     /// ownership. On error neither the file store nor global index changes.
     pub fn try_upsert_subgraph(&mut self, file: String, sub: FileSubgraph) -> Result<()> {
+        let prepared = Self::prepare_restored_change(file, sub)?;
+        self.commit_prepared(std::iter::once(prepared));
+        Ok(())
+    }
+
+    /// Apply a checked, atomic group of file-fact changes.
+    ///
+    /// This is intentionally crate-internal: [`FileChange`] is a transition
+    /// value contract, while this mutable store operation is reserved for the
+    /// tracked incremental layer. Duplicate targets (including an upsert and a
+    /// remove for the same path) are rejected before any state changes.
+    pub(crate) fn try_apply_changes(&mut self, changes: &[FileChange<'_>]) -> Result<()> {
+        let prepared = Self::prepare_changes(changes)?;
+        self.commit_prepared(prepared);
+        Ok(())
+    }
+
+    /// Drop the file `file` from the store, removing its definitions from the
+    /// global index. A no-op if the file is not present.
+    pub fn remove(&mut self, file: &str) {
+        let _ = self.try_apply_changes(&[FileChange::Remove(file)]);
+    }
+
+    fn prepare_changes(changes: &[FileChange<'_>]) -> Result<Vec<PreparedChange>> {
+        let mut targets = HashSet::with_capacity(changes.len());
+        for change in changes {
+            let file = match change {
+                FileChange::Upsert(facts) => facts.file.as_str(),
+                FileChange::Remove(file) => file,
+            };
+            if !targets.insert(file) {
+                return Err(CodegraphError::MalformedFacts {
+                    file: file.to_owned(),
+                    reason: "duplicate batch mutation target".into(),
+                });
+            }
+        }
+
+        let mut prepared = Vec::with_capacity(changes.len());
+        for change in changes {
+            match change {
+                FileChange::Upsert(facts) => {
+                    validate_file_facts(std::slice::from_ref(*facts))?;
+                    prepared.push(PreparedChange::Upsert {
+                        file: facts.file.clone(),
+                        subgraph: build_subgraph(facts),
+                    });
+                }
+                FileChange::Remove(file) => prepared.push(PreparedChange::Remove {
+                    file: (*file).to_owned(),
+                }),
+            }
+        }
+        Ok(prepared)
+    }
+
+    fn prepare_restored_change(file: String, subgraph: FileSubgraph) -> Result<PreparedChange> {
+        Self::validate_restored_subgraph(&file, &subgraph)?;
+        Ok(PreparedChange::Upsert { file, subgraph })
+    }
+
+    fn validate_restored_subgraph(file: &str, sub: &FileSubgraph) -> Result<()> {
         let invalid = |reason: String| CodegraphError::MalformedFacts {
-            file: file.clone(),
+            file: file.to_owned(),
             reason,
         };
         if sub.schema_version != FILE_SUBGRAPH_SCHEMA_VERSION {
@@ -151,19 +230,47 @@ impl IncrementalGraph {
                 "subgraph contains facts owned by another file".into(),
             ));
         }
-        if let Some(old) = self.files.get(&file) {
-            self.index.remove_symbols(&old.symbols);
+
+        // A persisted subgraph is an isolated unit: all callers must be one of
+        // its symbols, and intra-file targets must either be local to this file
+        // or another symbol in this subgraph. Without this check a malformed
+        // cache blob could inject edges from another file despite matching
+        // occurrence paths.
+        let owned_symbols: HashSet<_> = sub.symbols.iter().map(|symbol| &symbol.id).collect();
+        if sub.intra_edges.iter().any(|edge| {
+            !owned_symbols.contains(&edge.from)
+                || match edge.to.local_file() {
+                    Some(owner) => owner != file,
+                    None => !owned_symbols.contains(&edge.to),
+                }
+        }) || sub
+            .pending
+            .iter()
+            .any(|pending| !owned_symbols.contains(&pending.from))
+        {
+            return Err(invalid(
+                "subgraph contains edges or references outside its owner".into(),
+            ));
         }
-        self.index.insert_symbols(&sub.symbols);
-        self.files.insert(file, sub);
         Ok(())
     }
 
-    /// Drop the file `file` from the store, removing its definitions from the
-    /// global index. A no-op if the file is not present.
-    pub fn remove(&mut self, file: &str) {
-        if let Some(old) = self.files.remove(file) {
-            self.index.remove_symbols(&old.symbols);
+    fn commit_prepared(&mut self, changes: impl IntoIterator<Item = PreparedChange>) {
+        for change in changes {
+            match change {
+                PreparedChange::Upsert { file, subgraph } => {
+                    if let Some(old) = self.files.get(&file) {
+                        self.index.remove_symbols(&old.symbols);
+                    }
+                    self.index.insert_symbols(&subgraph.symbols);
+                    self.files.insert(file, subgraph);
+                }
+                PreparedChange::Remove { file } => {
+                    if let Some(old) = self.files.remove(&file) {
+                        self.index.remove_symbols(&old.symbols);
+                    }
+                }
+            }
         }
     }
 
@@ -381,6 +488,12 @@ mod tests {
             g.edges.iter().all(|e| e.occ.file != "src/app.rs"),
             "removed file's edges must be gone"
         );
+
+        // Preserve the legacy no-op behavior for a path the store never held.
+        let before_missing_remove = store.graph();
+        store.remove("src/missing.rs");
+        assert_eq!(store.len(), 2);
+        assert_multiset_eq(&store.graph(), &before_missing_remove);
     }
 
     /// Prove the full persistence seam end-to-end: serialize each file's
@@ -428,8 +541,43 @@ mod tests {
 
         let mut store = IncrementalGraph::from_files(&[original]);
         let before = store.graph();
-        store.upsert_subgraph("src/other.rs".to_string(), build_subgraph(&replacement));
+        assert!(
+            store
+                .try_upsert_subgraph("src/other.rs".to_string(), build_subgraph(&replacement))
+                .is_err()
+        );
 
+        assert_eq!(store.len(), 1);
+        assert!(store.subgraph("src/original.rs").is_some());
+        assert!(store.subgraph("src/other.rs").is_none());
+        assert_multiset_eq(&store.graph(), &before);
+    }
+
+    #[test]
+    fn restoring_a_subgraph_with_a_foreign_caller_leaves_state_unchanged() {
+        let consumer = RustExtractor
+            .extract(
+                "use provider::value;\npub fn call() { value(); }",
+                "src/consumer.rs",
+            )
+            .unwrap();
+        let mut subgraph = build_subgraph(&consumer);
+        let pending = subgraph
+            .pending
+            .first_mut()
+            .expect("imported call must produce a pending reference");
+        pending.from = crate::symbol::SymbolId::local("src/other.rs", "injected");
+
+        let mut store = IncrementalGraph::new();
+        let before = store.graph();
+        assert!(
+            store
+                .try_upsert_subgraph("src/consumer.rs".to_string(), subgraph)
+                .is_err()
+        );
+
+        assert!(store.is_empty());
+        assert!(store.subgraph("src/consumer.rs").is_none());
         assert_multiset_eq(&store.graph(), &before);
     }
 
@@ -451,5 +599,126 @@ mod tests {
             twice.upsert(f);
         }
         assert_multiset_eq(&twice.graph(), &once_graph);
+    }
+
+    #[test]
+    fn checked_batch_is_atomic_when_a_later_upsert_is_malformed() {
+        let original = RustExtractor
+            .extract("pub fn original() {}", "src/original.rs")
+            .unwrap();
+        let consumer = RustExtractor
+            .extract(
+                "use original::original;\npub fn call() { original(); }",
+                "src/consumer.rs",
+            )
+            .unwrap();
+        let replacement = RustExtractor
+            .extract("pub fn replacement() {}", "src/original.rs")
+            .unwrap();
+        let mut malformed = RustExtractor
+            .extract("pub fn malformed() {}", "src/new.rs")
+            .unwrap();
+        malformed.scopes[0].parent = Some(malformed.scopes.len());
+
+        let mut store = IncrementalGraph::from_files(&[original, consumer]);
+        let before = store.graph();
+        assert!(
+            store
+                .try_apply_changes(&[
+                    FileChange::Upsert(&replacement),
+                    FileChange::Upsert(&malformed),
+                ])
+                .is_err()
+        );
+
+        // The provider, its index entry, and the consumer's imported edge all
+        // survive: an error after a valid prepared change must still be pre-commit.
+        assert_eq!(store.len(), 2);
+        assert!(store.subgraph("src/original.rs").is_some());
+        assert!(store.subgraph("src/new.rs").is_none());
+        assert_multiset_eq(&store.graph(), &before);
+    }
+
+    #[test]
+    fn checked_batch_rejects_duplicate_and_conflicting_targets_without_mutation() {
+        let existing = RustExtractor
+            .extract("pub fn existing() {}", "src/existing.rs")
+            .unwrap();
+        let replacement = RustExtractor
+            .extract("pub fn replacement() {}", "src/existing.rs")
+            .unwrap();
+        let mut malformed_duplicate = replacement.clone();
+        malformed_duplicate.scopes[0].parent = Some(malformed_duplicate.scopes.len());
+        let mut store = IncrementalGraph::from_files(&[existing]);
+        let before = store.graph();
+
+        // Duplicate detection precedes validation and build preparation: even a
+        // malformed duplicate reports the batch conflict, with no partial change.
+        let error = store
+            .try_apply_changes(&[
+                FileChange::Upsert(&malformed_duplicate),
+                FileChange::Upsert(&malformed_duplicate),
+            ])
+            .expect_err("duplicate targets must be rejected before preparation");
+        assert!(matches!(
+            error,
+            CodegraphError::MalformedFacts { reason, .. }
+                if reason == "duplicate batch mutation target"
+        ));
+        assert_eq!(store.len(), 1);
+        assert!(store.subgraph("src/existing.rs").is_some());
+        assert_multiset_eq(&store.graph(), &before);
+
+        assert!(
+            store
+                .try_apply_changes(&[
+                    FileChange::Remove("src/existing.rs"),
+                    FileChange::Remove("src/existing.rs"),
+                ])
+                .is_err()
+        );
+        assert_eq!(store.len(), 1);
+        assert!(store.subgraph("src/existing.rs").is_some());
+        assert_multiset_eq(&store.graph(), &before);
+
+        assert!(
+            store
+                .try_apply_changes(&[
+                    FileChange::Upsert(&replacement),
+                    FileChange::Remove("src/existing.rs"),
+                ])
+                .is_err()
+        );
+        assert_eq!(store.len(), 1);
+        assert!(store.subgraph("src/existing.rs").is_some());
+        assert_multiset_eq(&store.graph(), &before);
+    }
+
+    #[test]
+    fn checked_mixed_batch_matches_fresh_scope_graph_resolution() {
+        let old = RustExtractor
+            .extract("pub fn old() {}", "src/old.rs")
+            .unwrap();
+        let replaced = RustExtractor
+            .extract("pub fn old_version() {}", "src/replaced.rs")
+            .unwrap();
+        let replacement = RustExtractor
+            .extract("pub fn new_version() {}", "src/replaced.rs")
+            .unwrap();
+        let added = RustExtractor
+            .extract("pub fn added() {}", "src/added.rs")
+            .unwrap();
+        let mut store = IncrementalGraph::from_files(&[old, replaced]);
+
+        store
+            .try_apply_changes(&[
+                FileChange::Upsert(&replacement),
+                FileChange::Upsert(&added),
+                FileChange::Remove("src/old.rs"),
+            ])
+            .unwrap();
+
+        let batch = ScopeGraphResolver.resolve(&[replacement, added]).unwrap();
+        assert_multiset_eq(&store.graph(), &batch);
     }
 }
