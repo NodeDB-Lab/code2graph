@@ -6,7 +6,8 @@
 //! index of all current definitions. Re-extracting a single changed file
 //! rebuilds ONLY that file's subgraph (the per-file build never looks at any
 //! file but the one passed) and patches the index — the rest of the graph is
-//! untouched. [`graph`] then stitches the current cross-file edges on demand.
+//! untouched. Derived cross-file state selectively restitches only references
+//! affected by changed definitions; [`graph`] reads that stored state.
 //!
 //! The store wraps the SAME per-file build and stitch passes the batch
 //! [`ScopeGraphResolver`] uses, so its output is identical (up to ordering) to
@@ -22,7 +23,8 @@ use crate::graph::types::{CodeGraph, FileFacts};
 use crate::validate_file_facts;
 
 use super::delta::FileChange;
-use super::stitch::{GlobalIndex, stitch};
+use super::state::PendingState;
+use super::stitch::GlobalIndex;
 use super::subgraph::{FILE_SUBGRAPH_SCHEMA_VERSION, FileSubgraph, build_subgraph};
 
 /// A fully validated, isolated file mutation ready to commit.
@@ -40,10 +42,9 @@ enum PreparedChange {
 }
 
 /// Incremental Tier-B resolution store. Holds one isolated subgraph per file
-/// plus a global definition index, so re-extracting a single changed file
-/// rebuilds only that file's subgraph — never the whole graph — while
-/// [`graph`](IncrementalGraph::graph) stitches the current cross-file edges on
-/// demand.
+/// plus a global definition index and resolved pending-reference state, so
+/// re-extracting a single changed file rebuilds only that file's subgraph and
+/// selectively restitches affected cross-file references.
 ///
 /// Output is identical (up to ordering) to running [`ScopeGraphResolver`] over
 /// the same file set: both share the same per-file build and stitch passes.
@@ -56,7 +57,7 @@ enum PreparedChange {
 /// let app = extract_path("src/app.rs", "use conf::Config;\npub fn run() {}").unwrap();
 ///
 /// // Keep a resolved graph current as files change: each file is resolved in
-/// // isolation and cross-file edges are stitched on demand.
+/// // isolation and affected cross-file edges are selectively restitched.
 /// let mut graph = IncrementalGraph::from_files(&[conf, app]);
 /// let resolves_import = |g: code2graph::graph::CodeGraph| {
 ///     g.edges.iter().any(|e| e.to.to_scip_string().ends_with("conf/Config#"))
@@ -73,6 +74,7 @@ enum PreparedChange {
 pub struct IncrementalGraph {
     files: HashMap<String, FileSubgraph>,
     index: GlobalIndex,
+    pending_state: PendingState,
 }
 
 impl IncrementalGraph {
@@ -81,6 +83,7 @@ impl IncrementalGraph {
         Self {
             files: HashMap::new(),
             index: GlobalIndex::new(),
+            pending_state: PendingState::default(),
         }
     }
 
@@ -256,6 +259,43 @@ impl IncrementalGraph {
     }
 
     fn commit_prepared(&mut self, changes: impl IntoIterator<Item = PreparedChange>) {
+        let changes: Vec<_> = changes.into_iter().collect();
+        let targets: Vec<String> = changes
+            .iter()
+            .map(|change| match change {
+                PreparedChange::Upsert { file, .. } | PreparedChange::Remove { file } => {
+                    file.clone()
+                }
+            })
+            .collect();
+        let mut affected = HashSet::new();
+
+        // Select unchanged refs against BOTH sides of every definition change,
+        // before the old pending records are deleted. This makes a batch resolve
+        // only against its final index, never an intermediate file ordering.
+        for change in &changes {
+            match change {
+                PreparedChange::Upsert { file, subgraph } => {
+                    if let Some(old) = self.files.get(file) {
+                        for symbol in &old.symbols {
+                            affected.extend(self.pending_state.affected_by_symbol(symbol));
+                        }
+                    }
+                    for symbol in &subgraph.symbols {
+                        affected.extend(self.pending_state.affected_by_symbol(symbol));
+                    }
+                }
+                PreparedChange::Remove { file } => {
+                    if let Some(old) = self.files.get(file) {
+                        for symbol in &old.symbols {
+                            affected.extend(self.pending_state.affected_by_symbol(symbol));
+                        }
+                    }
+                }
+            }
+        }
+
+        // First establish the complete final definition index and file set.
         for change in changes {
             match change {
                 PreparedChange::Upsert { file, subgraph } => {
@@ -272,14 +312,22 @@ impl IncrementalGraph {
                 }
             }
         }
+
+        // Replace installed refs only after the final index exists. New refs are
+        // always affected; deleted refs lose both lookup and resolved state.
+        for owner in targets {
+            self.pending_state.remove_owner(&owner);
+            if let Some(subgraph) = self.files.get(&owner) {
+                affected.extend(self.pending_state.install(&owner, &subgraph.pending));
+            }
+        }
+        self.pending_state.resolve(affected, &self.index);
     }
 
-    /// Stitch the current cross-file edges and return the full [`CodeGraph`].
+    /// Return the full [`CodeGraph`] from stored resolved cross-file state.
     ///
-    /// Deterministic: file keys are processed in sorted order, so symbols,
-    /// intra-file edges, and pending refs always accumulate in the same order
-    /// regardless of upsert history. Cross-file edges are stitched last against
-    /// the current global index.
+    /// Deterministic: file keys and pending ordinals are processed in sorted
+    /// owner/ordinal order, regardless of upsert history.
     pub fn graph(&self) -> CodeGraph {
         // Process files in sorted-key order for deterministic output. Iterate the
         // entries directly (no key-then-lookup) so there is no fallible indexing.
@@ -288,14 +336,15 @@ impl IncrementalGraph {
 
         let mut symbols = Vec::new();
         let mut edges = Vec::new();
-        let mut pending = Vec::new();
-
         for (_, sub) in entries {
             symbols.extend(sub.symbols.iter().cloned());
             edges.extend(sub.intra_edges.iter().cloned());
-            pending.extend(sub.pending.iter().cloned());
+            for (ordinal, _) in sub.pending.iter().enumerate() {
+                if let Some(Some(edge)) = self.pending_state.resolved(&sub.owner_file, ordinal) {
+                    edges.push(edge.clone());
+                }
+            }
         }
-        edges.extend(stitch(&pending, &self.index));
 
         CodeGraph { symbols, edges }
     }
@@ -602,6 +651,62 @@ mod tests {
     }
 
     #[test]
+    fn stored_pending_state_keeps_duplicate_occurrences_and_reconciles_provider_changes() {
+        let consumer = RustExtractor
+            .extract(
+                "use provider::helper;\npub fn run() { helper(); helper(); }",
+                "src/consumer.rs",
+            )
+            .unwrap();
+        let provider = RustExtractor
+            .extract("pub fn helper() {}", "src/provider.rs")
+            .unwrap();
+        let removed = RustExtractor
+            .extract("pub fn other() {}", "src/provider.rs")
+            .unwrap();
+
+        // Installing the caller before its target leaves an explicit unresolved
+        // state, which must become resolved when the target arrives.
+        let mut store = IncrementalGraph::from_files(std::slice::from_ref(&consumer));
+        assert_multiset_eq(
+            &store.graph(),
+            &ScopeGraphResolver
+                .resolve(std::slice::from_ref(&consumer))
+                .unwrap(),
+        );
+        store.upsert(&provider);
+        let resolved = store.graph();
+        assert_eq!(
+            resolved
+                .edges
+                .iter()
+                .filter(|edge| edge.role == crate::graph::types::RefRole::Call)
+                .count(),
+            2,
+            "identical pending call occurrences must retain distinct ordinals"
+        );
+        assert_multiset_eq(
+            &resolved,
+            &ScopeGraphResolver
+                .resolve(&[consumer.clone(), provider.clone()])
+                .unwrap(),
+        );
+
+        store.upsert(&removed);
+        assert_multiset_eq(
+            &store.graph(),
+            &ScopeGraphResolver
+                .resolve(&[consumer.clone(), removed])
+                .unwrap(),
+        );
+        store.remove("src/provider.rs");
+        assert_multiset_eq(
+            &store.graph(),
+            &ScopeGraphResolver.resolve(&[consumer]).unwrap(),
+        );
+    }
+
+    #[test]
     fn checked_batch_is_atomic_when_a_later_upsert_is_malformed() {
         let original = RustExtractor
             .extract("pub fn original() {}", "src/original.rs")
@@ -692,6 +797,237 @@ mod tests {
         assert_eq!(store.len(), 1);
         assert!(store.subgraph("src/existing.rs").is_some());
         assert_multiset_eq(&store.graph(), &before);
+    }
+
+    #[test]
+    fn typeref_module_preference_and_ordinary_fallback_restitch_unchanged_owner() {
+        let consumer = RustExtractor
+            .extract("pub struct Order { value: Config }", "src/order.rs")
+            .unwrap();
+        let ordinary = RustExtractor
+            .extract("pub struct Config {}", "src/types.rs")
+            .unwrap();
+        let module = RustExtractor.extract("", "src/Config.rs").unwrap();
+        let mut store = IncrementalGraph::from_files(&[consumer.clone(), ordinary.clone()]);
+        assert_multiset_eq(
+            &store.graph(),
+            &ScopeGraphResolver
+                .resolve(&[consumer.clone(), ordinary.clone()])
+                .unwrap(),
+        );
+
+        store.upsert(&module);
+        assert_multiset_eq(
+            &store.graph(),
+            &ScopeGraphResolver
+                .resolve(&[consumer.clone(), ordinary.clone(), module])
+                .unwrap(),
+        );
+        store.remove("src/Config.rs");
+        assert_multiset_eq(
+            &store.graph(),
+            &ScopeGraphResolver.resolve(&[consumer, ordinary]).unwrap(),
+        );
+    }
+
+    #[test]
+    fn qualified_namespace_candidate_add_remove_restitches_unchanged_owner() {
+        let consumer = RustExtractor
+            .extract("pub fn run() { a::process() }", "src/consumer.rs")
+            .unwrap();
+        let first = RustExtractor
+            .extract("pub fn process() {}", "src/a.rs")
+            .unwrap();
+        let second = RustExtractor
+            .extract("pub fn process() {}", "src/other/a.rs")
+            .unwrap();
+        let mut store = IncrementalGraph::from_files(&[consumer.clone(), first.clone()]);
+
+        store.upsert(&second);
+        assert_multiset_eq(
+            &store.graph(),
+            &ScopeGraphResolver
+                .resolve(&[consumer.clone(), first.clone(), second.clone()])
+                .unwrap(),
+        );
+        store.remove("src/other/a.rs");
+        assert_multiset_eq(
+            &store.graph(),
+            &ScopeGraphResolver.resolve(&[consumer, first]).unwrap(),
+        );
+    }
+
+    #[cfg(feature = "ruby")]
+    #[test]
+    fn qualified_enclosing_type_candidate_restitches_unchanged_owner() {
+        use crate::extract::RubyExtractor;
+
+        let consumer = RubyExtractor
+            .extract("def run\n  Alpha.compute\nend\n", "main.rb")
+            .unwrap();
+        let first = RubyExtractor
+            .extract(
+                "module Alpha\n  def self.compute\n    1\n  end\nend\n",
+                "alpha.rb",
+            )
+            .unwrap();
+        let duplicate = RubyExtractor
+            .extract(
+                "module Alpha\n  def self.compute\n    2\n  end\nend\n",
+                "duplicate.rb",
+            )
+            .unwrap();
+        let mut store = IncrementalGraph::from_files(&[consumer.clone(), first.clone()]);
+
+        store.upsert(&duplicate);
+        assert_multiset_eq(
+            &store.graph(),
+            &ScopeGraphResolver
+                .resolve(&[consumer.clone(), first.clone(), duplicate.clone()])
+                .unwrap(),
+        );
+        store.remove("duplicate.rb");
+        assert_multiset_eq(
+            &store.graph(),
+            &ScopeGraphResolver.resolve(&[consumer, first]).unwrap(),
+        );
+    }
+
+    #[test]
+    fn module_candidate_add_remove_restitches_unchanged_owner() {
+        let consumer = RustExtractor
+            .extract("mod util;\npub fn run() {}", "src/lib.rs")
+            .unwrap();
+        let first = RustExtractor
+            .extract("pub fn first() {}", "src/a/util.rs")
+            .unwrap();
+        let second = RustExtractor
+            .extract("pub fn second() {}", "src/b/util.rs")
+            .unwrap();
+        let mut store = IncrementalGraph::from_files(&[consumer.clone(), first.clone()]);
+        assert_multiset_eq(
+            &store.graph(),
+            &ScopeGraphResolver
+                .resolve(&[consumer.clone(), first.clone()])
+                .unwrap(),
+        );
+
+        // A second physical module instance makes the unchanged declaration
+        // ambiguous; deleting it must restore the original stored edge.
+        store.upsert(&second);
+        assert_multiset_eq(
+            &store.graph(),
+            &ScopeGraphResolver
+                .resolve(&[consumer.clone(), first.clone(), second.clone()])
+                .unwrap(),
+        );
+        store.remove("src/b/util.rs");
+        assert_multiset_eq(
+            &store.graph(),
+            &ScopeGraphResolver.resolve(&[consumer, first]).unwrap(),
+        );
+    }
+
+    #[cfg(feature = "go")]
+    #[test]
+    fn checked_batch_resolves_only_final_state_independent_of_change_order() {
+        use crate::extract::GoExtractor;
+
+        let consumer = GoExtractor
+            .extract("package main\nfunc Run() { Helper() }\n", "consumer.go")
+            .unwrap();
+        let a_old = GoExtractor
+            .extract("package main\nfunc Helper() {}\n", "a.go")
+            .unwrap();
+        let a_new = GoExtractor
+            .extract("package main\nfunc Other() {}\n", "a.go")
+            .unwrap();
+        let b_old = GoExtractor
+            .extract("package main\nfunc Other() {}\n", "b.go")
+            .unwrap();
+        let b_new = GoExtractor
+            .extract("package main\nfunc Helper() {}\n", "b.go")
+            .unwrap();
+
+        let initial = [consumer.clone(), a_old, b_old];
+        let mut forward = IncrementalGraph::from_files(&initial);
+        let mut reverse = IncrementalGraph::from_files(&initial);
+        forward
+            .try_apply_changes(&[FileChange::Upsert(&a_new), FileChange::Upsert(&b_new)])
+            .unwrap();
+        reverse
+            .try_apply_changes(&[FileChange::Upsert(&b_new), FileChange::Upsert(&a_new)])
+            .unwrap();
+
+        let batch = ScopeGraphResolver
+            .resolve(&[consumer, a_new, b_new])
+            .unwrap();
+        assert_multiset_eq(&forward.graph(), &batch);
+        assert_multiset_eq(&reverse.graph(), &batch);
+
+        // `graph()` itself has stable vector order, not merely stable sets.
+        let forward_graph = forward.graph();
+        let reverse_graph = reverse.graph();
+        assert_eq!(
+            forward_graph
+                .symbols
+                .iter()
+                .map(|symbol| symbol.id.clone())
+                .collect::<Vec<_>>(),
+            reverse_graph
+                .symbols
+                .iter()
+                .map(|symbol| symbol.id.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            forward_graph
+                .edges
+                .iter()
+                .map(Edge::key)
+                .collect::<Vec<_>>(),
+            reverse_graph
+                .edges
+                .iter()
+                .map(Edge::key)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn restored_pending_state_tracks_later_provider_mutations() {
+        let consumer = RustExtractor
+            .extract(
+                "use provider::helper;\npub fn run() { helper(); }",
+                "src/consumer.rs",
+            )
+            .unwrap();
+        let provider = RustExtractor
+            .extract("pub fn helper() {}", "src/provider.rs")
+            .unwrap();
+        let replacement = RustExtractor
+            .extract("pub fn other() {}", "src/provider.rs")
+            .unwrap();
+        let consumer_sub = build_subgraph(&consumer);
+
+        let mut restored = IncrementalGraph::new();
+        restored
+            .try_upsert_subgraph("src/consumer.rs".into(), consumer_sub)
+            .unwrap();
+        restored.upsert(&provider);
+        assert_multiset_eq(
+            &restored.graph(),
+            &ScopeGraphResolver
+                .resolve(&[consumer.clone(), provider])
+                .unwrap(),
+        );
+        restored.upsert(&replacement);
+        assert_multiset_eq(
+            &restored.graph(),
+            &ScopeGraphResolver
+                .resolve(&[consumer, replacement])
+                .unwrap(),
+        );
     }
 
     #[test]

@@ -14,6 +14,7 @@
 //! [`ScopeGraphResolver`]: super::ScopeGraphResolver
 
 mod delta;
+mod state;
 mod stitch;
 mod store;
 mod subgraph;

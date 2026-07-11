@@ -131,6 +131,39 @@ impl GlobalIndex {
         })
     }
 
+    /// Whether a definition could participate in resolving this pending ref.
+    /// This is deliberately the same role dispatch and compatibility predicate
+    /// used by [`resolve_pending`], allowing the incremental store to restitch
+    /// only references affected by a definition mutation.
+    pub(crate) fn pending_matches_symbol(p: &PendingRef, symbol: &Symbol) -> bool {
+        match p.role {
+            RefRole::ModuleRef => {
+                symbol.kind == SymbolKind::Module
+                    && symbol.name == p.name
+                    && (p.segs.is_empty() || namespaces_end_with(&symbol.id, &p.segs))
+            }
+            RefRole::TypeRef => {
+                let has_name = if symbol.kind == SymbolKind::Module {
+                    symbol.name == p.name
+                } else {
+                    symbol.id.leaf_name() == Some(p.name.as_str())
+                };
+                has_name && (p.segs.is_empty() || namespaces_end_with(&symbol.id, &p.segs))
+            }
+            _ if p.qualified => {
+                symbol.kind != SymbolKind::Module
+                    && symbol.id.leaf_name() == Some(p.name.as_str())
+                    && (namespaces_end_with(&symbol.id, &p.segs)
+                        || enclosing_path_ends_with(&symbol.id, &p.segs))
+            }
+            _ => {
+                symbol.kind != SymbolKind::Module
+                    && symbol.id.leaf_name() == Some(p.name.as_str())
+                    && (p.segs.is_empty() || namespaces_end_with(&symbol.id, &p.segs))
+            }
+        }
+    }
+
     /// Like [`unique_match`](GlobalIndex::unique_match) but for an EXPLICITLY
     /// qualified call: the qualifier may name an enclosing *type* (a Ruby
     /// `module`, Kotlin `object`, or class — a `Type` descriptor) as well as a
@@ -173,7 +206,7 @@ impl GlobalIndex {
 
 /// Resolve one deferred reference. This is shared by every stitch caller so
 /// resolution semantics have one private implementation.
-fn resolve_pending(p: &PendingRef, index: &GlobalIndex) -> Option<Edge> {
+pub(crate) fn resolve_pending(p: &PendingRef, index: &GlobalIndex) -> Option<Edge> {
     // ModuleRefs resolve ONLY against the module index; everything else resolves
     // ONLY against the leaf-name index.
     let matched = match p.role {
