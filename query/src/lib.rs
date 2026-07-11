@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Query-side indexes and snapshot-delta application for `code2graph` facts.
+//! Query-side indexes for `code2graph` facts.
 
 pub mod error;
-#[cfg(test)]
+pub mod index;
 mod order;
 
 pub use error::{QueryError, Result};
+pub use index::GraphIndex;
