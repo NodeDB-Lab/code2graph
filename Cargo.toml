@@ -14,7 +14,7 @@ readme = "README.md"
 [workspace.dependencies]
 # Exact requirements prevent a prerelease (for example 0.0.0-beta.2) from
 # silently resolving a different prerelease or the eventual stable release.
-# scripts/stamp-release.py replaces this development sentinel for tagged builds.
+# scripts/release/version_contract.py replaces this development sentinel for tagged builds.
 code2graph = { path = ".", version = "=0.0.0" }
 directories = "6"
 code2graph-query = { path = "query", version = "=0.0.0" }

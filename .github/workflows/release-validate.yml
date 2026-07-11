@@ -1,0 +1,63 @@
+# SPDX-License-Identifier: Apache-2.0
+name: Release Validate
+on:
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+    outputs:
+      version:
+        value: ${{ jobs.validate.outputs.version }}
+      is_prerelease:
+        value: ${{ jobs.validate.outputs.is_prerelease }}
+      source_sha:
+        value: ${{ jobs.validate.outputs.source_sha }}
+      python_version:
+        value: ${{ jobs.validate.outputs.python_version }}
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.contract.outputs.version }}
+      is_prerelease: ${{ steps.contract.outputs.is_prerelease }}
+      source_sha: ${{ steps.contract.outputs.source_sha }}
+      python_version: ${{ steps.contract.outputs.python_version }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          path: validation-helper
+      - id: tag
+        name: Validate tag syntax with canonical helper
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+        run: python3 validation-helper/scripts/release/version_contract.py validate-tag "$TAG" --github-output "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+          path: tagged-source
+      - id: contract
+        name: Validate immutable tag and release contract
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          SHA="$(git -C tagged-source rev-parse --verify "refs/tags/${TAG}^{commit}")"
+          test "$SHA" = "$(git -C tagged-source rev-parse "HEAD^{commit}")"
+          STAGE="$(mktemp -d)"
+          STAMPED="$(mktemp -d)/stamped"
+          git -C tagged-source archive "$SHA" | tar -x -C "$STAGE"
+          VERSION="${TAG#v}"
+          python3 validation-helper/scripts/release/version_contract.py stamp "$VERSION" --source "$STAGE" --destination "$STAMPED"
+          python3 validation-helper/scripts/release/version_contract.py verify "$VERSION" --root "$STAMPED"
+          {
+            echo "version=${{ steps.tag.outputs.version }}"
+            echo "python_version=${{ steps.tag.outputs.python_version }}"
+            echo "is_prerelease=${{ steps.tag.outputs.is_prerelease }}"
+            echo "source_sha=$SHA"
+          } >> "$GITHUB_OUTPUT"

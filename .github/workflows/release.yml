@@ -1,336 +1,318 @@
+# SPDX-License-Identifier: Apache-2.0
 name: Release
-
-# Tag-driven release. A tag `vX.Y.Z` (or `vX.Y.Z-alpha.N`, `-beta.N`, `-rc.N`)
-# stamps the workspace package version and exact internal crates.io requirements.
-# One synced version drives crates.io (code2graph, code2graph-query, code2graph-cli),
-# PyPI, and npm.
+run-name: Release ${{ inputs.tag }}
 on:
-  push:
-    tags: ["v*"]
-
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Immutable v* tag"
+        required: true
+        type: string
+      prepare_run_id:
+        description: "Successful Release Prepare run ID"
+        required: true
+        type: string
+      distribution_ref:
+        description: "Optional ref for distribution workflow/helper fixes"
+        required: false
+        type: string
+      crates:
+        description: "Publish crates.io packages"
+        required: true
+        default: true
+        type: boolean
+      pypi:
+        description: "Publish prepared Python files"
+        required: true
+        default: true
+        type: boolean
+      npm:
+        description: "Publish prepared npm tarballs"
+        required: true
+        default: true
+        type: boolean
+      github:
+        description: "Create/update GitHub release"
+        required: true
+        default: true
+        type: boolean
 concurrency:
-  group: release
+  group: release-distribution-${{ inputs.tag }}
   cancel-in-progress: false
-
 permissions:
   contents: read
-
-env:
-  CARGO_TERM_COLOR: always
-
+  actions: read
 jobs:
-  validate-version:
-    name: Validate version tag
+  validate:
+    uses: ./.github/workflows/release-validate.yml
+    with:
+      tag: ${{ inputs.tag }}
+  provenance:
+    needs: validate
     runs-on: ubuntu-latest
     outputs:
-      version: ${{ steps.version.outputs.version }}
-      is_prerelease: ${{ steps.version.outputs.is_prerelease }}
+      artifact: ${{ steps.check.outputs.artifact }}
     steps:
       - uses: actions/checkout@v6
-      - name: Validate release template and tag
-        id: version
+        with:
+          ref: ${{ inputs.distribution_ref || inputs.tag }}
+      - id: check
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN: ${{ inputs.prepare_run_id }}
+          TAG: ${{ inputs.tag }}
+          SHA: ${{ needs.validate.outputs.source_sha }}
+          PUBLISH_CRATES: ${{ inputs.crates }}
+          PUBLISH_PYPI: ${{ inputs.pypi }}
+          PUBLISH_NPM: ${{ inputs.npm }}
+          PUBLISH_GITHUB: ${{ inputs.github }}
+        run: |
+          set -euo pipefail
+          [[ "$RUN" =~ ^[0-9]+$ ]] || { echo "invalid prepare run ID" >&2; exit 1; }
+          [[ "$PUBLISH_CRATES$PUBLISH_PYPI$PUBLISH_NPM$PUBLISH_GITHUB" == *true* ]] || { echo "enable at least one distribution target" >&2; exit 1; }
+          RUN_JSON="$(gh api "/repos/$GITHUB_REPOSITORY/actions/runs/$RUN")"
+          test "$(jq -r .event <<<"$RUN_JSON")" = push
+          test "$(jq -r .conclusion <<<"$RUN_JSON")" = success
+          test "$(jq -r .head_sha <<<"$RUN_JSON")" = "$SHA"
+          RUN_PATH="$(jq -r .path <<<"$RUN_JSON")"
+          case "$RUN_PATH" in
+            .github/workflows/release-prepare.yml|.github/workflows/release-prepare.yml@*) ;;
+            *) echo "prepare run used unexpected workflow path: $RUN_PATH" >&2; exit 1 ;;
+          esac
+          test "$(jq -r .repository.full_name <<<"$RUN_JSON")" = "$GITHUB_REPOSITORY"
+          test "$(jq -r .head_repository.full_name <<<"$RUN_JSON")" = "$GITHUB_REPOSITORY"
+          ARTIFACT="release-bundle-${{ needs.validate.outputs.version }}"
+          COUNT="$(gh api "/repos/$GITHUB_REPOSITORY/actions/runs/$RUN/artifacts" --paginate --jq ".artifacts[] | select(.name == \"$ARTIFACT\" and .expired == false) | .id" | wc -l)"
+          test "$COUNT" -eq 1 || { echo "expected exactly one live $ARTIFACT artifact, got $COUNT" >&2; exit 1; }
+          echo "artifact=$ARTIFACT" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ steps.check.outputs.artifact }}
+          run-id: ${{ inputs.prepare_run_id }}
+          github-token: ${{ github.token }}
+          path: bundle
+      - name: Verify exact prepared bundle before protected environments
         shell: bash
         run: |
           set -euo pipefail
-          TAG="${GITHUB_REF_NAME}"
-          TAG_VERSION="${TAG#v}"
-          if [[ ! "$TAG_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)\.[0-9]+)?$ ]]; then
-            echo "::error::Invalid tag '$TAG'. Expected vX.Y.Z or vX.Y.Z-(alpha|beta|rc).N"
-            exit 1
-          fi
-          # Development manifests deliberately use 0.0.0, which is never
-          # published. Tagged jobs stamp every package requirement from this tag.
-          python3 scripts/stamp-release.py --check-template
-          if [[ "$TAG_VERSION" == *-* ]]; then
-            echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
-          fi
-          echo "version=$TAG_VERSION" >> "$GITHUB_OUTPUT"
-          echo "Releasing $TAG_VERSION"
-
-  ci:
-    name: Test
-    needs: validate-version
-    uses: ./.github/workflows/test.yml
-
+          python3 scripts/release/artifact_manifest.py verify --directory bundle --manifest bundle/release-manifest.json --repository "$GITHUB_REPOSITORY" --tag "${{ inputs.tag }}" --source-sha "${{ needs.validate.outputs.source_sha }}" --prepare-run-id "${{ inputs.prepare_run_id }}" --workflow release-prepare.yml --version "${{ needs.validate.outputs.version }}"
+          python3 scripts/release/artifact_manifest.py verify-checksums --directory bundle --manifest bundle/release-manifest.json --checksums bundle/SHA256SUMS
   publish-crates:
-    name: Publish to crates.io
-    needs: [validate-version, ci]
+    needs: [validate, provenance]
+    if: inputs.crates
     runs-on: ubuntu-latest
     environment: crates.io
     steps:
       - uses: actions/checkout@v6
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-      - name: Stamp package versions and exact internal requirements
-        run: python3 scripts/stamp-release.py "${{ needs.validate-version.outputs.version }}"
-      - name: Publish crates in dependency order
-        shell: bash
+        with:
+          ref: ${{ inputs.distribution_ref || inputs.tag }}
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.validate.outputs.source_sha }}
+          path: tagged-source
+      - uses: dtolnay/rust-toolchain@stable
+      - run: python3 scripts/release/version_contract.py stamp "${{ needs.validate.outputs.version }}" --source tagged-source --destination release-source
+      - shell: bash
+        working-directory: release-source
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           set -euo pipefail
-          VERSION="${{ needs.validate-version.outputs.version }}"
-          USER_AGENT="code2graph-ci (github.com/nodedb-lab/code2graph)"
-
-          crate_available() {
-            curl -sf -H "User-Agent: $USER_AGENT" \
-              "https://crates.io/api/v1/crates/$1/$VERSION" > /dev/null 2>&1
+          VERSION="${{ needs.validate.outputs.version }}"
+          USER_AGENT="code2graph-release/$VERSION ($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)"
+          available() { curl -fsS -A "$USER_AGENT" "https://crates.io/api/v1/crates/$1/$VERSION" >/dev/null; }
+          verify_remote() {
+            local package="$1" remote
+            remote="$(mktemp)"
+            curl -fsSL -A "$USER_AGENT" "https://crates.io/api/v1/crates/$package/$VERSION/download" -o "$remote"
+            cmp --silent "target/package/$package-$VERSION.crate" "$remote" || { echo "crates.io archive differs for $package@$VERSION" >&2; return 1; }
           }
-
-          wait_for_crate() {
-            local crate="$1"
-            for attempt in $(seq 1 30); do
-              if crate_available "$crate"; then
-                echo "$crate@$VERSION is available from crates.io"
-                return 0
-              fi
-              echo "Waiting for $crate@$VERSION to become available ($attempt/30)"
+          publish() {
+            local package="$1"
+            cargo package -p "$package" --allow-dirty --no-verify
+            if available "$package"; then
+              verify_remote "$package"
+              return
+            fi
+            if ! cargo publish -p "$package" --allow-dirty --no-verify; then
+              echo "cargo publish returned an error; reconciling against crates.io before failing" >&2
+            fi
+            for _ in {1..30}; do
+              if available "$package"; then verify_remote "$package" && return; fi
               sleep 10
             done
-            echo "::error::$crate@$VERSION was not available from crates.io after 300 seconds; refusing to publish a dependent crate."
+            echo "$package@$VERSION did not become available after publish reconciliation" >&2
             return 1
           }
-
-          publish_crate() {
-            local crate="$1"
-            if crate_available "$crate"; then
-              echo "$crate@$VERSION already published — skipping"
-            else
-              # Keep cargo's package verification enabled before every publish.
-              cargo publish -p "$crate" --allow-dirty
-            fi
-            wait_for_crate "$crate"
-          }
-
-          publish_crate code2graph
-          publish_crate code2graph-query
-          publish_crate code2graph-cli
-
-  build-sdist:
-    name: Build sdist
-    # Binding crates depend on the query crate; build only after its exact
-    # release is visible so release artifacts are validated in publish order.
-    needs: [validate-version, publish-crates]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-      - name: Stamp package versions and exact internal requirements
-        run: python scripts/stamp-release.py "${{ needs.validate-version.outputs.version }}"
-      - name: Build sdist
-        uses: PyO3/maturin-action@v1
-        with:
-          command: sdist
-          args: --out dist -m bindings/python/Cargo.toml
-      - uses: actions/upload-artifact@v7
-        with:
-          name: wheels-sdist
-          path: dist
-
-  build-wheels:
-    name: Build wheel (${{ matrix.target }})
-    needs: [validate-version, publish-crates]
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            manylinux: auto
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-            manylinux: auto
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-            manylinux: musllinux_1_2
-          # Intel macOS hosted runners (macos-13) are retired; cross-compile the
-          # x86_64 wheel on an Apple Silicon runner (the target is set above).
-          - os: macos-latest
-            target: x86_64-apple-darwin
-          - os: macos-latest
-            target: aarch64-apple-darwin
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-    steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-      - name: Stamp package versions and exact internal requirements
-        run: python scripts/stamp-release.py "${{ needs.validate-version.outputs.version }}"
-      - name: Build wheel
-        uses: PyO3/maturin-action@v1
-        with:
-          target: ${{ matrix.target }}
-          manylinux: ${{ matrix.manylinux || 'auto' }}
-          args: --release --out dist -m bindings/python/Cargo.toml
-          sccache: "true"
-          # tree-sitter grammars' generated parser.c uses C99 for-loop init and
-          # some scanners use C11 static_assert; the manylinux cross-GCC defaults
-          # to C89. Force C11 inside the build container (linux/docker only).
-          docker-options: ${{ contains(matrix.target, 'linux') && '-e CFLAGS=-std=gnu11' || '' }}
-      - uses: actions/upload-artifact@v7
-        with:
-          name: wheels-${{ matrix.target }}
-          path: dist
-
+          publish code2graph
+          publish code2graph-query
+          publish code2graph-cli
   publish-pypi:
-    name: Publish to PyPI
-    needs: [validate-version, publish-crates, build-wheels, build-sdist]
+    needs: [validate, provenance]
+    if: inputs.pypi
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
       id-token: write
-    steps:
-      - uses: actions/download-artifact@v8
-        with:
-          pattern: wheels-*
-          path: dist
-          merge-multiple: true
-      - name: Publish (Trusted Publishing / OIDC)
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          skip-existing: true
-
-  build-node:
-    name: Build addon (${{ matrix.target }})
-    needs: [validate-version, publish-crates]
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
-          - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-latest
-            napi_cross: true
-          - target: x86_64-unknown-linux-musl
-            runner: ubuntu-latest
-            zig: true
-          # Intel macOS runners are retired; cross-compile x86_64 on Apple Silicon.
-          - target: x86_64-apple-darwin
-            runner: macos-latest
-          - target: aarch64-apple-darwin
-            runner: macos-latest
-          - target: x86_64-pc-windows-msvc
-            runner: windows-latest
+      actions: read
+      contents: read
     steps:
       - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
         with:
-          python-version: "3.12"
-      - name: Stamp package versions and exact internal requirements
-        run: python scripts/stamp-release.py "${{ needs.validate-version.outputs.version }}"
-      - uses: actions/setup-node@v5
+          ref: ${{ inputs.distribution_ref || inputs.tag }}
+      - uses: actions/download-artifact@v8
         with:
-          node-version: "22"
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: node-${{ matrix.target }}
-      - name: Install zig (musl cross-compile)
-        if: matrix.zig
+          name: ${{ needs.provenance.outputs.artifact }}
+          run-id: ${{ inputs.prepare_run_id }}
+          github-token: ${{ github.token }}
+          path: bundle
+      - name: Reject different existing files and verify eventual registry hashes
+        shell: bash
         run: |
-          pip install ziglang
-          cargo install --locked cargo-zigbuild
-      - name: Install napi cross-toolchain (linux aarch64)
-        if: matrix.napi_cross
-        run: npm install -g @napi-rs/cross-toolchain
-      - name: Install deps
-        working-directory: bindings/node
-        run: npm ci
-      - name: Build and regenerate addon bindings
-        working-directory: bindings/node
-        # tree-sitter grammars need C11 (for-loop init / static_assert); the napi
-        # aarch64 cross-GCC defaults to C89. Harmless on the modern gnu/clang/zig
-        # targets; omitted on Windows, whose MSVC rejects -std=gnu11.
-        env:
-          CFLAGS: ${{ !contains(matrix.target, 'windows') && '-std=gnu11' || '' }}
-        run: |
-          npx napi build --platform --release --target ${{ matrix.target }} ${{ matrix.zig && '-x' || '' }} ${{ matrix.napi_cross && '--use-napi-cross' || '' }}
-          npm run harden-loader
-          npm run harden-types
-      - name: Test regenerated native binding and loader policy
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
-        working-directory: bindings/node
-        run: npm test
-      - uses: actions/upload-artifact@v7
+          set -euo pipefail
+          project=code2graph-rs
+          version="${{ needs.validate.outputs.python_version }}"
+          release_json() { curl -fsSL "https://pypi.org/pypi/$project/$version/json"; }
+          check_hashes() {
+            local json="$1" file name local_hash remote_hash
+            mapfile -t local_names < <(find bundle/python -maxdepth 1 -type f -printf '%f\n' | sort)
+            mapfile -t remote_names < <(jq -r '.urls[].filename' <<<"$json" | sort)
+            for name in "${remote_names[@]}"; do
+              printf '%s\n' "${local_names[@]}" | grep -Fxq "$name" || { echo "unexpected PyPI artifact $name" >&2; return 1; }
+              file="bundle/python/$name"
+              local_hash="$(sha256sum "$file" | awk '{print $1}')"
+              remote_hash="$(jq -r --arg name "$name" '.urls[] | select(.filename == $name) | .digests.sha256' <<<"$json")"
+              test "$remote_hash" = "$local_hash" || { echo "PyPI artifact mismatch for $name" >&2; return 1; }
+            done
+          }
+          if json="$(release_json 2>/dev/null)"; then check_hashes "$json"; fi
+      - uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          name: node-${{ matrix.target }}
-          path: bindings/node/*.node
-
+          packages-dir: bundle/python
+          skip-existing: true
+      - name: Poll and re-verify published Python files
+        shell: bash
+        run: |
+          set -euo pipefail
+          for _ in {1..30}; do
+            if json="$(curl -fsSL "https://pypi.org/pypi/code2graph-rs/${{ needs.validate.outputs.python_version }}/json" 2>/dev/null)"; then
+              mapfile -t local_names < <(find bundle/python -maxdepth 1 -type f -printf '%f\n' | sort)
+              mapfile -t remote_names < <(jq -r '.urls[].filename' <<<"$json" | sort)
+              complete=true
+              test "${local_names[*]}" = "${remote_names[*]}" || complete=false
+              for file in bundle/python/*; do
+                name="$(basename "$file")"; hash="$(sha256sum "$file" | awk '{print $1}')"
+                test "$(jq -r --arg name "$name" '.urls[] | select(.filename == $name) | .digests.sha256' <<<"$json")" = "$hash" || complete=false
+              done
+              "$complete" && exit 0
+            fi
+            sleep 2
+          done
+          exit 1
   publish-npm:
-    name: Publish to npm
-    needs: [validate-version, build-node, publish-crates]
+    needs: [validate, provenance]
+    if: inputs.npm
     runs-on: ubuntu-latest
     environment: npm
     permissions:
-      contents: read
       id-token: write
+      actions: read
+      contents: read
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.distribution_ref || inputs.tag }}
       - uses: actions/setup-node@v5
         with:
           node-version: "22"
-          registry-url: "https://registry.npmjs.org"
-      - name: Install deps
-        working-directory: bindings/node
-        run: npm ci
-      - name: Download addon artifacts
-        uses: actions/download-artifact@v8
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@v8
         with:
-          path: bindings/node/artifacts
-          pattern: node-*
-          merge-multiple: true
-      - name: Stamp version
-        working-directory: bindings/node
+          name: ${{ needs.provenance.outputs.artifact }}
+          run-id: ${{ inputs.prepare_run_id }}
+          github-token: ${{ github.token }}
+          path: bundle
+      - name: Publish prepared platform packages before the root package
+        shell: bash
         run: |
-          VERSION="${{ needs.validate-version.outputs.version }}"
-          jq --arg v "$VERSION" '.version = $v' package.json > tmp.json && mv tmp.json package.json
-      - name: Assemble platform packages
-        working-directory: bindings/node
-        run: |
-          npx napi create-npm-dirs --npm-dir ./npm
-          npx napi artifacts --output-dir ./artifacts --npm-dir ./npm
-          npx napi prepublish -t npm --npm-dir ./npm --skip-optional-publish
-          npm run harden-loader
-          npm run harden-types
-      - name: Publish (idempotent, with provenance)
-        working-directory: bindings/node
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          NPM_CONFIG_PROVENANCE: "true"
-        run: |
-          publish_pkg() {
-            local dir="$1" name ver
-            name=$(jq -r .name "$dir/package.json")
-            ver=$(jq -r .version "$dir/package.json")
-            if npm view "$name@$ver" version >/dev/null 2>&1; then
-              echo "$name@$ver already published — skipping"
+          set -euo pipefail
+          publish() {
+            local tarball="$1" name version remote
+            name=$(tar -xOf "$tarball" package/package.json | jq -r .name)
+            version=$(tar -xOf "$tarball" package/package.json | jq -r .version)
+            if npm view "$name@$version" version >/dev/null 2>&1; then
+              remote="$(mktemp -d)"
+              npm pack "$name@$version" --pack-destination "$remote"
+              python3 scripts/release/artifact_manifest.py compare-npm --local "$tarball" --remote "$(find "$remote" -name '*.tgz' -print -quit)"
             else
-              npm publish "$dir" --access public
+              npm publish "$tarball" --access public --provenance --tag "${{ needs.validate.outputs.is_prerelease == 'true' && 'next' || 'latest' }}"
             fi
+            for _ in {1..30}; do
+              if npm view "$name@$version" version >/dev/null 2>&1; then
+                remote="$(mktemp -d)"
+                npm pack "$name@$version" --pack-destination "$remote"
+                python3 scripts/release/artifact_manifest.py compare-npm --local "$tarball" --remote "$(find "$remote" -name '*.tgz' -print -quit)"
+                return
+              fi
+              sleep 2
+            done
+            return 1
           }
-          for dir in npm/*/; do publish_pkg "$dir"; done
-          publish_pkg .
-
+          shopt -s nullglob
+          platform_tarballs=(bundle/npm/*linux-*.tgz bundle/npm/*darwin-*.tgz bundle/npm/*win32-*.tgz)
+          test "${#platform_tarballs[@]}" -eq 6
+          for file in "${platform_tarballs[@]}"; do publish "$file"; done
+          root_tarballs=(bundle/npm/nodedb-lab-code2graph-*.tgz)
+          roots=()
+          for file in "${root_tarballs[@]}"; do [[ "$file" == *linux-* || "$file" == *darwin-* || "$file" == *win32-* ]] || roots+=("$file"); done
+          test "${#roots[@]}" -eq 1
+          publish "${roots[0]}"
   github-release:
-    name: GitHub release
-    needs: [validate-version, publish-crates, publish-pypi, publish-npm]
+    needs: [validate, provenance]
+    if: inputs.github
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      actions: read
     steps:
-      - uses: softprops/action-gh-release@v2
+      - uses: actions/download-artifact@v8
         with:
-          generate_release_notes: true
-          prerelease: ${{ needs.validate-version.outputs.is_prerelease == 'true' }}
+          name: ${{ needs.provenance.outputs.artifact }}
+          run-id: ${{ inputs.prepare_run_id }}
+          github-token: ${{ github.token }}
+          path: bundle
+      - name: Create or update exact GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          VERSION: ${{ needs.validate.outputs.version }}
+          PRERELEASE: ${{ needs.validate.outputs.is_prerelease }}
+          SHA: ${{ needs.validate.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(find bundle -type f | sort)
+          test "${#files[@]}" -eq 16
+          prerelease_flag=()
+          test "$PRERELEASE" = true && prerelease_flag=(--prerelease)
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            edit_flags=(--title "code2graph $VERSION" --target "$SHA" "--prerelease=$PRERELEASE")
+            test "$PRERELEASE" = false && edit_flags+=(--latest)
+            gh release edit "$TAG" "${edit_flags[@]}"
+          else
+            gh release create "$TAG" "${files[@]}" --verify-tag --target "$SHA" --title "code2graph $VERSION" --generate-notes "${prerelease_flag[@]}"
+          fi
+          mapfile -t expected < <(printf '%s\n' "${files[@]##*/}" | sort)
+          while IFS=$'\t' read -r id name; do
+            if ! printf '%s\n' "${expected[@]}" | grep -Fxq "$name"; then
+              gh api --method DELETE "/repos/$GITHUB_REPOSITORY/releases/assets/$id"
+            fi
+          done < <(gh api "/repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq '.assets[] | [.id,.name] | @tsv')
+          gh release upload "$TAG" "${files[@]}" --clobber
+          release_json="$(gh api "/repos/$GITHUB_REPOSITORY/releases/tags/$TAG")"
+          test "$(jq -r .tag_name <<<"$release_json")" = "$TAG"
+          test "$(jq -r .target_commitish <<<"$release_json")" = "$SHA"
+          test "$(jq -r .prerelease <<<"$release_json")" = "$PRERELEASE"
+          mapfile -t actual < <(jq -r '.assets[].name' <<<"$release_json" | sort)
+          test "${actual[*]}" = "${expected[*]}" || { echo "GitHub release attachment set mismatch" >&2; exit 1; }

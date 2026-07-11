@@ -1,0 +1,270 @@
+# SPDX-License-Identifier: Apache-2.0
+name: Release Prepare
+run-name: Release Prepare ${{ github.ref_name }}
+on:
+  push:
+    tags: ["v*"]
+concurrency:
+  group: release-prepare-${{ github.ref_name }}
+  cancel-in-progress: false
+permissions:
+  contents: read
+jobs:
+  validate:
+    uses: ./.github/workflows/release-validate.yml
+    with:
+      tag: ${{ github.ref_name }}
+  ci:
+    needs: validate
+    uses: ./.github/workflows/test.yml
+    with:
+      skip_bindings: true
+      source_ref: ${{ needs.validate.outputs.source_sha }}
+  python-sdist:
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.validate.outputs.source_sha }}
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: python3 scripts/release/version_contract.py stamp "${{ needs.validate.outputs.version }}" --destination release-source
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist -m release-source/bindings/python/Cargo.toml
+      - uses: actions/upload-artifact@v7
+        with:
+          name: python-sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+  python-wheel:
+    needs: validate
+    name: Python wheel (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            manylinux: auto
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            manylinux: auto
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            manylinux: musllinux_1_2
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            manylinux: auto
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            manylinux: auto
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            manylinux: auto
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.validate.outputs.source_sha }}
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: python3 scripts/release/version_contract.py stamp "${{ needs.validate.outputs.version }}" --destination release-source
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --out dist -m release-source/bindings/python/Cargo.toml
+          docker-options: ${{ contains(matrix.target, 'linux') && '-e CFLAGS=-std=gnu11' || '' }}
+      - name: Validate Python package metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import glob, zipfile
+          wheel, = glob.glob("dist/*.whl")
+          with zipfile.ZipFile(wheel) as archive:
+              metadata = next(name for name in archive.namelist() if name.endswith(".dist-info/METADATA"))
+              text = archive.read(metadata).decode()
+          assert "Name: code2graph-rs\n" in text
+          assert "Version: ${{ needs.validate.outputs.python_version }}\n" in text
+          PY
+      - name: Smoke host wheel and GraphIndex
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m venv smoke
+          . smoke/bin/activate
+          pip install dist/*.whl
+          python -c "import code2graph; assert code2graph.language_of('x.rs'); assert code2graph.GraphIndex({'symbols': [], 'edges': []})"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: python-${{ matrix.target }}
+          path: dist/*.whl
+          if-no-files-found: error
+  node-addon:
+    needs: validate
+    name: Node addon (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            cross: true
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            zig: true
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.validate.outputs.source_sha }}
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: python3 scripts/release/version_contract.py stamp "${{ needs.validate.outputs.version }}" --destination release-source
+      - if: matrix.cross
+        run: npm install -g @napi-rs/cross-toolchain
+      - if: matrix.zig
+        run: pip install ziglang && cargo install --locked cargo-zigbuild
+      - working-directory: release-source/bindings/node
+        env:
+          CFLAGS: ${{ !contains(matrix.target, 'windows') && '-std=gnu11' || '' }}
+        run: |
+          npm ci
+          npx napi build --platform --release --target ${{ matrix.target }} ${{ matrix.cross && '--use-napi-cross' || '' }} ${{ matrix.zig && '-x' || '' }}
+          npm run harden-loader
+          npm run harden-types
+      - if: matrix.target == 'x86_64-unknown-linux-gnu'
+        working-directory: release-source/bindings/node
+        run: npm test
+      - uses: actions/upload-artifact@v7
+        with:
+          name: node-${{ matrix.target }}
+          path: release-source/bindings/node/*.node
+          if-no-files-found: error
+  bundle:
+    needs: [validate, ci, python-sdist, python-wheel, node-addon]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.validate.outputs.source_sha }}
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+      - run: python3 scripts/release/version_contract.py stamp "${{ needs.validate.outputs.version }}" --destination release-source
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: python-*
+          path: bundle/python
+          merge-multiple: true
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: node-*
+          path: release-source/bindings/node/artifacts
+          merge-multiple: true
+      - name: Assemble and smoke exact npm packages
+        working-directory: release-source/bindings/node
+        shell: bash
+        run: |
+          set -euo pipefail
+          BUNDLE_NPM="$GITHUB_WORKSPACE/bundle/npm"
+          mkdir -p "$BUNDLE_NPM"
+          npm ci
+          expected=(
+            code2graph-node.linux-x64-gnu.node
+            code2graph-node.linux-arm64-gnu.node
+            code2graph-node.linux-x64-musl.node
+            code2graph-node.darwin-x64.node
+            code2graph-node.darwin-arm64.node
+            code2graph-node.win32-x64-msvc.node
+          )
+          mapfile -t actual < <(find artifacts -maxdepth 1 -type f -name '*.node' -printf '%f\n' | sort)
+          mapfile -t wanted < <(printf '%s\n' "${expected[@]}" | sort)
+          test "${actual[*]}" = "${wanted[*]}" || { printf 'unexpected native set: %s\n' "${actual[*]}" >&2; exit 1; }
+          npx napi create-npm-dirs --npm-dir ./npm
+          npx napi artifacts --output-dir ./artifacts --npm-dir ./npm
+          npm run harden-loader
+          npm run harden-types
+          npx napi prepublish -t npm --npm-dir ./npm --skip-optional-publish
+          npm test
+          npm pack --pack-destination "$BUNDLE_NPM"
+          for directory in npm/*; do npm pack "$directory" --pack-destination "$BUNDLE_NPM"; done
+          ROOT_TARBALL="$(find "$BUNDLE_NPM" -maxdepth 1 -name 'nodedb-lab-code2graph-*.tgz' ! -name '*linux-*' ! -name '*darwin-*' ! -name '*win32-*' -print -quit)"
+          HOST_TARBALL="$(find "$BUNDLE_NPM" -maxdepth 1 -name '*linux-x64-gnu*.tgz' -print -quit)"
+          test -n "$ROOT_TARBALL" && test -n "$HOST_TARBALL"
+          test "$(find "$BUNDLE_NPM" -maxdepth 1 -name '*.tgz' | wc -l)" -eq 7
+          mkdir smoke
+          cd smoke
+          npm init -y
+          npm install "$HOST_TARBALL" "$ROOT_TARBALL"
+          node -e "const core=require('@nodedb-lab/code2graph'); if (!core.languageOf('x.rs')) process.exit(1)"
+      - name: Run host Python query suite against prepared wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv python-smoke
+          . python-smoke/bin/activate
+          pip install bundle/python/*manylinux*x86_64.whl
+          python -m unittest discover -s release-source/bindings/python/tests -p 'test_*.py'
+      - name: Run full Pi suite against exact packed native packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          BUNDLE_NPM="$GITHUB_WORKSPACE/bundle/npm"
+          ROOT_TARBALL="$(find "$BUNDLE_NPM" -maxdepth 1 -name 'nodedb-lab-code2graph-*.tgz' ! -name '*linux-*' ! -name '*darwin-*' ! -name '*win32-*' -print -quit)"
+          HOST_TARBALL="$(find "$BUNDLE_NPM" -maxdepth 1 -name '*linux-x64-gnu*.tgz' -print -quit)"
+          export CODE2GRAPH_CORE_TARBALL="$ROOT_TARBALL"
+          export CODE2GRAPH_CORE_PLATFORM_TARBALL="$HOST_TARBALL"
+          cd release-source/bindings/pi
+          npm install --no-save --package-lock=false "$ROOT_TARBALL" "$HOST_TARBALL" ignore tsx typescript @types/node @earendil-works/pi-ai @earendil-works/pi-coding-agent @earendil-works/pi-tui
+          npm install --global @earendil-works/pi-coding-agent@latest
+          npm run test:all
+      - name: Create canonical manifest and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd bundle
+          files=()
+          while IFS= read -r file; do files+=(--file "$file"); done < <(find python npm -type f -printf '%p\n' | sort)
+          python3 ../scripts/release/artifact_manifest.py create --directory . --output release-manifest.json --repository "$GITHUB_REPOSITORY" --tag "$GITHUB_REF_NAME" --source-sha "${{ needs.validate.outputs.source_sha }}" --prepare-run-id "$GITHUB_RUN_ID" --workflow release-prepare.yml --version "${{ needs.validate.outputs.version }}" "${files[@]}"
+          mapfile -t checksum_files < <(find python npm -type f | sort)
+          sha256sum release-manifest.json "${checksum_files[@]}" > SHA256SUMS
+          python3 ../scripts/release/artifact_manifest.py verify --directory . --manifest release-manifest.json --repository "$GITHUB_REPOSITORY" --tag "$GITHUB_REF_NAME" --source-sha "${{ needs.validate.outputs.source_sha }}" --prepare-run-id "$GITHUB_RUN_ID" --workflow release-prepare.yml --version "${{ needs.validate.outputs.version }}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-bundle-${{ needs.validate.outputs.version }}
+          path: bundle
+          retention-days: 14
+          if-no-files-found: error
+  summary:
+    needs: [validate, bundle]
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          {
+            echo "## Prepared ${{ github.ref_name }}"
+            echo "Source: \`${{ needs.validate.outputs.source_sha }}\`; bundle: \`release-bundle-${{ needs.validate.outputs.version }}\` (14 days)."
+            echo "\`gh workflow run release.yml -f tag=${{ github.ref_name }} -f prepare_run_id=${{ github.run_id }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

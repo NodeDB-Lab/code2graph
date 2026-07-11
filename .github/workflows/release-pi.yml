@@ -50,7 +50,7 @@ jobs:
           set -euo pipefail
           node bindings/pi/scripts/stage-release.mjs validate "$CORE_VERSION" core_version
           node bindings/pi/scripts/stage-release.mjs validate "$PI_VERSION" pi_version
-          SOURCE_SHA="$(git rev-parse --verify HEAD^{commit})"
+          SOURCE_SHA="$(git rev-parse --verify "HEAD^{commit}")"
           printf 'SOURCE_SHA=%s\nCORE_VERSION=%s\nPI_VERSION=%s\nPI_TAG=pi-v%s\n' "$SOURCE_SHA" "$CORE_VERSION" "$PI_VERSION" "$PI_VERSION" >> "$GITHUB_ENV"
       - name: Confirm exact native package exists
         shell: bash
@@ -137,7 +137,7 @@ jobs:
           fi
 
           registry_version=
-          for attempt in {1..30}; do
+          for _ in {1..30}; do
             registry_version="$(npm view "$NAME@$PI_VERSION" version 2>/dev/null || true)"
             test "$registry_version" = "$PI_VERSION" && break
             sleep 2

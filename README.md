@@ -200,6 +200,18 @@ Building something on code2graph? Open a [Discussion](https://github.com/nodedb-
 
 Contributions are welcome — especially **new languages** and **resolution-quality improvements**. Start with [CONTRIBUTING.md](CONTRIBUTING.md): it covers the architecture and invariants, the language-adding recipe, what to do when a language has **no usable tree-sitter grammar**, the resolver tiers, and how to validate changes against the eval harness. By participating you agree to the [Code of Conduct](CODE_OF_CONDUCT.md).
 
+## Release operation
+
+Pushing an immutable `vX.Y.Z` (or `vX.Y.Z-alpha.N`, `-beta.N`, `-rc.N`) tag runs **Release Prepare**. It validates and tests the tag, builds each native package once, and retains the checksummed bundle for 14 days. It publishes nothing.
+
+Distribute that exact bundle manually after Prepare succeeds. The manual workflow checks the successful Prepare run's tag, source SHA, workflow identity, manifest, checksums, and complete file set before any registry or GitHub publication:
+
+```sh
+gh workflow run release.yml -f tag=vX.Y.Z -f prepare_run_id=PREPARE_RUN_ID
+```
+
+The optional `distribution_ref` is only for a distribution-workflow/helper fix; the source and prepared artifacts remain bound to the tag. To retry a failed registry or GitHub stage, dispatch the same command and disable every completed toggle (`crates`, `pypi`, `npm`, `github`). Do not rerun Prepare for a distribution failure. If the bundle expires, rerun Prepare for the same immutable tag and use its new run ID. A package already present with different content fails closed.
+
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).

@@ -32,7 +32,9 @@ test("packed package loads through Pi and scans a fixture without consumer tsx",
     const tarball = suppliedPackage || path.join(stage, run("node", ["-e", "const fs=require('fs');console.log(fs.readdirSync('.').find(x=>x.startsWith('nodedb-lab-pi-code2graph-')&&x.endsWith('.tgz')))"], stage).trim());
     run("tar", ["-xzf", tarball, "-C", packageDir, "--strip-components=1"], stage);
     const core = suppliedCore || path.join(coreDir, run("node", ["-e", "const fs=require('fs');console.log(fs.readdirSync('.').find(x=>x.endsWith('.tgz')))"], coreDir).trim());
-    run("npm", ["install", "--omit=dev", "--package-lock=false", core], packageDir);
+    const platform = process.env.CODE2GRAPH_CORE_PLATFORM_TARBALL;
+    const packages = platform ? [core, platform] : [core];
+    run("npm", ["install", "--omit=dev", "--package-lock=false", ...packages], packageDir);
     await writeFile(path.join(fixture, "tiny.rs"), "pub fn answer() -> u32 { 42 }\n");
     const output = await rpcScan(packageDir, fixture, config);
     assert.match(output, /"success":true/);
