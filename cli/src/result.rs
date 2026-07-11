@@ -4,6 +4,9 @@ use code2graph::{Confidence, Provenance, RefRole, SymbolId, SymbolKind, TypeRefC
 use serde::{Deserialize, Serialize};
 
 use crate::config::ResolverTier;
+use crate::inventory::{
+    InventoryCompleteness, InventorySummary, OmissionReason, StableIoErrorKind,
+};
 
 /// The first version of the stable JSON output envelope.
 pub const OUTPUT_SCHEMA_VERSION: u32 = 1;
@@ -281,10 +284,138 @@ pub struct ModuleDependencyOutput {
     pub evidence: Vec<RelationOutput>,
 }
 
-/// Cache/project information returned by `status`.
+/// Stable inventory completeness spelling in status output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum InventoryCompletenessOutput {
+    Complete,
+    Partial,
+}
+
+impl From<InventoryCompleteness> for InventoryCompletenessOutput {
+    fn from(value: InventoryCompleteness) -> Self {
+        match value {
+            InventoryCompleteness::Complete => Self::Complete,
+            InventoryCompleteness::Partial => Self::Partial,
+        }
+    }
+}
+
+/// A typed, stable inventory omission reason.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum InventoryOmissionReasonOutput {
+    UnrecognizedExtension,
+    FeatureDisabled { language: String },
+    SymlinkFile,
+    SymlinkDirectory,
+    NotRegularFile,
+    FileTooLarge { limit: usize },
+    TotalBytesLimit { limit: usize },
+    FileCountLimit { limit: usize },
+    InvalidUtf8,
+    ChangedDuringRead,
+    ReadError { error: StableIoErrorOutput },
+}
+
+impl From<&OmissionReason> for InventoryOmissionReasonOutput {
+    fn from(value: &OmissionReason) -> Self {
+        match value {
+            OmissionReason::UnrecognizedExtension => Self::UnrecognizedExtension,
+            OmissionReason::FeatureDisabled { language } => Self::FeatureDisabled {
+                language: language.as_str().to_owned(),
+            },
+            OmissionReason::SymlinkFile => Self::SymlinkFile,
+            OmissionReason::SymlinkDirectory => Self::SymlinkDirectory,
+            OmissionReason::NotRegularFile => Self::NotRegularFile,
+            OmissionReason::FileTooLarge { limit } => Self::FileTooLarge { limit: *limit },
+            OmissionReason::TotalBytesLimit { limit } => Self::TotalBytesLimit { limit: *limit },
+            OmissionReason::FileCountLimit { limit } => Self::FileCountLimit { limit: *limit },
+            OmissionReason::InvalidUtf8 => Self::InvalidUtf8,
+            OmissionReason::ChangedDuringRead => Self::ChangedDuringRead,
+            OmissionReason::ReadError { kind } => Self::ReadError {
+                error: (*kind).into(),
+            },
+        }
+    }
+}
+
+/// Stable platform-neutral I/O error kind in inventory output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StableIoErrorOutput {
+    NotFound,
+    PermissionDenied,
+    AlreadyExists,
+    InvalidInput,
+    InvalidData,
+    TimedOut,
+    Interrupted,
+    UnexpectedEof,
+    WouldBlock,
+    WriteZero,
+    Other,
+}
+
+impl From<StableIoErrorKind> for StableIoErrorOutput {
+    fn from(value: StableIoErrorKind) -> Self {
+        match value {
+            StableIoErrorKind::NotFound => Self::NotFound,
+            StableIoErrorKind::PermissionDenied => Self::PermissionDenied,
+            StableIoErrorKind::AlreadyExists => Self::AlreadyExists,
+            StableIoErrorKind::InvalidInput => Self::InvalidInput,
+            StableIoErrorKind::InvalidData => Self::InvalidData,
+            StableIoErrorKind::TimedOut => Self::TimedOut,
+            StableIoErrorKind::Interrupted => Self::Interrupted,
+            StableIoErrorKind::UnexpectedEof => Self::UnexpectedEof,
+            StableIoErrorKind::WouldBlock => Self::WouldBlock,
+            StableIoErrorKind::WriteZero => Self::WriteZero,
+            StableIoErrorKind::Other => Self::Other,
+        }
+    }
+}
+
+/// One typed omission-reason count, in stable reason-tag order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InventoryReasonCountOutput {
+    pub reason: InventoryOmissionReasonOutput,
+    pub count: usize,
+}
+
+/// Typed aggregate inventory status returned by `status`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InventorySummaryOutput {
+    pub completeness: InventoryCompletenessOutput,
+    pub admitted_files: usize,
+    pub admitted_bytes: usize,
+    pub omitted_files: usize,
+    pub omission_reasons: Vec<InventoryReasonCountOutput>,
+}
+
+impl InventorySummaryOutput {
+    pub fn new(completeness: InventoryCompleteness, summary: &InventorySummary) -> Self {
+        Self {
+            completeness: completeness.into(),
+            admitted_files: summary.admitted_files,
+            admitted_bytes: summary.admitted_bytes,
+            omitted_files: summary.omitted_files,
+            omission_reasons: summary
+                .omission_reasons
+                .iter()
+                .map(|(reason, count)| InventoryReasonCountOutput {
+                    reason: reason.into(),
+                    count: *count,
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Cache/project and inventory information returned by `status`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatusOutput {
     pub project: ProjectOutput,
+    pub inventory: InventorySummaryOutput,
     pub max_files: usize,
     pub max_file_bytes: usize,
     pub max_total_bytes: usize,
@@ -398,6 +529,29 @@ mod tests {
             })
             .unwrap(),
             r#"{"kind":"file","file":"src/lib.rs"}"#
+        );
+    }
+
+    #[test]
+    fn inventory_summary_has_a_typed_stable_json_contract() {
+        let summary = InventorySummary {
+            admitted_files: 2,
+            admitted_bytes: 17,
+            omitted_files: 2,
+            omission_reasons: vec![
+                (OmissionReason::FileTooLarge { limit: 8 }, 1),
+                (
+                    OmissionReason::ReadError {
+                        kind: StableIoErrorKind::PermissionDenied,
+                    },
+                    1,
+                ),
+            ],
+        };
+        let output = InventorySummaryOutput::new(InventoryCompleteness::Partial, &summary);
+        assert_eq!(
+            serde_json::to_string(&output).unwrap(),
+            r#"{"completeness":"partial","admitted_files":2,"admitted_bytes":17,"omitted_files":2,"omission_reasons":[{"reason":{"kind":"file-too-large","limit":8},"count":1},{"reason":{"kind":"read-error","error":"permission-denied"},"count":1}]}"#
         );
     }
 }

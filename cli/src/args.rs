@@ -581,8 +581,17 @@ mod tests {
 
     #[test]
     fn global_flags_work_after_commands_and_frozen_index_is_still_rejected() {
-        let request = parse_from(["code2graph", "status", "--json", "--tier", "dense"]).unwrap();
+        let request = parse_from([
+            "code2graph",
+            "status",
+            "--json",
+            "--tier",
+            "dense",
+            "--include-hidden",
+        ])
+        .unwrap();
         assert!(request.global.json);
+        assert!(request.global.include_hidden);
         assert_eq!(request.global.tier, ResolverTier::Dense);
         assert!(parse_from(["code2graph", "index", "--frozen"]).is_err());
     }

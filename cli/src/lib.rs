@@ -6,6 +6,7 @@ pub mod args;
 pub mod config;
 pub mod error;
 pub mod exit;
+pub mod inventory;
 pub mod project;
 pub mod request;
 pub mod result;
@@ -17,12 +18,17 @@ pub use config::{
 };
 pub use error::{CliError, Result};
 pub use exit::ExitCode;
+pub use inventory::{
+    FileClassification, InventoryCompleteness, InventoryFile, InventorySummary, MtimeHint,
+    OmissionReason, OmittedFile, SourceInventory, StableIoErrorKind, build_inventory,
+};
 pub use project::{ProjectPath, ProjectSelection, SelectionProvenance, select_project};
 pub use request::{CliRequest, CommandRequest, Selector, SourcePosition};
 pub use result::{
     CacheDisposition, ConfidenceOutput, ErrorEnvelope, Freshness, ImpactOutput,
-    ModuleDependencyOutput, ModuleDependencyTargetOutput, OUTPUT_SCHEMA_VERSION, OccurrenceOutput,
-    OutputEnvelope, OutputStatus, ProjectOutput, ProvenanceOutput, RefRoleOutput, ReferenceOutput,
-    RelationOutput, SelectorOutput, StatusOutput, SymbolKindOutput, SymbolOutput,
-    TypeRefContextOutput,
+    InventoryCompletenessOutput, InventoryOmissionReasonOutput, InventoryReasonCountOutput,
+    InventorySummaryOutput, ModuleDependencyOutput, ModuleDependencyTargetOutput,
+    OUTPUT_SCHEMA_VERSION, OccurrenceOutput, OutputEnvelope, OutputStatus, ProjectOutput,
+    ProvenanceOutput, RefRoleOutput, ReferenceOutput, RelationOutput, SelectorOutput,
+    StableIoErrorOutput, StatusOutput, SymbolKindOutput, SymbolOutput, TypeRefContextOutput,
 };
