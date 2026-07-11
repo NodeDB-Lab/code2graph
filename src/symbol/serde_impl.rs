@@ -53,7 +53,10 @@ impl<'de> serde::Deserialize<'de> for SymbolId {
                         w.version
                     )));
                 }
-                SymbolId::from_wire(&w.scip, w.lang, w.file).map_err(serde::de::Error::custom)
+
+                let parsed =
+                    SymbolId::from_scip_string(&w.scip).map_err(serde::de::Error::custom)?;
+                SymbolId::from_wire(parsed, w.lang, w.file).map_err(serde::de::Error::custom)
             }
         }
     }
@@ -73,6 +76,53 @@ mod tests {
                 .to_scip_string(),
             id.to_scip_string()
         );
+    }
+
+    #[test]
+    fn versioned_wire_round_trips_global_and_local_identity() {
+        let global = SymbolId::global("rust", vec![Descriptor::Term("run".into())]);
+        let local = SymbolId::local("src/main.rs", "x0");
+
+        for id in [global, local] {
+            let json = serde_json::to_string(&id).unwrap();
+            let restored: SymbolId = serde_json::from_str(&json).unwrap();
+            assert_eq!(restored, id);
+        }
+    }
+
+    #[test]
+    fn versioned_wire_rejects_invalid_coordinate_combinations() {
+        let cases = [
+            (
+                r#"{"version":1,"scip":"codegraph . . . run."}"#,
+                "global SymbolId wire requires lang",
+            ),
+            (
+                r#"{"version":1,"scip":"codegraph . . . run.","file":"src/main.rs"}"#,
+                "global SymbolId wire requires lang",
+            ),
+            (
+                r#"{"version":1,"scip":"codegraph . . . run.","lang":"rust","file":"src/main.rs"}"#,
+                "global SymbolId wire requires lang",
+            ),
+            (
+                r#"{"version":1,"scip":"local x0"}"#,
+                "local SymbolId wire requires file",
+            ),
+            (
+                r#"{"version":1,"scip":"local x0","lang":"rust"}"#,
+                "local SymbolId wire requires file",
+            ),
+            (
+                r#"{"version":1,"scip":"local x0","lang":"rust","file":"src/main.rs"}"#,
+                "local SymbolId wire requires file",
+            ),
+        ];
+
+        for (json, expected) in cases {
+            let error = serde_json::from_str::<SymbolId>(json).unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+        }
     }
 
     #[test]

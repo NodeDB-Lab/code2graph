@@ -4,8 +4,9 @@
 //!
 //! A symbol's identity is a sequence of descriptors that together form a fully
 //! qualified name, following Sourcegraph's SCIP grammar. Each descriptor kind
-//! renders with a distinct suffix so the joined string is unambiguous and
-//! cross-file matching is string equality (no separate resolution join).
+//! renders with a distinct suffix so the joined string is unambiguous; the
+//! rendered SCIP string is for display/interoperability, while structural
+//! identity lives in `SymbolId`'s language/local-file coordinates.
 //!
 //! Grammar (subset we emit), from `scip.proto`:
 //! ```text

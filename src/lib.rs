@@ -24,9 +24,9 @@
 //!
 //! ## Design
 //!
-//! - **Identity** ([`symbol`]) is SCIP-aligned: a symbol is a descriptor path
-//!   rendering to a stable, human-readable string, so cross-file matching is
-//!   string equality.
+//! - **Identity** ([`symbol`]) is SCIP-aligned: structural [`SymbolId`] equality
+//!   includes language/local-file coordinates, while its stable human-readable
+//!   SCIP rendering is display/interoperability only.
 //! - **Resolution** ([`resolve`]) is a tier seam: the fast recall-first
 //!   [`SymbolTableResolver`] (name matching, all languages, `NameOnly` edges) and
 //!   the precise scope-aware [`ScopeGraphResolver`] (lexical-scope + import +
@@ -63,13 +63,13 @@ pub mod symbol;
 pub use error::{CodegraphError, Result};
 pub use extract::{Extractor, extract_file, extract_path};
 pub use graph::{
-    Binding, BindingKind, BindingTarget, ByteSpan, CodeGraph, Confidence, Edge, EntryPoint, FfiAbi,
-    FfiExport, FileFacts, Occurrence, Provenance, RefRole, Reference, Scope, ScopeId, ScopeKind,
-    Symbol, SymbolKind, TypeRefContext, Visibility, validate_file_facts,
+    Binding, BindingKind, BindingTarget, ByteSpan, CodeGraph, Confidence, Edge, EdgeKey,
+    EntryPoint, FfiAbi, FfiExport, FileFacts, Occurrence, Provenance, RefRole, Reference, Scope,
+    ScopeId, ScopeKind, Symbol, SymbolKind, TypeRefContext, Visibility, validate_file_facts,
 };
 pub use lang::Language;
 pub use resolve::{
-    FfiBridgeResolver, FileSubgraph, IncrementalGraph, LayeredResolver, Resolver,
-    ScopeGraphResolver, SymbolTableResolver,
+    FILE_SUBGRAPH_SCHEMA_VERSION, FfiBridgeResolver, FileSubgraph, IncrementalGraph,
+    LayeredResolver, Resolver, ScopeGraphResolver, SymbolTableResolver,
 };
 pub use symbol::{Descriptor, Package, SymbolId};

@@ -21,7 +21,7 @@ use crate::error::{CodegraphError, Result};
 use crate::graph::types::{CodeGraph, FileFacts};
 
 use super::stitch::{GlobalIndex, stitch};
-use super::subgraph::{FileSubgraph, build_subgraph};
+use super::subgraph::{FILE_SUBGRAPH_SCHEMA_VERSION, FileSubgraph, build_subgraph};
 
 /// Incremental Tier-B resolution store. Holds one isolated subgraph per file
 /// plus a global definition index, so re-extracting a single changed file
@@ -134,7 +134,7 @@ impl IncrementalGraph {
             file: file.clone(),
             reason,
         };
-        if sub.schema_version != 1 {
+        if sub.schema_version != FILE_SUBGRAPH_SCHEMA_VERSION {
             return Err(invalid(format!(
                 "unsupported subgraph schema {}",
                 sub.schema_version
@@ -214,35 +214,32 @@ impl Default for IncrementalGraph {
 mod tests {
     use super::*;
     use crate::extract::{Extractor, PythonExtractor, RustExtractor};
-    use crate::graph::types::{CodeGraph, Edge};
+    use crate::graph::types::{CodeGraph, Confidence, Edge, EdgeKey};
     use crate::resolve::{Resolver, ScopeGraphResolver, SymbolTableResolver};
 
-    /// Stable per-edge key: source/target SCIP ids, role, confidence, and the
-    /// occurrence byte. Captures everything that distinguishes one edge fact.
-    fn edge_key(e: &Edge) -> (String, String, String, String, usize) {
-        (
-            e.from.to_scip_string(),
-            e.to.to_scip_string(),
-            format!("{:?}", e.role),
-            format!("{:?}", e.confidence),
-            e.occ.byte,
-        )
+    /// Stable per-edge key: structural edge identity plus its confidence.
+    fn edge_key(e: &Edge) -> (EdgeKey, Confidence) {
+        (e.key(), e.confidence)
+    }
+
+    fn counts<K: Eq + std::hash::Hash>(keys: impl IntoIterator<Item = K>) -> HashMap<K, usize> {
+        let mut counts = HashMap::new();
+        for key in keys {
+            *counts.entry(key).or_default() += 1;
+        }
+        counts
     }
 
     /// Assert two graphs are equal as MULTISETS (order-independent): batch
     /// concatenates in input order, the store in sorted-key order, so positional
-    /// comparison would be wrong. Symbols compare by SCIP id, edges by `edge_key`.
+    /// comparison would be wrong. Symbols and edges use structural identity.
     fn assert_multiset_eq(a: &CodeGraph, b: &CodeGraph) {
-        let mut a_syms: Vec<String> = a.symbols.iter().map(|s| s.id.to_scip_string()).collect();
-        let mut b_syms: Vec<String> = b.symbols.iter().map(|s| s.id.to_scip_string()).collect();
-        a_syms.sort();
-        b_syms.sort();
+        let a_syms = counts(a.symbols.iter().map(|s| s.id.clone()));
+        let b_syms = counts(b.symbols.iter().map(|s| s.id.clone()));
         assert_eq!(a_syms, b_syms, "symbol multisets differ");
 
-        let mut a_edges: Vec<_> = a.edges.iter().map(edge_key).collect();
-        let mut b_edges: Vec<_> = b.edges.iter().map(edge_key).collect();
-        a_edges.sort();
-        b_edges.sort();
+        let a_edges = counts(a.edges.iter().map(edge_key));
+        let b_edges = counts(b.edges.iter().map(edge_key));
         assert_eq!(a_edges, b_edges, "edge multisets differ");
     }
 

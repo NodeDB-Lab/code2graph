@@ -33,15 +33,14 @@ pub fn enrich(facts: &mut FileFacts, package: &Package) {
 /// resolved [`CodeGraph`].
 ///
 /// Unlike [`enrich`] (which operates on a single file's facts before
-/// resolution), a `CodeGraph`'s edges reference symbols *by* their `SymbolId`,
-/// so identity is matched by SCIP-string equality. This pass therefore rewrites
-/// all three id-bearing slots consistently:
+/// resolution), a `CodeGraph`'s edges reference symbols *by* their structural
+/// `SymbolId`. This pass therefore rewrites all three id-bearing slots consistently:
 /// - `graph.symbols[*].id`
 /// - `graph.edges[*].from`
 /// - `graph.edges[*].to`
 ///
 /// Both endpoints of every edge get the *same* package as the symbols they
-/// point at, so string-equality matching is preserved (no edge is broken).
+/// point at, so structural identity relationships are preserved (no edge is broken).
 /// `Local` ids are left unchanged by [`SymbolId::with_package`](crate::symbol::SymbolId::with_package)
 /// — locals have no cross-repo coordinate — which is correct.
 pub fn enrich_codegraph(graph: &mut CodeGraph, package: &Package) {

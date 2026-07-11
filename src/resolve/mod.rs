@@ -27,7 +27,7 @@ pub mod symbol_table;
 pub use conformance::ConformanceResolver;
 pub use external::ExternalResolver;
 pub use ffi_bridge::FfiBridgeResolver;
-pub use incremental::{FileSubgraph, IncrementalGraph};
+pub use incremental::{FILE_SUBGRAPH_SCHEMA_VERSION, FileSubgraph, IncrementalGraph};
 pub use layered::LayeredResolver;
 pub use normalized_name::NormalizedNameResolver;
 pub use resolver::Resolver;

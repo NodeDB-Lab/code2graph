@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::graph::types::{CodeGraph, Confidence, Edge, FileFacts, Provenance, RefRole, Symbol};
+use crate::graph::types::{CodeGraph, Confidence, Edge, FileFacts, RefRole, Symbol};
 
 use super::{
     ConformanceResolver, ExternalResolver, FfiBridgeResolver, NormalizedNameResolver, Resolver,
@@ -18,7 +18,7 @@ use super::{
 /// outputs into a single [`CodeGraph`].
 ///
 /// **Symbol dedup**: symbols that appear in multiple layers are deduplicated by
-/// their SCIP identity string (`SymbolId::to_scip_string`); the first occurrence
+/// structural [`SymbolId`](crate::symbol::SymbolId) identity; the first occurrence
 /// wins and insertion order is preserved.
 ///
 /// **Edge dedup**: edges sharing the same `(from, to, role, file, byte)` key are
@@ -94,7 +94,7 @@ impl Resolver for LayeredResolver {
         // `Occurrence` is `Eq` but not `Hash`, so we decompose it by hand.
         // `RefRole` is `Hash + Eq`; `Provenance` is `Hash + Eq`.
 
-        type EdgeKey = (
+        type ResolutionKey = (
             crate::symbol::SymbolId,
             crate::symbol::SymbolId,
             RefRole,
@@ -105,7 +105,7 @@ impl Resolver for LayeredResolver {
         // Flatten all edges in layer order (layer 0 first) and compute each
         // edge's key once, shared across both passes.
         let all_edges: Vec<_> = graphs.iter().flat_map(|g| g.edges.iter()).collect();
-        let keys: Vec<EdgeKey> = all_edges
+        let keys: Vec<ResolutionKey> = all_edges
             .iter()
             .map(|e| {
                 (
@@ -119,7 +119,7 @@ impl Resolver for LayeredResolver {
             .collect();
 
         // Pass 1: find max Confidence per key.
-        let mut max_conf: HashMap<EdgeKey, Confidence> = HashMap::new();
+        let mut max_conf: HashMap<ResolutionKey, Confidence> = HashMap::new();
         for (key, e) in keys.iter().zip(all_edges.iter()) {
             if let Some(c) = max_conf.get_mut(key) {
                 *c = (*c).max(e.confidence);
@@ -131,7 +131,7 @@ impl Resolver for LayeredResolver {
         // Pass 2: iterate in original order; keep an edge iff:
         //   - its confidence equals the max for its key, AND
         //   - (key, provenance) has not already been emitted (exact-dupe guard).
-        let mut seen_key_prov: HashSet<(EdgeKey, Provenance)> = HashSet::new();
+        let mut seen_key_prov: HashSet<crate::graph::EdgeKey> = HashSet::new();
         let mut edges: Vec<Edge> = Vec::new();
         for (e, key) in all_edges.into_iter().zip(keys) {
             // Every key was inserted in pass 1; the `else` branch is unreachable
@@ -143,7 +143,7 @@ impl Resolver for LayeredResolver {
                 continue;
             }
             // Same confidence: keep each distinct provenance once.
-            if seen_key_prov.insert((key, e.provenance)) {
+            if seen_key_prov.insert(e.key()) {
                 edges.push(e.clone());
             }
         }
@@ -230,7 +230,7 @@ mod tests {
 
     /// A `LayeredResolver::default_dense()` is a superset of `ScopeGraphResolver`
     /// for the same inputs: every edge produced by `ScopeGraphResolver` (matched
-    /// by from/to SCIP string and role) also appears in the layered output.
+    /// by structural source/target identity and role) also appears in the layered output.
     #[test]
     fn layered_is_superset_of_scope_graph() {
         use crate::extract::{Extractor, RustExtractor};
@@ -248,17 +248,13 @@ mod tests {
         let layered = LayeredResolver::default_dense().resolve(&files).unwrap();
 
         for sg_edge in &scope_graph.edges {
-            let sg_from = sg_edge.from.to_scip_string();
-            let sg_to = sg_edge.to.to_scip_string();
             let found = layered.edges.iter().any(|le| {
-                le.from.to_scip_string() == sg_from
-                    && le.to.to_scip_string() == sg_to
-                    && le.role == sg_edge.role
+                le.from == sg_edge.from && le.to == sg_edge.to && le.role == sg_edge.role
             });
             assert!(
                 found,
                 "layered graph is missing ScopeGraph edge: {} → {} ({:?})",
-                sg_from, sg_to, sg_edge.role
+                sg_edge.from, sg_edge.to, sg_edge.role
             );
         }
     }
@@ -401,7 +397,7 @@ mod tests {
     // ── Test 4: symbol dedup ─────────────────────────────────────────────────
 
     /// Symbols that appear in multiple layers appear exactly once in the merged
-    /// output (deduplicated by SCIP identity string; first-seen wins).
+    /// output (deduplicated by structural identity; first-seen wins).
     #[test]
     fn symbols_with_matching_descriptors_in_different_languages_both_survive() {
         let rust = make_symbol("util", "helper");

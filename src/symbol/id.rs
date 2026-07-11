@@ -2,9 +2,10 @@
 
 //! `SymbolId` — SCIP-aligned symbol identity.
 //!
-//! A global symbol is `<scheme> <package> (<descriptor>)+`; its rendered string
-//! is a stable, human-readable, fully-qualified name, so two references resolve
-//! to the same symbol iff their strings are equal — no separate join pass.
+//! A global symbol is `<scheme> <package> (<descriptor>)+`; its rendered SCIP
+//! string is a stable, human-readable interoperability/display form. Structural
+//! [`SymbolId`] equality is identity: global language and local-file coordinates
+//! are intentionally retained even though SCIP does not render them.
 //!
 //! code2graph is build-free, so it often does **not** know the package
 //! (manager/name/version) at parse time. We still emit descriptors (the FQN
@@ -101,6 +102,16 @@ pub enum SymbolParseError {
     NoDescriptors,
 }
 
+/// Coordinate-combination errors in a versioned `SymbolId` wire value.
+#[cfg(feature = "serde")]
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum WireContextError {
+    #[error("global SymbolId wire requires lang and forbids file")]
+    Global,
+    #[error("local SymbolId wire requires file and forbids lang")]
+    Local,
+}
+
 /// A symbol's identity.
 ///
 /// Internally an `Arc` over a private representation, so cloning is O(1)
@@ -129,36 +140,65 @@ impl SymbolId {
         }))
     }
 
-    /// Identity coordinates omitted by SCIP's standard rendered form. Kept
-    /// crate-visible so serde can preserve structural identity without abusing
-    /// package coordinates or changing the required `codegraph` scheme.
-    pub(crate) fn wire_context(&self) -> (Option<&str>, Option<&str>) {
+    /// The language coordinate of a global symbol, or `None` for a local symbol.
+    /// This coordinate is structural identity and is not rendered by SCIP.
+    pub fn language(&self) -> Option<&str> {
         match &*self.0 {
-            SymbolRepr::Global { lang, .. } => (Some(lang), None),
-            SymbolRepr::Local { file, .. } => (None, Some(file)),
+            SymbolRepr::Global { lang, .. } => Some(lang),
+            SymbolRepr::Local { .. } => None,
         }
     }
 
+    /// The owning file coordinate of a local symbol, or `None` for a global symbol.
+    /// This coordinate is structural identity and is not rendered by SCIP.
+    pub fn local_file(&self) -> Option<&str> {
+        match &*self.0 {
+            SymbolRepr::Global { .. } => None,
+            SymbolRepr::Local { file, .. } => Some(file),
+        }
+    }
+
+    /// Identity coordinates omitted by SCIP's standard rendered form. Kept
+    /// crate-visible so serde can preserve structural identity without abusing
+    /// package coordinates or changing the required `codegraph` scheme.
+    #[cfg(feature = "serde")]
+    pub(crate) fn wire_context(&self) -> (Option<&str>, Option<&str>) {
+        (self.language(), self.local_file())
+    }
+
+    /// Apply the identity coordinates from a versioned wire value to a parsed
+    /// SCIP display string. Global symbols require `lang`; local symbols require
+    /// `file`; the other coordinate is rejected in each case.
+    #[cfg(feature = "serde")]
     pub(crate) fn from_wire(
-        scip: &str,
+        parsed: Self,
         lang: Option<String>,
         file: Option<String>,
-    ) -> Result<Self, SymbolParseError> {
-        let parsed = Self::from_scip_string(scip)?;
+    ) -> Result<Self, WireContextError> {
         match &*parsed.0 {
             SymbolRepr::Global {
                 scheme,
                 package,
                 descriptors,
                 ..
-            } => Ok(SymbolId(Arc::new(SymbolRepr::Global {
-                scheme: scheme.clone(),
-                package: package.clone(),
-                lang: lang.unwrap_or_default(),
-                descriptors: descriptors.clone(),
-            }))),
+            } => {
+                let lang = lang.ok_or(WireContextError::Global)?;
+                if file.is_some() {
+                    return Err(WireContextError::Global);
+                }
+                Ok(SymbolId(Arc::new(SymbolRepr::Global {
+                    scheme: scheme.clone(),
+                    package: package.clone(),
+                    lang,
+                    descriptors: descriptors.clone(),
+                })))
+            }
             SymbolRepr::Local { id, .. } => {
-                Ok(SymbolId::local(file.unwrap_or_default(), id.clone()))
+                let file = file.ok_or(WireContextError::Local)?;
+                if lang.is_some() {
+                    return Err(WireContextError::Local);
+                }
+                Ok(SymbolId::local(file, id.clone()))
             }
         }
     }
@@ -272,12 +312,11 @@ impl SymbolId {
         }
     }
 
-    /// The SCIP-format symbol string. Equality of this string is symbol identity.
+    /// The SCIP-format symbol display/interoperability string. It is not a
+    /// lossless identity key because it omits global language and local-file
+    /// coordinates; use structural [`SymbolId`] equality for identity.
     pub fn to_scip_string(&self) -> String {
-        let mut s = String::new();
-        self.write_scip(&mut s)
-            .expect("writing to a String is infallible");
-        s
+        self.to_string()
     }
 
     /// Parse a SCIP symbol string — the inverse of [`SymbolId::to_scip_string`].
@@ -416,6 +455,10 @@ mod tests {
         // SCIP deliberately has no language field. The lossless serde wire
         // representation carries it without changing the standard SCIP scheme.
         assert_eq!(rust.to_scip_string(), python.to_scip_string());
+        assert_ne!(rust, python, "language is structural identity");
+        assert_eq!(rust.language(), Some("rust"));
+        assert_eq!(python.language(), Some("python"));
+        assert_eq!(rust.local_file(), None);
         #[cfg(feature = "serde")]
         {
             assert_ne!(
@@ -430,6 +473,17 @@ mod tests {
     fn local_renders_local_form() {
         let id = SymbolId::local("src/main.rs", "x0");
         assert_eq!(id.to_scip_string(), "local x0");
+        assert_eq!(id.language(), None);
+        assert_eq!(id.local_file(), Some("src/main.rs"));
+    }
+
+    #[test]
+    fn same_display_local_symbols_in_different_files_are_distinct() {
+        let a = SymbolId::local("src/a.rs", "x0");
+        let b = SymbolId::local("src/b.rs", "x0");
+
+        assert_eq!(a.to_scip_string(), b.to_scip_string());
+        assert_ne!(a, b, "local file is structural identity");
     }
 
     // ── SCIP-compliance golden tests ──────────────────────────────────────────

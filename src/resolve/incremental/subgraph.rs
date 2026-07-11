@@ -20,6 +20,9 @@ use crate::symbol::SymbolId;
 
 use super::super::{enclosing_symbol_index, normalize_from_path};
 
+/// Schema version for opaque [`FileSubgraph`] persistence blobs.
+pub const FILE_SUBGRAPH_SCHEMA_VERSION: u32 = 1;
+
 /// A cross-file reference whose resolution is deferred to the stitch phase.
 /// Qualified calls, imports, and unqualified same-namespace cross-file calls
 /// all reduce to "match `name` whose namespace chain ends with `segs`,
@@ -304,7 +307,7 @@ pub(crate) fn build_subgraph(f: &FileFacts) -> FileSubgraph {
     }
 
     FileSubgraph {
-        schema_version: 1,
+        schema_version: FILE_SUBGRAPH_SCHEMA_VERSION,
         owner_file: f.file.clone(),
         symbols,
         intra_edges,

@@ -207,7 +207,7 @@ pub struct Reference {
     pub occ: Occurrence,
     /// What kind of reference.
     pub role: RefRole,
-    /// For [`RefRole::Import`] references: the SCIP identity string of the
+    /// For [`RefRole::Import`] references: the SCIP display string of the
     /// importing file's module symbol. `None` for all other reference roles.
     pub source_module: Option<String>,
     /// For [`RefRole::Import`] references: the module path the symbol is imported
@@ -285,7 +285,7 @@ pub enum BindingTarget {
     /// An import: the module path as written in source (mirrors
     /// [`Reference::from_path`]).
     Import(String),
-    /// Points at an extracted top-level [`Symbol`]'s SCIP identity.
+    /// Points at an extracted top-level [`Symbol`] by structural identity.
     Def(SymbolId),
 }
 
@@ -407,12 +407,34 @@ pub enum FfiAbi {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FfiExport {
-    /// The exported definition's SCIP identity.
+    /// The exported definition's structural identity.
     pub symbol: SymbolId,
     /// The ABI the symbol is exposed under.
     pub abi: FfiAbi,
     /// The symbol name as seen across the boundary (the stable linker/ABI name).
     pub export_name: String,
+}
+
+/// A lossless identity key for a resolved [`Edge`].
+///
+/// Confidence is deliberately excluded: changing confidence updates the same
+/// derived edge. Provenance is included because distinct resolver mechanisms can
+/// produce distinct facts at the same occurrence.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct EdgeKey {
+    /// Structural identity of the source symbol.
+    pub from: SymbolId,
+    /// Structural identity of the target symbol.
+    pub to: SymbolId,
+    /// Relationship expressed by the resolved reference.
+    pub role: RefRole,
+    /// File containing the reference occurrence.
+    pub occurrence_file: String,
+    /// Byte offset of the reference occurrence within [`Self::occurrence_file`].
+    pub occurrence_byte: usize,
+    /// Resolver mechanism that derived the edge.
+    pub provenance: Provenance,
 }
 
 /// A resolved directed edge between two symbols.
@@ -431,6 +453,20 @@ pub struct Edge {
     pub provenance: Provenance,
     /// The reference site that produced the edge — the evidence trail.
     pub occ: Occurrence,
+}
+
+impl Edge {
+    /// Return this edge's lossless identity, excluding its confidence attribute.
+    pub fn key(&self) -> EdgeKey {
+        EdgeKey {
+            from: self.from.clone(),
+            to: self.to.clone(),
+            role: self.role,
+            occurrence_file: self.occ.file.clone(),
+            occurrence_byte: self.occ.byte,
+            provenance: self.provenance,
+        }
+    }
 }
 
 /// The neutral facts extracted from a single file (extractor output, resolver input).
@@ -534,6 +570,52 @@ mod confidence_tests {
             ],
         };
         (graph, symbols)
+    }
+
+    #[test]
+    fn edge_key_uses_every_identity_dimension_except_confidence() {
+        let edge = make_edge("from", "to", Confidence::NameOnly);
+        let key = edge.key();
+        assert_eq!(key.from, edge.from);
+        assert_eq!(key.to, edge.to);
+        assert_eq!(key.role, edge.role);
+        assert_eq!(key.occurrence_file, edge.occ.file);
+        assert_eq!(key.occurrence_byte, edge.occ.byte);
+        assert_eq!(key.provenance, edge.provenance);
+
+        let mut changed = edge.clone();
+        changed.confidence = Confidence::Exact;
+        assert_eq!(changed.key(), key, "confidence is not edge identity");
+
+        changed.from = SymbolId::global(
+            "python",
+            vec![
+                Descriptor::Namespace("pkg".into()),
+                Descriptor::Term("from".into()),
+            ],
+        );
+        assert_eq!(changed.from.to_scip_string(), edge.from.to_scip_string());
+        assert_ne!(
+            changed.key(),
+            key,
+            "structural SymbolId coordinates are identity"
+        );
+
+        let mut changed = edge.clone();
+        changed.to = make_id("other");
+        assert_ne!(changed.key(), key);
+        changed = edge.clone();
+        changed.role = RefRole::Read;
+        assert_ne!(changed.key(), key);
+        changed = edge.clone();
+        changed.occ.file = "src/b.rs".into();
+        assert_ne!(changed.key(), key);
+        changed = edge.clone();
+        changed.occ.byte = 1;
+        assert_ne!(changed.key(), key);
+        changed = edge.clone();
+        changed.provenance = Provenance::ScopeGraph;
+        assert_ne!(changed.key(), key);
     }
 
     #[test]
