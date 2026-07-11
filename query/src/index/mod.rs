@@ -5,5 +5,6 @@
 mod build;
 mod lookup;
 
+pub use crate::impact::{ImpactOptions, ImpactResult, ImpactStep};
 pub use crate::relation::EdgeFilter;
 pub use build::GraphIndex;
