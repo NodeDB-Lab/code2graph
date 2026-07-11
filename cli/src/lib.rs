@@ -6,6 +6,7 @@ pub mod args;
 pub mod config;
 pub mod error;
 pub mod exit;
+pub mod project;
 pub mod request;
 pub mod result;
 
@@ -16,6 +17,7 @@ pub use config::{
 };
 pub use error::{CliError, Result};
 pub use exit::ExitCode;
+pub use project::{ProjectPath, ProjectSelection, SelectionProvenance, select_project};
 pub use request::{CliRequest, CommandRequest, Selector, SourcePosition};
 pub use result::{
     CacheDisposition, ConfidenceOutput, ErrorEnvelope, Freshness, ImpactOutput,

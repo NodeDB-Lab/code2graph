@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::path::PathBuf;
+
 use crate::exit::ExitCode;
 use crate::result::OutputStatus;
 
@@ -21,6 +23,14 @@ pub enum CliError {
     Index(String),
     #[error("unsupported: {0}")]
     Unsupported(String),
+    #[error("project path {path}: {reason}")]
+    ProjectPath { path: PathBuf, reason: String },
+    #[error("project path {path} is a symlink")]
+    ProjectSymlink { path: PathBuf },
+    #[error("project-relative path {path}: {reason}")]
+    ProjectRelativePath { path: PathBuf, reason: String },
+    #[error("source path {path} is outside project root {root}")]
+    ProjectPathOutsideRoot { root: PathBuf, path: PathBuf },
     #[error("operation timed out")]
     Timeout,
     #[error("{command} execution is not implemented in this contract-only CLI shell")]
@@ -39,6 +49,10 @@ impl CliError {
             Self::Cache(_)
             | Self::Index(_)
             | Self::Unsupported(_)
+            | Self::ProjectPath { .. }
+            | Self::ProjectSymlink { .. }
+            | Self::ProjectRelativePath { .. }
+            | Self::ProjectPathOutsideRoot { .. }
             | Self::Timeout
             | Self::Unavailable { .. }
             | Self::Fatal(_) => ExitCode::Operational,
@@ -53,9 +67,14 @@ impl From<&CliError> for OutputStatus {
             CliError::Ambiguous => Self::Ambiguous,
             CliError::Unsupported(_) | CliError::Unavailable { .. } => Self::Unsupported,
             CliError::Timeout => Self::Timeout,
-            CliError::Usage(_) | CliError::Cache(_) | CliError::Index(_) | CliError::Fatal(_) => {
-                Self::Error
-            }
+            CliError::Usage(_)
+            | CliError::Cache(_)
+            | CliError::Index(_)
+            | CliError::ProjectPath { .. }
+            | CliError::ProjectSymlink { .. }
+            | CliError::ProjectRelativePath { .. }
+            | CliError::ProjectPathOutsideRoot { .. }
+            | CliError::Fatal(_) => Self::Error,
         }
     }
 }
@@ -73,6 +92,21 @@ mod tests {
             CliError::Cache("x".into()),
             CliError::Index("x".into()),
             CliError::Unsupported("x".into()),
+            CliError::ProjectPath {
+                path: "project".into(),
+                reason: "missing".into(),
+            },
+            CliError::ProjectSymlink {
+                path: "project".into(),
+            },
+            CliError::ProjectRelativePath {
+                path: "source".into(),
+                reason: "invalid".into(),
+            },
+            CliError::ProjectPathOutsideRoot {
+                root: "project".into(),
+                path: "source".into(),
+            },
             CliError::Timeout,
             CliError::Unavailable {
                 command: "status".into(),
@@ -92,6 +126,33 @@ mod tests {
             (CliError::Cache("x".into()), OutputStatus::Error),
             (CliError::Index("x".into()), OutputStatus::Error),
             (CliError::Unsupported("x".into()), OutputStatus::Unsupported),
+            (
+                CliError::ProjectPath {
+                    path: "project".into(),
+                    reason: "missing".into(),
+                },
+                OutputStatus::Error,
+            ),
+            (
+                CliError::ProjectSymlink {
+                    path: "project".into(),
+                },
+                OutputStatus::Error,
+            ),
+            (
+                CliError::ProjectRelativePath {
+                    path: "source".into(),
+                    reason: "invalid".into(),
+                },
+                OutputStatus::Error,
+            ),
+            (
+                CliError::ProjectPathOutsideRoot {
+                    root: "project".into(),
+                    path: "source".into(),
+                },
+                OutputStatus::Error,
+            ),
             (CliError::Timeout, OutputStatus::Timeout),
             (
                 CliError::Unavailable {
