@@ -260,14 +260,14 @@ impl IncrementalGraph {
             match change {
                 PreparedChange::Upsert { file, subgraph } => {
                     if let Some(old) = self.files.get(&file) {
-                        self.index.remove_symbols(&old.symbols);
+                        self.index.remove_symbols(&file, &old.symbols);
                     }
-                    self.index.insert_symbols(&subgraph.symbols);
+                    self.index.insert_symbols(&file, &subgraph.symbols);
                     self.files.insert(file, subgraph);
                 }
                 PreparedChange::Remove { file } => {
                     if let Some(old) = self.files.remove(&file) {
-                        self.index.remove_symbols(&old.symbols);
+                        self.index.remove_symbols(&file, &old.symbols);
                     }
                 }
             }

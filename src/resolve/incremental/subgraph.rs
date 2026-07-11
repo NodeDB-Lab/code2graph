@@ -432,7 +432,7 @@ mod tests {
         let consumer_sub = build_subgraph(&consumer);
 
         let mut index = GlobalIndex::new();
-        index.insert_symbols(&provider_sub.symbols);
+        index.insert_symbols(&provider_sub.owner_file, &provider_sub.symbols);
 
         let type_edges: Vec<Edge> = stitch(&consumer_sub.pending, &index)
             .into_iter()
@@ -469,9 +469,11 @@ mod tests {
 
         let consumer_sub = build_subgraph(&consumer);
 
+        let p1_sub = build_subgraph(&p1);
+        let p2_sub = build_subgraph(&p2);
         let mut index = GlobalIndex::new();
-        index.insert_symbols(&build_subgraph(&p1).symbols);
-        index.insert_symbols(&build_subgraph(&p2).symbols);
+        index.insert_symbols(&p1_sub.owner_file, &p1_sub.symbols);
+        index.insert_symbols(&p2_sub.owner_file, &p2_sub.symbols);
 
         let type_edges = stitch(&consumer_sub.pending, &index)
             .into_iter()

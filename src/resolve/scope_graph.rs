@@ -97,9 +97,13 @@ impl Resolver for ScopeGraphResolver {
             .flat_map(|s| s.symbols.iter().cloned())
             .collect();
 
-        // Global leaf-name → SymbolId index for the cross-file stitch phase
-        // (mirrors Tier-A's `by_name`).
-        let index = GlobalIndex::from_symbols(&symbols);
+        // Global leaf-name → physical definition-instance index for the
+        // cross-file stitch phase (mirrors Tier-A's `by_name`).
+        let symbol_sets: Vec<(&str, &[Symbol])> = subs
+            .iter()
+            .map(|sub| (sub.owner_file.as_str(), sub.symbols.as_slice()))
+            .collect();
+        let index = GlobalIndex::from_symbols(&symbol_sets);
 
         // Intra-file edges first (all files, in order), then the stitched
         // cross-file edges. Tests assert edge sets, not positional order.

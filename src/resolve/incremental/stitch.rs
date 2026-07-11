@@ -11,6 +11,7 @@
 //! no edge).
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use crate::graph::types::{Edge, Provenance, RefRole, Symbol, SymbolKind};
 use crate::symbol::SymbolId;
@@ -18,18 +19,23 @@ use crate::symbol::SymbolId;
 use super::super::{enclosing_path_ends_with, namespaces_end_with};
 use super::subgraph::PendingRef;
 
-/// Global definition index: leaf name → the SymbolIds sharing that name.
-/// Mirrors the `by_name` map the batch resolver builds, but owns SymbolIds so
-/// it can be maintained incrementally (next unit adds add/remove).
+/// A physical definition record in a [`GlobalIndex`]. Its key is deliberately
+/// structural rather than a SCIP identity: equal symbol IDs in different files
+/// (or duplicate records in one file) remain distinct resolution candidates.
+#[derive(Clone, Hash, PartialEq, Eq)]
+struct DefinitionInstance {
+    owner_file: Arc<str>,
+    ordinal: usize,
+    id: SymbolId,
+}
+
+/// Global definition index: leaf name → physical definition instances.
 #[derive(Default)]
 pub(crate) struct GlobalIndex {
-    by_name: HashMap<String, HashSet<SymbolId>>,
-    /// Module-name → the module SymbolIds sharing that name. Kept separate from
-    /// `by_name` because module symbols have a `Namespace`-only id (no leaf
-    /// name, so they never land in `by_name`) and because a `ModuleRef` must
-    /// resolve ONLY to a module — never to a same-named function, and vice
-    /// versa. Keyed by the module's `name` field (the last `Namespace` segment).
-    modules_by_name: HashMap<String, HashSet<SymbolId>>,
+    by_name: HashMap<String, HashSet<DefinitionInstance>>,
+    /// Module-name → module definition instances. Kept separate from `by_name`
+    /// because module symbols have a `Namespace`-only id (no leaf name).
+    modules_by_name: HashMap<String, HashSet<DefinitionInstance>>,
 }
 
 impl GlobalIndex {
@@ -43,66 +49,66 @@ impl GlobalIndex {
         }
     }
 
-    /// Build from the full symbol set (batch path).
-    pub(crate) fn from_symbols(symbols: &[Symbol]) -> Self {
+    /// Build from owner-labelled symbol sets (batch path).
+    pub(crate) fn from_symbols(symbol_sets: &[(&str, &[Symbol])]) -> Self {
         let mut idx = Self::new();
-        idx.insert_symbols(symbols);
+        for (owner_file, symbols) in symbol_sets {
+            idx.insert_symbols(owner_file, symbols);
+        }
         idx
     }
 
-    /// Add `symbols` to the index: each symbol with a leaf name is pushed under
-    /// that name. The incremental store calls this whenever a file's subgraph is
-    /// (re)built — same mapping [`from_symbols`] uses, applied incrementally.
-    ///
-    /// [`from_symbols`]: GlobalIndex::from_symbols
-    pub(crate) fn insert_symbols(&mut self, symbols: &[Symbol]) {
-        for s in symbols {
-            // A module belongs exclusively to the module target domain. Ordinary
-            // calls/reads/writes/imports must never become ambiguous because a
-            // same-named module exists.
+    /// Add one file's symbols. `ordinal` is the record's position in that
+    /// owner's symbol list, making equal IDs distinct physical candidates.
+    pub(crate) fn insert_symbols(&mut self, owner_file: &str, symbols: &[Symbol]) {
+        if symbols.is_empty() {
+            return;
+        }
+        let owner_file = Arc::<str>::from(owner_file);
+        for (ordinal, s) in symbols.iter().enumerate() {
+            let instance = DefinitionInstance {
+                owner_file: Arc::clone(&owner_file),
+                ordinal,
+                id: s.id.clone(),
+            };
             if s.kind == SymbolKind::Module {
                 self.modules_by_name
                     .entry(s.name.clone())
                     .or_default()
-                    .insert(s.id.clone());
+                    .insert(instance);
             } else if let Some(n) = s.id.leaf_name() {
                 self.by_name
                     .entry(n.to_string())
                     .or_default()
-                    .insert(s.id.clone());
+                    .insert(instance);
             }
         }
     }
 
-    /// Remove `symbols` from the index: for each symbol with a leaf name, drop
-    /// ONE entry equal to its id from that name's bucket. The incremental store
-    /// calls this before re-building a changed file's subgraph, so the index
-    /// reflects only the current file set.
-    ///
-    /// Order within a bucket is irrelevant — [`unique_match`] is order-independent
-    /// and returns `None` on ambiguity — so hash-set removal is O(1). A bucket
-    /// that empties is dropped so the map never leaks empty keys.
-    ///
-    /// [`unique_match`]: GlobalIndex::unique_match
-    pub(crate) fn remove_symbols(&mut self, symbols: &[Symbol]) {
-        for s in symbols {
-            // Mirror `insert_symbols`: modules live only in `modules_by_name`.
+    /// Remove exactly one owner's definition instances from the index.
+    pub(crate) fn remove_symbols(&mut self, owner_file: &str, symbols: &[Symbol]) {
+        for (ordinal, s) in symbols.iter().enumerate() {
             if s.kind == SymbolKind::Module {
                 if let Some(bucket) = self.modules_by_name.get_mut(&s.name) {
-                    bucket.remove(&s.id);
+                    bucket.retain(|instance| {
+                        instance.owner_file.as_ref() != owner_file
+                            || instance.ordinal != ordinal
+                            || instance.id != s.id
+                    });
                     if bucket.is_empty() {
                         self.modules_by_name.remove(&s.name);
                     }
                 }
-            }
-            if s.kind != SymbolKind::Module {
-                if let Some(n) = s.id.leaf_name() {
-                    if let Some(bucket) = self.by_name.get_mut(n) {
-                        bucket.remove(&s.id);
-                        if bucket.is_empty() {
-                            self.by_name.remove(n);
-                        }
-                    }
+            } else if let Some(n) = s.id.leaf_name()
+                && let Some(bucket) = self.by_name.get_mut(n)
+            {
+                bucket.retain(|instance| {
+                    instance.owner_file.as_ref() != owner_file
+                        || instance.ordinal != ordinal
+                        || instance.id != s.id
+                });
+                if bucket.is_empty() {
+                    self.by_name.remove(n);
                 }
             }
         }
@@ -117,10 +123,10 @@ impl GlobalIndex {
         self.by_name.get(name).and_then(|cands| {
             let mut it = cands
                 .iter()
-                .filter(|id| segs.is_empty() || namespaces_end_with(id, segs));
+                .filter(|instance| segs.is_empty() || namespaces_end_with(&instance.id, segs));
             match (it.next(), it.next()) {
-                (Some(only), None) => Some(only), // exactly one match
-                _ => None,                        // zero or ambiguous → no edge
+                (Some(only), None) => Some(&only.id), // exactly one match
+                _ => None,                            // zero or ambiguous → no edge
             }
         })
     }
@@ -134,11 +140,12 @@ impl GlobalIndex {
     /// call to an ambiguous name yields no edge (precision is never faked).
     fn unique_qualified_match(&self, name: &str, segs: &[String]) -> Option<&SymbolId> {
         self.by_name.get(name).and_then(|cands| {
-            let mut it = cands
-                .iter()
-                .filter(|id| namespaces_end_with(id, segs) || enclosing_path_ends_with(id, segs));
+            let mut it = cands.iter().filter(|instance| {
+                namespaces_end_with(&instance.id, segs)
+                    || enclosing_path_ends_with(&instance.id, segs)
+            });
             match (it.next(), it.next()) {
-                (Some(only), None) => Some(only),
+                (Some(only), None) => Some(&only.id),
                 _ => None,
             }
         })
@@ -155,55 +162,52 @@ impl GlobalIndex {
             // so accept all candidates in that case and let uniqueness decide.
             let mut it = cands
                 .iter()
-                .filter(|id| segs.is_empty() || namespaces_end_with(id, segs));
+                .filter(|instance| segs.is_empty() || namespaces_end_with(&instance.id, segs));
             match (it.next(), it.next()) {
-                (Some(only), None) => Some(only), // exactly one match
-                _ => None,                        // zero or ambiguous → no edge
+                (Some(only), None) => Some(&only.id), // exactly one match
+                _ => None,                            // zero or ambiguous → no edge
             }
         })
     }
 }
 
+/// Resolve one deferred reference. This is shared by every stitch caller so
+/// resolution semantics have one private implementation.
+fn resolve_pending(p: &PendingRef, index: &GlobalIndex) -> Option<Edge> {
+    // ModuleRefs resolve ONLY against the module index; everything else resolves
+    // ONLY against the leaf-name index.
+    let matched = match p.role {
+        RefRole::ModuleRef => index.unique_module_match(&p.name, &p.segs),
+        // HCL and similar DSLs use type-like references to modules. Prefer a
+        // unique module target, then retain ordinary type lookup.
+        RefRole::TypeRef => index
+            .unique_module_match(&p.name, &p.segs)
+            .or_else(|| index.unique_match(&p.name, &p.segs)),
+        _ if p.qualified => index.unique_qualified_match(&p.name, &p.segs),
+        _ => index.unique_match(&p.name, &p.segs),
+    }?;
+    // A definition never links to itself (parity with Tier-A).
+    if *matched == p.from {
+        return None;
+    }
+    Some(Edge {
+        from: p.from.clone(),
+        to: matched.clone(),
+        role: p.role,
+        confidence: p.confidence,
+        provenance: Provenance::ScopeGraph,
+        occ: p.occ.clone(),
+    })
+}
+
 /// Resolve all pending cross-file refs into edges via the global index. One
 /// [`Provenance::ScopeGraph`] edge per unique match, stamped with the pending
-/// ref's own [`Confidence`](crate::graph::types::Confidence) (Exact for
-/// explicit written paths, Scoped for an
-/// unqualified same-namespace cross-file match).
+/// ref's own [`Confidence`](crate::graph::types::Confidence).
 pub(crate) fn stitch(pending: &[PendingRef], index: &GlobalIndex) -> Vec<Edge> {
-    let mut edges = Vec::new();
-    for p in pending {
-        // ModuleRefs resolve ONLY against the module index; everything else
-        // resolves ONLY against the leaf-name index. This keeps the two kinds of
-        // match disjoint — a ModuleRef can never bind a function, nor a Call a module.
-        let matched = match p.role {
-            RefRole::ModuleRef => index.unique_module_match(&p.name, &p.segs),
-            // HCL and similar DSLs use type-like references to modules. Prefer
-            // a unique module target, then retain ordinary type lookup.
-            RefRole::TypeRef => index
-                .unique_module_match(&p.name, &p.segs)
-                .or_else(|| index.unique_match(&p.name, &p.segs)),
-            _ if p.qualified => index.unique_qualified_match(&p.name, &p.segs),
-            _ => index.unique_match(&p.name, &p.segs),
-        };
-        if let Some(matched_id) = matched {
-            // A definition never links to itself (parity with Tier-A, which skips
-            // `i == from_idx`). An unqualified same-namespace ref whose unique
-            // match is the caller's own id (e.g. a recursive free function)
-            // would otherwise produce a `from == to` self-edge.
-            if *matched_id == p.from {
-                continue;
-            }
-            edges.push(Edge {
-                from: p.from.clone(),
-                to: matched_id.clone(),
-                role: p.role,
-                confidence: p.confidence,
-                provenance: Provenance::ScopeGraph,
-                occ: p.occ.clone(),
-            });
-        }
-    }
-    edges
+    pending
+        .iter()
+        .filter_map(|pending| resolve_pending(pending, index))
+        .collect()
 }
 
 #[cfg(test)]
@@ -235,7 +239,7 @@ mod tests {
         // Import role to assert the import contract specifically.)
         use crate::graph::types::RefRole;
         let mut index = GlobalIndex::new();
-        index.insert_symbols(&conf_sub.symbols);
+        index.insert_symbols(&conf_sub.owner_file, &conf_sub.symbols);
         let edges = stitch(&app_sub.pending, &index);
         assert_eq!(
             edges.iter().filter(|e| e.role == RefRole::Import).count(),
@@ -244,12 +248,103 @@ mod tests {
         );
 
         // Remove conf's symbols → neither the import nor the module ref matches.
-        index.remove_symbols(&conf_sub.symbols);
+        index.remove_symbols(&conf_sub.owner_file, &conf_sub.symbols);
         let edges = stitch(&app_sub.pending, &index);
         assert!(
             edges.is_empty(),
             "after removing conf's symbols, nothing must resolve"
         );
+    }
+
+    #[test]
+    fn identical_ids_remain_ambiguous_until_one_owner_is_removed() {
+        let facts = RustExtractor
+            .extract("pub fn helper() {}", "src/template.rs")
+            .expect("extract template");
+        let helper = facts
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "helper")
+            .expect("helper symbol")
+            .clone();
+        let symbols = vec![helper];
+        let mut index = GlobalIndex::from_symbols(&[
+            ("src/one.rs", symbols.as_slice()),
+            ("src/two.rs", symbols.as_slice()),
+        ]);
+        assert!(index.unique_match("helper", &[]).is_none());
+
+        index.remove_symbols("src/one.rs", &symbols);
+        assert!(index.unique_match("helper", &[]).is_some());
+
+        // Replacing the remaining owner must retain the other owner's instance.
+        index.insert_symbols("src/one.rs", &symbols);
+        index.remove_symbols("src/one.rs", &symbols);
+        assert!(index.unique_match("helper", &[]).is_some());
+    }
+
+    #[test]
+    fn duplicate_records_in_one_owner_are_ambiguous() {
+        let facts = RustExtractor
+            .extract("pub fn helper() {}", "src/template.rs")
+            .expect("extract template");
+        let helper = facts
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "helper")
+            .expect("helper symbol")
+            .clone();
+        let duplicates = vec![helper.clone(), helper];
+        let mut index = GlobalIndex::new();
+        index.insert_symbols("src/owner.rs", &duplicates);
+        assert!(index.unique_match("helper", &[]).is_none());
+    }
+
+    #[test]
+    fn duplicate_module_records_are_ambiguous() {
+        let facts = RustExtractor
+            .extract("pub fn helper() {}", "src/util.rs")
+            .expect("extract module");
+        let module = facts
+            .symbols
+            .iter()
+            .find(|symbol| symbol.kind == SymbolKind::Module)
+            .expect("module symbol")
+            .clone();
+        let duplicates = vec![module.clone(), module];
+        let mut index = GlobalIndex::new();
+        index.insert_symbols("src/util.rs", &duplicates);
+        assert!(index.unique_module_match("util", &[]).is_none());
+    }
+
+    #[test]
+    fn stitch_delegates_single_pending_resolution() {
+        let provider = RustExtractor
+            .extract("pub fn helper() {}", "src/provider.rs")
+            .expect("extract provider");
+        let consumer = RustExtractor
+            .extract("use provider::helper;\npub fn run() {}", "src/consumer.rs")
+            .expect("extract consumer");
+        let provider_sub = build_subgraph(&provider);
+        let consumer_sub = build_subgraph(&consumer);
+        let mut index = GlobalIndex::new();
+        index.insert_symbols(&provider_sub.owner_file, &provider_sub.symbols);
+        let pending = consumer_sub
+            .pending
+            .iter()
+            .find(|pending| pending.role == RefRole::Import)
+            .expect("import pending");
+        let resolved = resolve_pending(pending, &index);
+        let stitched = stitch(std::slice::from_ref(pending), &index);
+        assert_eq!(stitched.len(), usize::from(resolved.is_some()));
+        if let (Some(expected), Some(actual)) = (resolved, stitched.first()) {
+            assert_eq!(actual.from, expected.from);
+            assert_eq!(actual.to, expected.to);
+            assert_eq!(actual.role, expected.role);
+            assert_eq!(actual.confidence, expected.confidence);
+            assert_eq!(actual.provenance, expected.provenance);
+            assert_eq!(actual.occ, expected.occ);
+        }
     }
 
     /// `lib.rs` with `mod util;` and `util.rs` defining an item: the ModuleRef
@@ -267,8 +362,8 @@ mod tests {
         let util_sub = build_subgraph(&util);
 
         let mut index = GlobalIndex::new();
-        index.insert_symbols(&lib_sub.symbols);
-        index.insert_symbols(&util_sub.symbols);
+        index.insert_symbols(&lib_sub.owner_file, &lib_sub.symbols);
+        index.insert_symbols(&util_sub.owner_file, &util_sub.symbols);
 
         let edges = stitch(&lib_sub.pending, &index);
         assert_eq!(edges.len(), 1, "mod util; must resolve to exactly one edge");
@@ -302,8 +397,8 @@ mod tests {
         let other_sub = build_subgraph(&other);
 
         let mut index = GlobalIndex::new();
-        index.insert_symbols(&lib_sub.symbols);
-        index.insert_symbols(&other_sub.symbols);
+        index.insert_symbols(&lib_sub.owner_file, &lib_sub.symbols);
+        index.insert_symbols(&other_sub.owner_file, &other_sub.symbols);
 
         let edges = stitch(&lib_sub.pending, &index);
         // The only module named "config" is lib.rs's own decl — but a ModuleRef
@@ -346,7 +441,7 @@ mod tests {
         // unique match IS the caller — exactly what an unqualified same-namespace
         // self-recursive deferral produces.
         let mut index = GlobalIndex::new();
-        index.insert_symbols(&sub.symbols);
+        index.insert_symbols(&sub.owner_file, &sub.symbols);
         let pending = vec![PendingRef {
             from: own_id.clone(),
             name: "recurse".to_string(),
@@ -389,9 +484,9 @@ mod tests {
         let b_sub = build_subgraph(&util_b);
 
         let mut index = GlobalIndex::new();
-        index.insert_symbols(&lib_sub.symbols);
-        index.insert_symbols(&a_sub.symbols);
-        index.insert_symbols(&b_sub.symbols);
+        index.insert_symbols(&lib_sub.owner_file, &lib_sub.symbols);
+        index.insert_symbols(&a_sub.owner_file, &a_sub.symbols);
+        index.insert_symbols(&b_sub.owner_file, &b_sub.symbols);
 
         let module_refs = stitch(&lib_sub.pending, &index)
             .into_iter()
@@ -418,8 +513,8 @@ mod tests {
         let helper_sub = build_subgraph(&helper);
 
         let mut index = GlobalIndex::new();
-        index.insert_symbols(&lib_sub.symbols);
-        index.insert_symbols(&helper_sub.symbols);
+        index.insert_symbols(&lib_sub.owner_file, &lib_sub.symbols);
+        index.insert_symbols(&helper_sub.owner_file, &helper_sub.symbols);
         let edges = stitch(&lib_sub.pending, &index);
 
         let calls: Vec<_> = edges
