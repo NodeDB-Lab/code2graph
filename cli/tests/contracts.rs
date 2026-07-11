@@ -179,7 +179,7 @@ fn lossless_ids_survive_selector_and_output_json() {
 #[test]
 fn binary_keeps_unimplemented_commands_operational_failures() {
     let output = Command::new(env!("CARGO_BIN_EXE_code2graph"))
-        .args(["symbols", "run"])
+        .args(["callers", "run"])
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(4));
@@ -187,14 +187,14 @@ fn binary_keeps_unimplemented_commands_operational_failures() {
     assert!(
         String::from_utf8(output.stderr)
             .unwrap()
-            .contains("symbols execution is not implemented")
+            .contains("callers execution is not implemented")
     );
 }
 
 #[test]
 fn binary_json_failures_keep_stdout_machine_only_and_stderr_diagnostic() {
     let output = Command::new(env!("CARGO_BIN_EXE_code2graph"))
-        .args(["symbols", "run", "--json"])
+        .args(["callers", "run", "--json"])
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(4));
@@ -205,7 +205,7 @@ fn binary_json_failures_keep_stdout_machine_only_and_stderr_diagnostic() {
         value["error"]
             .as_str()
             .unwrap()
-            .contains("symbols execution")
+            .contains("callers execution")
     );
     assert!(
         String::from_utf8(output.stderr)
@@ -240,6 +240,121 @@ fn binary_usage_errors_map_to_two_and_emit_json_when_requested() {
         String::from_utf8(output.stderr)
             .unwrap()
             .starts_with("error: ")
+    );
+}
+
+#[test]
+fn binary_symbols_and_def_query_a_real_no_cache_project_losslessly() {
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(
+        project.path().join("alpha.rs"),
+        "pub fn alpha_helper() {}\npub fn display_target() {}\n",
+    )
+    .unwrap();
+    std::fs::write(project.path().join("beta.rs"), "pub fn beta_helper() {}\n").unwrap();
+
+    let symbols = Command::new(env!("CARGO_BIN_EXE_code2graph"))
+        .current_dir(project.path())
+        .args(["symbols", "HELPER", "--no-cache", "--json", "--limit", "1"])
+        .output()
+        .unwrap();
+    assert!(symbols.status.success());
+    assert!(symbols.stderr.is_empty());
+    let symbols: serde_json::Value = serde_json::from_slice(&symbols.stdout).unwrap();
+    assert_eq!(symbols["status"], "ok");
+    assert_eq!(symbols["project"]["cache"], "disabled");
+    assert_eq!(symbols["returned"], 1);
+    assert_eq!(symbols["total"], 2);
+    assert_eq!(symbols["truncated"], true);
+    assert_eq!(symbols["results"][0]["name"], "alpha_helper");
+    assert_eq!(symbols["results"][0]["id"]["version"], 1);
+    let output_id: SymbolId = serde_json::from_value(symbols["results"][0]["id"].clone()).unwrap();
+    assert_eq!(
+        output_id.to_scip_string(),
+        symbols["results"][0]["idDisplay"].as_str().unwrap()
+    );
+
+    let filtered = Command::new(env!("CARGO_BIN_EXE_code2graph"))
+        .current_dir(project.path())
+        .args([
+            "symbols",
+            "helper",
+            "--file",
+            "beta.rs",
+            "--kind",
+            "function",
+            "--no-cache",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(filtered.status.success());
+    assert!(filtered.stderr.is_empty());
+    let filtered: serde_json::Value = serde_json::from_slice(&filtered.stdout).unwrap();
+    assert_eq!(filtered["total"], 1);
+    assert_eq!(filtered["results"][0]["name"], "beta_helper");
+
+    let definition = Command::new(env!("CARGO_BIN_EXE_code2graph"))
+        .current_dir(project.path())
+        .args([
+            "def",
+            "alpha_helper",
+            "--no-cache",
+            "--json",
+            "--limit",
+            "0",
+        ])
+        .output()
+        .unwrap();
+    assert!(definition.status.success());
+    assert!(definition.stderr.is_empty());
+    let definition: serde_json::Value = serde_json::from_slice(&definition.stdout).unwrap();
+    assert_eq!(definition["status"], "ok");
+    assert_eq!(definition["returned"], 0);
+    assert_eq!(definition["total"], 1);
+    assert_eq!(definition["truncated"], true);
+    assert_eq!(definition["selector"]["matched"], 1);
+    assert_eq!(definition["selector"]["ambiguous"], false);
+    assert_eq!(definition["selector"]["ids"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        definition["selector"]["symbols"].as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(definition["selector"]["symbols"][0]["id"]["version"], 1);
+}
+
+#[test]
+fn binary_query_no_match_has_typed_json_human_output_and_exit_code() {
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join("lib.rs"), "pub fn present() {}\n").unwrap();
+
+    let json = Command::new(env!("CARGO_BIN_EXE_code2graph"))
+        .current_dir(project.path())
+        .args(["symbols", "missing", "--no-cache", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(json.status.code(), Some(1));
+    let json: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(json["schemaVersion"], 1);
+    assert_eq!(json["status"], "no-match");
+    assert!(
+        json["error"]
+            .as_str()
+            .unwrap()
+            .contains("no matching result")
+    );
+
+    let human = Command::new(env!("CARGO_BIN_EXE_code2graph"))
+        .current_dir(project.path())
+        .args(["def", "missing", "--no-cache"])
+        .output()
+        .unwrap();
+    assert_eq!(human.status.code(), Some(1));
+    assert!(human.stdout.is_empty());
+    assert!(
+        String::from_utf8(human.stderr)
+            .unwrap()
+            .contains("error: no matching result")
     );
 }
 

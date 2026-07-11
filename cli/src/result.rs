@@ -250,6 +250,20 @@ pub struct SymbolOutput {
     pub signature: String,
 }
 
+impl From<&code2graph::Symbol> for SymbolOutput {
+    fn from(symbol: &code2graph::Symbol) -> Self {
+        Self {
+            id: symbol.id.clone(),
+            id_display: symbol.id.to_scip_string(),
+            name: symbol.name.clone(),
+            kind: symbol.kind.into(),
+            file: symbol.file.clone(),
+            line: symbol.line,
+            signature: symbol.signature.clone(),
+        }
+    }
+}
+
 /// A source occurrence. Lines are 1-based and columns are 0-based, matching
 /// the core graph schema.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -524,7 +538,7 @@ impl IndexOutput {
     ) -> Self {
         Self {
             candidate: snapshot.candidate_id.to_string(),
-            snapshot: snapshot.input_digest.to_string(),
+            snapshot: snapshot.candidate_id.to_string(),
             tier,
             completeness: snapshot.completeness.into(),
             inventory_file_count: snapshot.inventory_file_count,
@@ -690,6 +704,31 @@ mod tests {
             files: Vec::new(),
             tier_graphs: Vec::new(),
         }
+    }
+
+    #[test]
+    fn symbol_output_keeps_lossless_identity_and_line() {
+        let symbol = code2graph::Symbol {
+            id: SymbolId::global("rust", vec![code2graph::Descriptor::Term("run".into())]),
+            name: "run".into(),
+            kind: SymbolKind::Function,
+            visibility: code2graph::Visibility::Public,
+            entry_points: Vec::new(),
+            file: "src/lib.rs".into(),
+            line: 7,
+            span: code2graph::ByteSpan { start: 0, end: 8 },
+            signature: "pub fn run()".into(),
+        };
+        let expected_display = symbol.id.to_scip_string();
+        let output = SymbolOutput::from(&symbol);
+        assert_eq!(output.id, symbol.id);
+        assert_eq!(output.line, 7);
+        let mut maximum_line = symbol.clone();
+        maximum_line.line = u32::MAX;
+        assert_eq!(SymbolOutput::from(&maximum_line).line, u32::MAX);
+        let json = serde_json::to_value(output).unwrap();
+        assert_eq!(json["idDisplay"], expected_display);
+        assert_eq!(json["id"]["version"], 1);
     }
 
     #[test]

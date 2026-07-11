@@ -6,6 +6,10 @@ use crate::cache::{
     CacheCompleteness, CacheError, CacheLocation, CacheStore, CandidateSnapshot, LoadedSnapshot,
     ResolverCacheTier,
 };
+use crate::commands::{
+    DefinitionCommandRequest, QueryCommandContext, SymbolsCommandRequest, execute_definition,
+    execute_symbols,
+};
 use crate::refresh::{
     PrepareCandidateInputs, PreparedRefreshCandidate, prepare_and_publish,
     prepare_refresh_candidate,
@@ -25,6 +29,8 @@ use super::context::ExecutionContext;
 pub enum CommandOutput {
     Index(OutputEnvelope<IndexOutput>),
     Status(OutputEnvelope<StatusOutput>),
+    Symbols(OutputEnvelope<Vec<crate::SymbolOutput>>),
+    Def(OutputEnvelope<Vec<crate::SymbolOutput>>),
     LoadedGraph(LoadedGraph),
 }
 
@@ -72,13 +78,84 @@ impl<'a> ExecutionRefreshInputs<'a> {
 /// Executes the implemented top-level commands. Selection starts only after a
 /// command-wide deadline and cancellation check have been established.
 pub fn execute(request: CliRequest, context: &ExecutionContext<'_>) -> Result<CommandOutput> {
-    match &request.command {
+    let result_limit = request.global.limits.result_limit;
+    match request.command.clone() {
         CommandRequest::Index { .. } => execute_index(request, context),
         CommandRequest::Status => execute_status(request, context),
+        CommandRequest::Symbols {
+            text,
+            file,
+            kind,
+            case_sensitive,
+        } => execute_symbols_query(
+            request,
+            context,
+            SymbolsCommandRequest {
+                text: &text,
+                file: file.as_deref(),
+                kind,
+                case_sensitive,
+                result_limit,
+            },
+        ),
+        CommandRequest::Def {
+            selector,
+            file,
+            kind,
+            require_unique,
+        } => execute_definition_query(
+            request,
+            context,
+            DefinitionCommandRequest {
+                selector: &selector,
+                file: file.as_deref(),
+                kind,
+                require_unique,
+                result_limit,
+            },
+        ),
         command => Err(CliError::Unavailable {
             command: command.name().to_owned(),
         }),
     }
+}
+
+fn execute_symbols_query(
+    request: CliRequest,
+    execution: &ExecutionContext<'_>,
+    command: SymbolsCommandRequest<'_>,
+) -> Result<CommandOutput> {
+    let loaded = load_query_graph(&request, execution)?;
+    let deadline = Deadline::new(request.global.limits.timeout);
+    deadline.check(execution.cancellation)?;
+    let index = crate::build_graph_index(&loaded)?;
+    let context = QueryCommandContext::new(
+        &loaded,
+        &index,
+        &deadline,
+        execution.cancellation,
+        request.global.limits.max_file_bytes,
+    )?;
+    Ok(CommandOutput::Symbols(execute_symbols(&context, command)?))
+}
+
+fn execute_definition_query(
+    request: CliRequest,
+    execution: &ExecutionContext<'_>,
+    command: DefinitionCommandRequest<'_>,
+) -> Result<CommandOutput> {
+    let loaded = load_query_graph(&request, execution)?;
+    let deadline = Deadline::new(request.global.limits.timeout);
+    deadline.check(execution.cancellation)?;
+    let index = crate::build_graph_index(&loaded)?;
+    let context = QueryCommandContext::new(
+        &loaded,
+        &index,
+        &deadline,
+        execution.cancellation,
+        request.global.limits.max_file_bytes,
+    )?;
+    Ok(CommandOutput::Def(execute_definition(&context, command)?))
 }
 
 fn deadline_before_selection(
@@ -460,7 +537,7 @@ fn project_output(
 ) -> ProjectOutput {
     ProjectOutput {
         root: selection.canonical_root.to_string_lossy().into_owned(),
-        snapshot: snapshot.input_digest.to_string(),
+        snapshot: snapshot.candidate_id.to_string(),
         tier,
         freshness,
         cache,

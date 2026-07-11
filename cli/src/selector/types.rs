@@ -2,6 +2,8 @@
 
 //! Owned selector request and result contracts.
 
+use std::collections::HashMap;
+
 use code2graph::{Symbol, SymbolId, SymbolKind};
 use code2graph_query::GraphIndex;
 
@@ -38,6 +40,10 @@ pub struct SelectorContext<'a> {
     pub index: &'a GraphIndex,
     pub selection: &'a ProjectSelection,
     pub snapshot: &'a LoadedSnapshot,
+    /// Candidate content hashes keyed by normalized project-relative path.
+    /// Built once at command setup so position resolution does not linearly scan
+    /// untrusted cached file records for every selector.
+    pub candidate_hashes: &'a HashMap<String, [u8; 32]>,
     pub max_file_bytes: usize,
     pub deadline: &'a Deadline,
     pub cancellation: &'a dyn Cancellation,

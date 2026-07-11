@@ -28,11 +28,9 @@ pub(super) fn resolve_position(
         return Err(CliError::NoMatch);
     }
     let expected_hash = context
-        .snapshot
-        .files
-        .iter()
-        .find(|file| file.path == project_path.as_str())
-        .map(|file| file.content_hash)
+        .candidate_hashes
+        .get(project_path.as_str())
+        .copied()
         .ok_or_else(|| {
             CliError::Index("position source is absent from the loaded snapshot".into())
         })?;
@@ -232,6 +230,7 @@ fn source_lines(source: &str) -> Vec<(usize, usize)> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::fs;
 
     use code2graph::{
@@ -269,6 +268,14 @@ mod tests {
             span: ByteSpan { start, end },
             signature: name.into(),
         }
+    }
+
+    fn candidate_hashes(snapshot: &LoadedSnapshot) -> HashMap<String, [u8; 32]> {
+        snapshot
+            .files
+            .iter()
+            .map(|file| (file.path.clone(), file.content_hash))
+            .collect()
     }
 
     fn snapshot(bytes: &[u8], symbols: Vec<Symbol>) -> LoadedSnapshot {
@@ -365,6 +372,7 @@ mod tests {
         })
         .unwrap();
         let snapshot = snapshot(bytes, vec![first.clone(), second.clone()]);
+        let candidate_hashes = candidate_hashes(&snapshot);
         let selection = ProjectSelection {
             canonical_root: fs::canonicalize(directory.path()).unwrap(),
             canonical_source: None,
@@ -375,6 +383,7 @@ mod tests {
             index: &index,
             selection: &selection,
             snapshot: &snapshot,
+            candidate_hashes: &candidate_hashes,
             max_file_bytes: 64,
             deadline: &deadline,
             cancellation: &NeverCancelled,
@@ -411,6 +420,7 @@ mod tests {
         })
         .unwrap();
         let snapshot = snapshot(original, vec![definition]);
+        let candidate_hashes = candidate_hashes(&snapshot);
         let selection = ProjectSelection {
             canonical_root: fs::canonicalize(directory.path()).unwrap(),
             canonical_source: None,
@@ -421,6 +431,7 @@ mod tests {
             index: &index,
             selection: &selection,
             snapshot: &snapshot,
+            candidate_hashes: &candidate_hashes,
             max_file_bytes: 64,
             deadline: &deadline,
             cancellation: &NeverCancelled,
@@ -468,6 +479,7 @@ mod tests {
         })
         .unwrap();
         let snapshot = snapshot(b"x", vec![definition]);
+        let candidate_hashes = candidate_hashes(&snapshot);
         let selection = ProjectSelection {
             canonical_root: fs::canonicalize(directory.path()).unwrap(),
             canonical_source: None,
@@ -478,6 +490,7 @@ mod tests {
             index: &index,
             selection: &selection,
             snapshot: &snapshot,
+            candidate_hashes: &candidate_hashes,
             max_file_bytes: 64,
             deadline: &deadline,
             cancellation: &NeverCancelled,

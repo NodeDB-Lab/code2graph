@@ -137,6 +137,7 @@ fn position_match(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::path::Path;
 
     use code2graph::{
@@ -247,11 +248,13 @@ mod tests {
             provenance: SelectionProvenance::CurrentDirectory,
         };
         let deadline = Deadline::new(None);
+        let candidate_hashes = HashMap::new();
         resolve_selector(
             &SelectorContext {
                 index,
                 selection: &selection,
                 snapshot,
+                candidate_hashes: &candidate_hashes,
                 max_file_bytes: 1024,
                 deadline: &deadline,
                 cancellation: &NeverCancelled,

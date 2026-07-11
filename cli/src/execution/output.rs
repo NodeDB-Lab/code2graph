@@ -22,6 +22,20 @@ pub fn render_human(output: &CommandOutput) -> String {
             envelope.results.inventory.admitted_files,
             cache(envelope.results.project.cache)
         ),
+        CommandOutput::Symbols(envelope) | CommandOutput::Def(envelope) => {
+            let mut output = envelope
+                .results
+                .iter()
+                .map(|symbol| format!("{}:{}  {}\n", symbol.file, symbol.line, symbol.signature))
+                .collect::<String>();
+            if envelope.truncated {
+                output.push_str(&format!(
+                    "truncated: returned {} of {} results\n",
+                    envelope.returned, envelope.total
+                ));
+            }
+            output
+        }
         CommandOutput::LoadedGraph(graph) => format!(
             "loaded {} symbols and {} edges\n",
             graph.graph.symbols.len(),

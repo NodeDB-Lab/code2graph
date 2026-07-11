@@ -7,6 +7,14 @@ use code2graph::{Symbol, SymbolId};
 use super::GraphIndex;
 
 impl GraphIndex {
+    /// Return every locally-defined symbol in structural-ID order.
+    ///
+    /// Consumers that enumerate definitions must use this validated index rather
+    /// than the original graph vector, which may have been decoded from cache.
+    pub fn symbols(&self) -> impl Iterator<Item = &Symbol> {
+        self.definitions.values()
+    }
+
     /// Whether this graph knows a structural ID, including endpoint-only IDs.
     pub fn contains_id(&self, id: &SymbolId) -> bool {
         self.known_ids.contains(id)
@@ -153,6 +161,7 @@ mod tests {
         })
         .expect("valid graph");
 
+        assert_eq!(index.symbols().count(), 2);
         assert_eq!(index.symbols_with_scip(&display).len(), 2);
         assert_eq!(index.ids_with_scip(&display), vec![&python, &rust]);
         assert!(index.contains_id(&external_a));

@@ -4,6 +4,7 @@
 
 pub mod args;
 pub mod cache;
+mod commands;
 pub mod config;
 pub mod deadline;
 pub mod error;
