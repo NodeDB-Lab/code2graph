@@ -314,6 +314,7 @@ pub enum InventoryOmissionReasonOutput {
     TotalBytesLimit { limit: usize },
     FileCountLimit { limit: usize },
     InvalidUtf8,
+    ExtractionError,
     ChangedDuringRead,
     ReadError { error: StableIoErrorOutput },
 }
@@ -332,6 +333,7 @@ impl From<&OmissionReason> for InventoryOmissionReasonOutput {
             OmissionReason::TotalBytesLimit { limit } => Self::TotalBytesLimit { limit: *limit },
             OmissionReason::FileCountLimit { limit } => Self::FileCountLimit { limit: *limit },
             OmissionReason::InvalidUtf8 => Self::InvalidUtf8,
+            OmissionReason::ExtractionError => Self::ExtractionError,
             OmissionReason::ChangedDuringRead => Self::ChangedDuringRead,
             OmissionReason::ReadError { kind } => Self::ReadError {
                 error: (*kind).into(),

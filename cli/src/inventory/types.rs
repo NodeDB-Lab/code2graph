@@ -69,16 +69,28 @@ impl From<std::io::ErrorKind> for StableIoErrorKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OmissionReason {
     UnrecognizedExtension,
-    FeatureDisabled { language: Language },
+    FeatureDisabled {
+        language: Language,
+    },
     SymlinkFile,
     SymlinkDirectory,
     NotRegularFile,
-    FileTooLarge { limit: usize },
-    TotalBytesLimit { limit: usize },
-    FileCountLimit { limit: usize },
+    FileTooLarge {
+        limit: usize,
+    },
+    TotalBytesLimit {
+        limit: usize,
+    },
+    FileCountLimit {
+        limit: usize,
+    },
     InvalidUtf8,
+    /// Source-free semantic extraction failure from an isolated worker.
+    ExtractionError,
     ChangedDuringRead,
-    ReadError { kind: StableIoErrorKind },
+    ReadError {
+        kind: StableIoErrorKind,
+    },
 }
 
 impl OmissionReason {
@@ -94,6 +106,7 @@ impl OmissionReason {
             Self::TotalBytesLimit { .. } => "total-bytes-limit".into(),
             Self::FileCountLimit { .. } => "file-count-limit".into(),
             Self::InvalidUtf8 => "invalid-utf8".into(),
+            Self::ExtractionError => "extraction-error".into(),
             Self::ChangedDuringRead => "changed-during-read".into(),
             Self::ReadError { kind } => format!("read-error:{}", kind.as_str()),
         }
@@ -198,6 +211,7 @@ impl OmissionImpact {
             | OmissionReason::TotalBytesLimit { .. }
             | OmissionReason::FileCountLimit { .. }
             | OmissionReason::InvalidUtf8
+            | OmissionReason::ExtractionError
             | OmissionReason::ChangedDuringRead => Self::IncompleteSourceSet,
             OmissionReason::ReadError { .. }
             | OmissionReason::SymlinkFile
