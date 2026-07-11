@@ -1,5 +1,5 @@
 [workspace]
-members = ["eval", "bindings/python", "bindings/node"]
+members = ["eval", "bindings/python", "bindings/node", "query"]
 
 # Single source of truth for the version shared by the crate and all bindings.
 # CI stamps this from the git tag and mirrors it into pyproject.toml / package.json.

@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "code2graph-query"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Storage-free structural graph indexes and query primitives for code2graph facts."
+repository = "https://github.com/nodedb-lab/code2graph"
+keywords = ["code-graph", "static-analysis", "query", "symbols"]
+categories = ["development-tools", "parsing"]
+
+[dependencies]
+thiserror = "2"
+
+[dependencies.code2graph]
+path = ".."
+version = "0.0.0"
+default-features = false
