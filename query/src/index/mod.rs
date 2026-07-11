@@ -5,4 +5,5 @@
 mod build;
 mod lookup;
 
+pub use crate::relation::EdgeFilter;
 pub use build::GraphIndex;

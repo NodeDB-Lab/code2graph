@@ -5,6 +5,7 @@
 pub mod error;
 pub mod index;
 mod order;
+pub mod relation;
 
 pub use error::{QueryError, Result};
-pub use index::GraphIndex;
+pub use index::{EdgeFilter, GraphIndex};
