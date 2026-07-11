@@ -26,18 +26,21 @@ pub use error::{CliError, Result};
 pub use exit::ExitCode;
 pub use inventory::{
     FileClassification, InventoryCompleteness, InventoryFile, InventorySummary,
-    MaterializedCandidate, MtimeHint, OmissionReason, OmittedFile, SourceCandidate,
+    MaterializedCandidate, MtimeHint, OmissionImpact, OmissionReason, OmittedFile, SourceCandidate,
     SourceDiscovery, SourceInventory, StableIdentity, StableIoErrorKind, build_inventory,
-    discover_sources, materialize_candidate,
+    discover_sources, discover_sources_checked, materialize_candidate,
+    materialize_candidate_checked,
 };
 pub use package_assignment::{
     ManifestInput, ManifestOutcome, ManifestParserKind, PackageAssignmentSet, PackageDiagnostic,
     PackageDiagnosticKind, PackageSourcePath, SourcePackageAssignment, assign_packages,
+    assign_packages_checked,
 };
 pub use project::{ProjectPath, ProjectSelection, SelectionProvenance, select_project};
 pub use refresh::{
-    PriorFileRecord, PriorScopeState, RefreshDecision, RefreshEntry, RefreshInputs, RefreshPlan,
-    ResolveCandidateInputs, ResolvedCandidate, resolve_candidate,
+    ExtractionError, MAX_REFRESH_ATTEMPTS, PriorFileRecord, PriorScopeState, RefreshDecision,
+    RefreshEntry, RefreshInputs, RefreshPlan, ResolveCandidateInputs, ResolvedCandidate,
+    resolve_candidate,
 };
 pub use request::{CliRequest, CommandRequest, Selector, SourcePosition};
 pub use result::{

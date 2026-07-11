@@ -30,6 +30,7 @@ struct CandidateFileRow {
     size_bytes: i64,
     mtime_seconds: Option<i64>,
     mtime_nanoseconds: Option<i64>,
+    package_assignment: String,
     file_facts: Vec<u8>,
     file_subgraph: Option<Vec<u8>>,
 }
@@ -42,6 +43,7 @@ struct LoadedCandidateFileRow {
     size_bytes: i64,
     mtime_seconds: Option<i64>,
     mtime_nanoseconds: Option<i64>,
+    package_assignment: String,
     file_facts: Vec<u8>,
     file_subgraph: Option<Vec<u8>>,
 }
@@ -49,6 +51,8 @@ struct LoadedCandidateFileRow {
 #[derive(Debug)]
 struct CandidateSnapshotRow {
     compatibility_id: Vec<u8>,
+    language_fingerprint: Vec<u8>,
+    package_fingerprint: Vec<u8>,
     input_digest: Vec<u8>,
     completeness: i64,
     created_at_ns: i64,
@@ -62,7 +66,6 @@ struct ExistingCandidateRow {
     compatibility_id: Vec<u8>,
     input_digest: Vec<u8>,
     completeness: i64,
-    created_at_ns: i64,
     inventory_file_count: i64,
     inventory_total_bytes: i64,
 }
@@ -97,9 +100,11 @@ impl CacheStore {
         let version = user_version(&connection, deadline)?;
         match version {
             0 => {
-                ensure_pristine_v0(&connection, deadline)?;
-                configure_writable(&connection, deadline)?;
+                // Do not inspect pristine-v0 state outside the initialization
+                // lock. This connection may have observed v0 just before a
+                // concurrent opener committed v1.
                 initialize_or_join_v1(&connection, &root, &key, deadline)?;
+                configure_writable(&connection, deadline)?;
             }
             SCHEMA_VERSION => {
                 schema::validate_v1(&connection, &root, &key)?;
@@ -164,7 +169,8 @@ impl CacheStore {
         if !self.writable {
             return Err(CacheError::ReadOnly);
         }
-        let encoded = PreparedCandidate::new(candidate)?;
+        ensure_time(deadline)?;
+        let encoded = PreparedCandidate::new(candidate, deadline)?;
         ensure_time(deadline)?;
         set_busy_timeout(&self.connection, deadline)?;
         self.connection
@@ -173,31 +179,35 @@ impl CacheStore {
         let result = (|| {
             ensure_time(deadline)?;
             self.connection.execute(
-                "INSERT OR IGNORE INTO compatibility (compatibility_id, created_at_ns) VALUES (?1, ?2)",
-                params![encoded.compatibility_id.as_slice(), encoded.compatibility_created_at],
+                "INSERT OR IGNORE INTO compatibility (compatibility_id, language_fingerprint, package_fingerprint, created_at_ns) VALUES (?1, ?2, ?3, ?4)",
+                params![encoded.compatibility_id.as_slice(), encoded.language_fingerprint.as_slice(), encoded.package_fingerprint.as_slice(), encoded.compatibility_created_at],
             ).map_err(|error| map_sqlite_error(error, deadline))?;
-            let stored_compatibility: i64 = self
+            let stored_compatibility: (Vec<u8>, Vec<u8>, i64) = self
                 .connection
                 .query_row(
-                    "SELECT created_at_ns FROM compatibility WHERE compatibility_id = ?1",
+                    "SELECT language_fingerprint, package_fingerprint, created_at_ns FROM compatibility WHERE compatibility_id = ?1",
                     [encoded.compatibility_id.as_slice()],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .map_err(|error| map_sqlite_error(error, deadline))?;
-            if stored_compatibility != encoded.compatibility_created_at {
+            // Publication timestamps are store-owned. Fingerprint components,
+            // unlike timestamps, are exact compatibility content and conflicts
+            // must be rejected even when the derived compatibility id matches.
+            if stored_compatibility.0 != encoded.language_fingerprint
+                || stored_compatibility.1 != encoded.package_fingerprint
+            {
                 return Err(CacheError::CandidateConflict);
             }
             let existing: Option<ExistingCandidateRow> = self.connection.query_row(
-                "SELECT compatibility_id, input_digest, completeness, created_at_ns, inventory_file_count, inventory_total_bytes FROM candidates WHERE candidate_id = ?1",
+                "SELECT compatibility_id, input_digest, completeness, inventory_file_count, inventory_total_bytes FROM candidates WHERE candidate_id = ?1",
                 [encoded.candidate_id.as_slice()],
                 |row| {
                     Ok(ExistingCandidateRow {
                         compatibility_id: row.get(0)?,
                         input_digest: row.get(1)?,
                         completeness: row.get(2)?,
-                        created_at_ns: row.get(3)?,
-                        inventory_file_count: row.get(4)?,
-                        inventory_total_bytes: row.get(5)?,
+                        inventory_file_count: row.get(3)?,
+                        inventory_total_bytes: row.get(4)?,
                     })
                 },
             ).optional().map_err(|error| map_sqlite_error(error, deadline))?;
@@ -205,7 +215,6 @@ impl CacheStore {
                 if existing.compatibility_id != encoded.compatibility_id
                     || existing.input_digest != encoded.input_digest
                     || existing.completeness != encoded.completeness
-                    || existing.created_at_ns != encoded.created_at
                     || existing.inventory_file_count != encoded.inventory_file_count
                     || existing.inventory_total_bytes != encoded.inventory_total_bytes
                 {
@@ -218,6 +227,7 @@ impl CacheStore {
                     params![encoded.candidate_id.as_slice(), encoded.compatibility_id.as_slice(), encoded.input_digest.as_slice(), encoded.completeness, encoded.created_at, encoded.inventory_file_count, encoded.inventory_total_bytes],
                 ).map_err(|error| map_sqlite_error(error, deadline))?;
                 for omission in &encoded.omissions {
+                    ensure_time(deadline)?;
                     self.connection.execute(
                         "INSERT INTO candidate_omissions (candidate_id, path, reason) VALUES (?1, ?2, ?3)",
                         params![encoded.candidate_id.as_slice(), omission.path, omission.reason],
@@ -226,11 +236,19 @@ impl CacheStore {
                 for file in &encoded.files {
                     ensure_time(deadline)?;
                     self.connection.execute(
-                        "INSERT INTO candidate_files (candidate_id, path, language, content_hash, size_bytes, mtime_seconds, mtime_nanoseconds, file_facts, file_subgraph) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                        params![encoded.candidate_id.as_slice(), file.path, file.language, file.content_hash.as_slice(), file.size_bytes, file.mtime_seconds, file.mtime_nanoseconds, file.facts, file.subgraph],
+                        "INSERT INTO candidate_files (candidate_id, path, language, content_hash, size_bytes, mtime_seconds, mtime_nanoseconds, package_assignment, file_facts, file_subgraph) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                        params![encoded.candidate_id.as_slice(), file.path, file.language, file.content_hash.as_slice(), file.size_bytes, file.mtime_seconds, file.mtime_nanoseconds, file.package_assignment, file.facts, file.subgraph],
                     ).map_err(|error| map_sqlite_error(error, deadline))?;
                 }
             }
+            let candidate_created_at: i64 = self
+                .connection
+                .query_row(
+                    "SELECT created_at_ns FROM candidates WHERE candidate_id = ?1",
+                    [encoded.candidate_id.as_slice()],
+                    |row| row.get(0),
+                )
+                .map_err(|error| map_sqlite_error(error, deadline))?;
             for graph in &encoded.graphs {
                 ensure_time(deadline)?;
                 let existing: Option<Vec<u8>> = self.connection.query_row(
@@ -246,13 +264,11 @@ impl CacheStore {
                         params![encoded.candidate_id.as_slice(), graph.tier],
                         |row| row.get(0),
                     ).map_err(|error| map_sqlite_error(error, deadline))?;
-                    if stored_created_at != encoded.created_at {
-                        return Err(CacheError::CandidateConflict);
-                    }
+                    let _ = stored_created_at;
                 } else {
                     self.connection.execute(
                         "INSERT INTO graph_snapshots (candidate_id, resolver_tier, graph, created_at_ns) VALUES (?1, ?2, ?3, ?4)",
-                        params![encoded.candidate_id.as_slice(), graph.tier, graph.blob, encoded.created_at],
+                        params![encoded.candidate_id.as_slice(), graph.tier, graph.blob, candidate_created_at],
                     ).map_err(|error| map_sqlite_error(error, deadline))?;
                 }
                 // Do this last: a failed file/graph write cannot change visibility.
@@ -357,6 +373,7 @@ impl CacheStore {
             }
             let mut graph = IncrementalGraph::new();
             for file in loaded.files {
+                ensure_time(deadline)?;
                 let subgraph = file.subgraph.ok_or(CacheError::SnapshotMissing)?;
                 let blob = encode_subgraph(&subgraph)?;
                 restore_subgraph(&blob, file.path, &mut graph)?;
@@ -429,10 +446,11 @@ impl CacheStore {
             return Err(CacheError::CandidateConflict);
         }
         for file in &candidate.files {
+            ensure_time(deadline)?;
             let found: Option<CandidateFileRow> = self
                 .connection
                 .query_row(
-                    "SELECT language, content_hash, size_bytes, mtime_seconds, mtime_nanoseconds, file_facts, file_subgraph FROM candidate_files WHERE candidate_id = ?1 AND path = ?2",
+                    "SELECT language, content_hash, size_bytes, mtime_seconds, mtime_nanoseconds, package_assignment, file_facts, file_subgraph FROM candidate_files WHERE candidate_id = ?1 AND path = ?2",
                     params![candidate.candidate_id.as_slice(), file.path],
                     |row| {
                         Ok(CandidateFileRow {
@@ -441,8 +459,9 @@ impl CacheStore {
                             size_bytes: row.get(2)?,
                             mtime_seconds: row.get(3)?,
                             mtime_nanoseconds: row.get(4)?,
-                            file_facts: row.get(5)?,
-                            file_subgraph: row.get(6)?,
+                            package_assignment: row.get(5)?,
+                            file_facts: row.get(6)?,
+                            file_subgraph: row.get(7)?,
                         })
                     },
                 )
@@ -456,10 +475,22 @@ impl CacheStore {
                 || found.size_bytes != file.size_bytes
                 || found.mtime_seconds != file.mtime_seconds
                 || found.mtime_nanoseconds != file.mtime_nanoseconds
+                || found.package_assignment != file.package_assignment
                 || found.file_facts != file.facts
-                || found.file_subgraph != file.subgraph
             {
                 return Err(CacheError::CandidateConflict);
+            }
+            match (found.file_subgraph, &file.subgraph) {
+                (None, Some(subgraph)) => {
+                    self.connection.execute(
+                        "UPDATE candidate_files SET file_subgraph = ?1 WHERE candidate_id = ?2 AND path = ?3 AND file_subgraph IS NULL",
+                        params![subgraph, candidate.candidate_id.as_slice(), file.path],
+                    ).map_err(|error| map_sqlite_error(error, deadline))?;
+                }
+                (Some(stored), Some(incoming)) if stored != *incoming => {
+                    return Err(CacheError::CandidateConflict);
+                }
+                _ => {}
             }
         }
         Ok(())
@@ -475,17 +506,19 @@ impl CacheStore {
         let row: Option<CandidateSnapshotRow> = self
             .connection
             .query_row(
-                "SELECT c.compatibility_id, c.input_digest, c.completeness, c.created_at_ns, k.created_at_ns, c.inventory_file_count, c.inventory_total_bytes FROM candidates c JOIN compatibility k ON k.compatibility_id = c.compatibility_id WHERE c.candidate_id = ?1",
+                "SELECT c.compatibility_id, k.language_fingerprint, k.package_fingerprint, c.input_digest, c.completeness, c.created_at_ns, k.created_at_ns, c.inventory_file_count, c.inventory_total_bytes FROM candidates c JOIN compatibility k ON k.compatibility_id = c.compatibility_id WHERE c.candidate_id = ?1",
                 [candidate_id.as_bytes().as_slice()],
                 |row| {
                     Ok(CandidateSnapshotRow {
                         compatibility_id: row.get(0)?,
-                        input_digest: row.get(1)?,
-                        completeness: row.get(2)?,
-                        created_at_ns: row.get(3)?,
-                        compatibility_created_at_ns: row.get(4)?,
-                        inventory_file_count: row.get(5)?,
-                        inventory_total_bytes: row.get(6)?,
+                        language_fingerprint: row.get(1)?,
+                        package_fingerprint: row.get(2)?,
+                        input_digest: row.get(3)?,
+                        completeness: row.get(4)?,
+                        created_at_ns: row.get(5)?,
+                        compatibility_created_at_ns: row.get(6)?,
+                        inventory_file_count: row.get(7)?,
+                        inventory_total_bytes: row.get(8)?,
                     })
                 },
             )
@@ -495,6 +528,14 @@ impl CacheStore {
             return Err(CacheError::SnapshotMissing);
         };
         let compatibility = CompatibilityFingerprint::from_bytes(fixed_32(row.compatibility_id)?);
+        let language_fingerprint =
+            super::LanguageFeatureFingerprint::from_bytes(fixed_32(row.language_fingerprint)?);
+        let package_fingerprint =
+            super::PackageFingerprint::from_bytes(fixed_32(row.package_fingerprint)?);
+        if compatibility != CompatibilityFingerprint::new(language_fingerprint, package_fingerprint)
+        {
+            return Err(CacheError::Corrupt);
+        }
         let input_digest = ProjectInputDigest::from_bytes(fixed_32(row.input_digest)?);
         let completeness = CacheCompleteness::from_sql(row.completeness)?;
         let created_at = row.created_at_ns;
@@ -516,7 +557,7 @@ impl CacheStore {
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|error| map_sqlite_error(error, deadline))?
         };
-        let mut statement = self.connection.prepare("SELECT path, language, content_hash, size_bytes, mtime_seconds, mtime_nanoseconds, file_facts, file_subgraph FROM candidate_files WHERE candidate_id = ?1 ORDER BY path ASC").map_err(|error| map_sqlite_error(error, deadline))?;
+        let mut statement = self.connection.prepare("SELECT path, language, content_hash, size_bytes, mtime_seconds, mtime_nanoseconds, package_assignment, file_facts, file_subgraph FROM candidate_files WHERE candidate_id = ?1 ORDER BY path ASC").map_err(|error| map_sqlite_error(error, deadline))?;
         let rows = statement
             .query_map([candidate_id.as_bytes().as_slice()], |row| {
                 Ok(LoadedCandidateFileRow {
@@ -526,8 +567,9 @@ impl CacheStore {
                     size_bytes: row.get::<_, i64>(3)?,
                     mtime_seconds: row.get::<_, Option<i64>>(4)?,
                     mtime_nanoseconds: row.get::<_, Option<i64>>(5)?,
-                    file_facts: row.get::<_, Vec<u8>>(6)?,
-                    file_subgraph: row.get::<_, Option<Vec<u8>>>(7)?,
+                    package_assignment: row.get::<_, String>(6)?,
+                    file_facts: row.get::<_, Vec<u8>>(7)?,
+                    file_subgraph: row.get::<_, Option<Vec<u8>>>(8)?,
                 })
             })
             .map_err(|error| map_sqlite_error(error, deadline))?;
@@ -558,6 +600,7 @@ impl CacheStore {
                 content_hash: fixed_32(row.content_hash)?,
                 size_bytes: nonnegative(row.size_bytes)?,
                 mtime: decode_mtime(row.mtime_seconds, row.mtime_nanoseconds)?,
+                package_assignment: row.package_assignment,
                 facts,
                 subgraph,
             });
@@ -582,6 +625,7 @@ impl CacheStore {
             .next()
             .map_err(|error| map_sqlite_error(error, deadline))?
         {
+            ensure_time(deadline)?;
             let graph_created_at = row
                 .get::<_, i64>(2)
                 .map_err(|error| map_sqlite_error(error, deadline))?;
@@ -637,6 +681,8 @@ impl CacheStore {
             candidate_id,
             compatibility: CompatibilityRecord {
                 id: compatibility,
+                language_fingerprint,
+                package_fingerprint,
                 created_at_ns: nonnegative(compatibility_created_at)?,
             },
             input_digest,
@@ -666,6 +712,7 @@ struct PreparedFile {
     size_bytes: i64,
     mtime_seconds: Option<i64>,
     mtime_nanoseconds: Option<i64>,
+    package_assignment: String,
     facts: Vec<u8>,
     subgraph: Option<Vec<u8>>,
 }
@@ -678,6 +725,8 @@ struct PreparedGraph {
 struct PreparedCandidate {
     candidate_id: [u8; 32],
     compatibility_id: [u8; 32],
+    language_fingerprint: [u8; 32],
+    package_fingerprint: [u8; 32],
     input_digest: [u8; 32],
     completeness: i64,
     compatibility_created_at: i64,
@@ -690,7 +739,16 @@ struct PreparedCandidate {
 }
 
 impl PreparedCandidate {
-    fn new(candidate: &CandidateSnapshot) -> Result<Self, CacheError> {
+    fn new(candidate: &CandidateSnapshot, deadline: &Deadline) -> Result<Self, CacheError> {
+        ensure_time(deadline)?;
+        if candidate.compatibility.id
+            != CompatibilityFingerprint::new(
+                candidate.compatibility.language_fingerprint,
+                candidate.compatibility.package_fingerprint,
+            )
+        {
+            return Err(CacheError::InvalidCandidate);
+        }
         if candidate.inventory_file_count
             != u64::try_from(candidate.files.len()).map_err(|_| CacheError::InvalidCandidate)?
             || candidate.inventory_total_bytes
@@ -746,9 +804,14 @@ impl PreparedCandidate {
         }
         let mut files = Vec::with_capacity(candidate.files.len());
         for file in &candidate.files {
+            ensure_time(deadline)?;
             if file.path.is_empty()
                 || file.path.contains('\\')
                 || file.language.is_empty()
+                || !crate::package_assignment::SourcePackageAssignment::is_canonical_identity_for_path(
+                    &file.package_assignment,
+                    &file.path,
+                )
                 || file.facts.file != file.path
                 || file.facts.lang != file.language
             {
@@ -775,23 +838,24 @@ impl PreparedCandidate {
                 size_bytes,
                 mtime_seconds,
                 mtime_nanoseconds,
+                package_assignment: file.package_assignment.clone(),
                 facts,
                 subgraph,
             });
         }
-        let graphs = candidate
-            .tier_graphs
-            .iter()
-            .map(|(tier, graph)| {
-                Ok(PreparedGraph {
-                    tier: tier.as_sql(),
-                    blob: encode_graph(graph)?,
-                })
-            })
-            .collect::<Result<Vec<_>, CacheError>>()?;
+        let mut graphs = Vec::with_capacity(candidate.tier_graphs.len());
+        for (tier, graph) in &candidate.tier_graphs {
+            ensure_time(deadline)?;
+            graphs.push(PreparedGraph {
+                tier: tier.as_sql(),
+                blob: encode_graph(graph)?,
+            });
+        }
         Ok(Self {
             candidate_id: *candidate.candidate_id.as_bytes(),
             compatibility_id: *candidate.compatibility.id.as_bytes(),
+            language_fingerprint: *candidate.compatibility.language_fingerprint.as_bytes(),
+            package_fingerprint: *candidate.compatibility.package_fingerprint.as_bytes(),
             input_digest: *candidate.input_digest.as_bytes(),
             completeness: candidate.completeness.as_sql(),
             compatibility_created_at: i64::try_from(candidate.compatibility.created_at_ns)
@@ -1094,26 +1158,27 @@ mod tests {
                 seconds_since_unix_epoch: 0,
                 nanoseconds: 4,
             }),
+            package_assignment: "10:assignment8:src/a.rs4:none".into(),
             facts: empty_facts("src/a.rs"),
             subgraph: None,
         };
         let input_digest = ProjectInputDigest::from_inputs([("src/a.rs", "rust", [3; 32])]);
         let omissions = Vec::new();
+        let language_fingerprint = LanguageFeatureFingerprint::current();
+        let package_fingerprint = PackageFingerprint::from_normalized(["test"]);
+        let compatibility_id =
+            CompatibilityFingerprint::new(language_fingerprint, package_fingerprint);
         CandidateSnapshot {
             candidate_id: CandidateId::new(
-                CompatibilityFingerprint::new(
-                    LanguageFeatureFingerprint::current(),
-                    PackageFingerprint::from_normalized(["test"]),
-                ),
+                compatibility_id,
                 input_digest,
                 completeness,
                 &omissions,
             ),
             compatibility: CompatibilityRecord {
-                id: CompatibilityFingerprint::new(
-                    LanguageFeatureFingerprint::current(),
-                    PackageFingerprint::from_normalized(["test"]),
-                ),
+                id: compatibility_id,
+                language_fingerprint,
+                package_fingerprint,
                 created_at_ns: 1,
             },
             input_digest,
@@ -1178,6 +1243,23 @@ mod tests {
         let incompatible = CompatibilityFingerprint::new(
             super::super::LanguageFeatureFingerprint::current(),
             super::super::PackageFingerprint::from_normalized(["different-package"]),
+        );
+        let loaded_complete = store
+            .load_active(
+                ResolverCacheTier::Name,
+                CacheCompleteness::Complete,
+                complete.compatibility.id,
+                &Deadline::new(None),
+            )
+            .expect("load")
+            .expect("active");
+        assert_eq!(
+            loaded_complete.compatibility.language_fingerprint,
+            complete.compatibility.language_fingerprint
+        );
+        assert_eq!(
+            loaded_complete.compatibility.package_fingerprint,
+            complete.compatibility.package_fingerprint
         );
         assert!(
             store
@@ -1275,12 +1357,12 @@ mod tests {
         store
             .publish_candidate(&original, &Deadline::new(None))
             .expect("publish");
-        let mut conflict = original.clone();
-        conflict.created_at_ns += 1;
-        assert!(matches!(
-            store.publish_candidate(&conflict, &Deadline::new(None)),
-            Err(CacheError::CandidateConflict)
-        ));
+        let mut republished = original.clone();
+        republished.created_at_ns += 1;
+        republished.compatibility.created_at_ns += 1;
+        store
+            .publish_candidate(&republished, &Deadline::new(None))
+            .expect("timestamps are store-owned and do not conflict");
         assert_eq!(
             store
                 .load_active(
@@ -1309,12 +1391,25 @@ mod tests {
             store.publish_candidate(&snapshot, &Deadline::new(None)),
             Err(CacheError::InvalidCandidate)
         ));
+        // A Name snapshot may be published first; a later Scope publication
+        // for the identical candidate augments its per-file subgraphs.
+        let mut name = snapshot.clone();
+        name.tier_graphs = vec![(
+            ResolverCacheTier::Name,
+            CodeGraph {
+                symbols: Vec::new(),
+                edges: Vec::new(),
+            },
+        )];
+        store
+            .publish_candidate(&name, &Deadline::new(None))
+            .expect("publish name");
         let mut incremental = IncrementalGraph::new();
         incremental.upsert(&snapshot.files[0].facts);
         snapshot.files[0].subgraph = incremental.subgraph("src/a.rs").cloned();
         store
             .publish_candidate(&snapshot, &Deadline::new(None))
-            .expect("publish scope");
+            .expect("augment with scope");
         let restored = store
             .hydrate_scope_subgraphs(snapshot.candidate_id, &Deadline::new(None))
             .expect("hydrate");
@@ -1711,6 +1806,27 @@ mod tests {
     }
 
     #[test]
+    fn zero_deadline_precedes_candidate_validation_and_publication() {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().join("project");
+        fs::create_dir(&root).expect("project");
+        let cache_location = location(&root, temp.path());
+        let store =
+            CacheStore::open_writable(&cache_location, &root, &Deadline::new(None)).expect("store");
+        let mut invalid = candidate(CacheCompleteness::Complete, ResolverCacheTier::Name);
+        invalid.inventory_file_count = 99;
+        assert!(matches!(
+            store.publish_candidate(&invalid, &Deadline::new(Some(Duration::ZERO))),
+            Err(CacheError::Timeout)
+        ));
+        let count: i64 = store
+            .connection
+            .query_row("SELECT count(*) FROM candidates", [], |row| row.get(0))
+            .expect("candidate count");
+        assert_eq!(count, 0);
+    }
+
+    #[test]
     fn zero_deadline_precedes_directory_or_database_creation() {
         let temp = tempdir().expect("tempdir");
         let root = temp.path().join("project");
@@ -1722,6 +1838,30 @@ mod tests {
             Err(CacheError::Timeout)
         ));
         assert!(!cache_base.exists());
+    }
+
+    #[test]
+    fn stale_v0_observer_joins_an_already_committed_initialization() {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().join("project");
+        fs::create_dir(&root).expect("project");
+        let cache_location = location(&root, temp.path());
+        fs::create_dir_all(&cache_location.directory).expect("cache directory");
+        let stale = Connection::open(&cache_location.database_path).expect("stale observer");
+        assert_eq!(
+            user_version(&stale, &Deadline::new(None)).expect("observe v0"),
+            0
+        );
+
+        CacheStore::open_writable(&cache_location, &root, &Deadline::new(None))
+            .expect("concurrent initializer");
+        initialize_or_join_v1(
+            &stale,
+            &native_path_bytes(&root),
+            &cache_location.project_key.as_bytes(),
+            &Deadline::new(None),
+        )
+        .expect("stale observer joins v1");
     }
 
     #[test]
@@ -1832,8 +1972,8 @@ mod tests {
         writer
             .connection
             .execute(
-                "INSERT INTO compatibility (compatibility_id, created_at_ns) VALUES (?1, 0)",
-                [vec![7_u8; 32]],
+                "INSERT INTO compatibility (compatibility_id, language_fingerprint, package_fingerprint, created_at_ns) VALUES (?1, ?2, ?3, 0)",
+                params![vec![7_u8; 32], vec![8_u8; 32], vec![9_u8; 32]],
             )
             .expect("committed WAL row");
         let before = directory_state(&cache_location.directory);

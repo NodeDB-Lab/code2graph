@@ -151,11 +151,65 @@ pub struct InventoryFile {
     pub mtime: Option<MtimeHint>,
 }
 
+/// Whether an omission means the inventory does not cover the source set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OmissionImpact {
+    /// The path is not a recognized source input.
+    IgnoredNonSource,
+    /// A source input, or a directory which may contain source inputs, was skipped.
+    IncompleteSourceSet,
+}
+
 /// One discovered path excluded from the inventory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OmittedFile {
     pub path: ProjectPath,
     pub reason: OmissionReason,
+    pub impact: OmissionImpact,
+}
+
+impl OmittedFile {
+    /// Records an omission together with its source-set completeness impact.
+    pub fn new(path: ProjectPath, reason: OmissionReason) -> Self {
+        let impact = OmissionImpact::for_path_and_reason(&path, &reason);
+        Self {
+            path,
+            reason,
+            impact,
+        }
+    }
+
+    /// Records an omission whose path is known to be a traversal directory.
+    pub fn traversal_directory(path: ProjectPath, reason: OmissionReason) -> Self {
+        Self {
+            path,
+            reason,
+            impact: OmissionImpact::IncompleteSourceSet,
+        }
+    }
+}
+
+impl OmissionImpact {
+    fn for_path_and_reason(path: &ProjectPath, reason: &OmissionReason) -> Self {
+        match reason {
+            OmissionReason::UnrecognizedExtension => Self::IgnoredNonSource,
+            OmissionReason::FeatureDisabled { .. }
+            | OmissionReason::FileTooLarge { .. }
+            | OmissionReason::TotalBytesLimit { .. }
+            | OmissionReason::FileCountLimit { .. }
+            | OmissionReason::InvalidUtf8
+            | OmissionReason::ChangedDuringRead => Self::IncompleteSourceSet,
+            OmissionReason::ReadError { .. }
+            | OmissionReason::SymlinkFile
+            | OmissionReason::NotRegularFile => match Language::from_path(path.as_str()) {
+                Some(_) => Self::IncompleteSourceSet,
+                None => Self::IgnoredNonSource,
+            },
+            // A skipped directory can hide recognized sources, so it is never
+            // safe to claim source-set completeness.
+            OmissionReason::SymlinkDirectory => Self::IncompleteSourceSet,
+        }
+    }
 }
 
 /// Stable aggregate counts for the scanning result.

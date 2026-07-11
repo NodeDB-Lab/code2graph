@@ -14,10 +14,15 @@ mod tests {
     use code2graph::Language;
 
     use super::*;
+    use crate::cache::{
+        CacheCompleteness, CandidateFileRecord, CandidateId, CompatibilityFingerprint,
+        CompatibilityRecord, LanguageFeatureFingerprint, LoadedSnapshot, PackageFingerprint,
+        ProjectInputDigest, ResolverCacheTier,
+    };
     use crate::config::ResolverTier;
     use crate::inventory::{
-        FileClassification, MtimeHint, OmissionReason, OmittedFile, SourceCandidate,
-        SourceDiscovery, StableIdentity,
+        FileClassification, MtimeHint, OmissionImpact, OmissionReason, OmittedFile,
+        SourceCandidate, SourceDiscovery, StableIdentity,
     };
     use crate::project::ProjectPath;
 
@@ -45,7 +50,7 @@ mod tests {
         PriorFileRecord {
             path: path(value),
             language: Language::Rust,
-            content_hash: "old".into(),
+            content_hash: [1; 32],
             size_bytes: 3,
             mtime: Some(MtimeHint {
                 seconds_since_unix_epoch: -1,
@@ -54,6 +59,83 @@ mod tests {
             package_assignment: "package".into(),
             tier: ResolverTier::Scope,
         }
+    }
+
+    fn loaded_snapshot(path_value: &str, assignment: String) -> LoadedSnapshot {
+        let language = LanguageFeatureFingerprint::current();
+        let package = PackageFingerprint::from_normalized(["package"]);
+        let compatibility = CompatibilityFingerprint::new(language, package);
+        let input = ProjectInputDigest::from_inputs([(path_value, "rust", [7_u8; 32])]);
+        let candidate_id = CandidateId::new(compatibility, input, CacheCompleteness::Complete, &[]);
+        LoadedSnapshot {
+            candidate_id,
+            compatibility: CompatibilityRecord {
+                id: compatibility,
+                language_fingerprint: language,
+                package_fingerprint: package,
+                created_at_ns: 1,
+            },
+            input_digest: input,
+            completeness: CacheCompleteness::Complete,
+            omissions: Vec::new(),
+            created_at_ns: 2,
+            inventory_file_count: 1,
+            inventory_total_bytes: 3,
+            files: vec![CandidateFileRecord {
+                path: path_value.into(),
+                language: "rust".into(),
+                content_hash: [7; 32],
+                size_bytes: 3,
+                mtime: None,
+                package_assignment: assignment,
+                facts: code2graph::FileFacts {
+                    file: path_value.into(),
+                    lang: "rust".into(),
+                    symbols: Vec::new(),
+                    references: Vec::new(),
+                    scopes: Vec::new(),
+                    bindings: Vec::new(),
+                    ffi_exports: Vec::new(),
+                },
+                subgraph: None,
+            }],
+            tier_graphs: vec![(
+                ResolverCacheTier::Name,
+                code2graph::CodeGraph {
+                    symbols: Vec::new(),
+                    edges: Vec::new(),
+                },
+            )],
+        }
+    }
+
+    #[test]
+    fn loaded_snapshot_conversion_preserves_exact_hash_and_rejects_wrong_tier_or_assignment() {
+        let assignment = crate::package_assignment::SourcePackageAssignment {
+            source_path: path("src/a.rs"),
+            manifest_path: None,
+            package: None,
+        }
+        .canonical_identity();
+        let snapshot = loaded_snapshot("src/a.rs", assignment);
+        let records = PriorFileRecord::from_loaded_snapshot(&snapshot, ResolverTier::Name)
+            .expect("valid loaded snapshot");
+        assert_eq!(records[0].content_hash, [7; 32]);
+        assert_eq!(records[0].tier, ResolverTier::Name);
+        assert!(matches!(
+            PriorFileRecord::from_loaded_snapshot(&snapshot, ResolverTier::Scope),
+            Err(crate::CliError::Cache(_))
+        ));
+
+        let aliased =
+            snapshot.files[0]
+                .package_assignment
+                .replacen("10:assignment", "010:assignment", 1);
+        let malformed = loaded_snapshot("src/a.rs", aliased);
+        assert!(matches!(
+            PriorFileRecord::from_loaded_snapshot(&malformed, ResolverTier::Name),
+            Err(crate::CliError::Cache(_))
+        ));
     }
 
     #[test]
@@ -209,7 +291,7 @@ mod tests {
         );
         assert_eq!(matching.entries[1].decision, RefreshDecision::NeedHash);
         matching.finalize_hashes(
-            &BTreeMap::from([(path("z.rs"), "old".into())]),
+            &BTreeMap::from([(path("z.rs"), [1; 32])]),
             &prior_records,
             &assignments,
             &discovery.candidates,
@@ -219,7 +301,7 @@ mod tests {
 
         let mut changed = make_plan();
         changed.finalize_hashes(
-            &BTreeMap::from([(path("z.rs"), "new".into())]),
+            &BTreeMap::from([(path("z.rs"), [2; 32])]),
             &prior_records,
             &assignments,
             &discovery.candidates,
@@ -244,12 +326,12 @@ mod tests {
     fn force_new_delete_omit_and_duplicate_prior_paths_are_truthful() {
         let discovery = SourceDiscovery {
             candidates: vec![candidate("new.rs"), candidate("old.rs")],
-            omitted: vec![OmittedFile {
-                path: path("denied.rs"),
-                reason: OmissionReason::ReadError {
+            omitted: vec![OmittedFile::new(
+                path("denied.rs"),
+                OmissionReason::ReadError {
                     kind: crate::inventory::StableIoErrorKind::PermissionDenied,
                 },
-            }],
+            )],
         };
         let assignments = BTreeMap::from([
             (path("new.rs"), "package".into()),
@@ -273,9 +355,12 @@ mod tests {
                 },
                 RefreshEntry {
                     path: path("denied.rs"),
-                    decision: RefreshDecision::Omit(OmissionReason::ReadError {
-                        kind: crate::inventory::StableIoErrorKind::PermissionDenied,
-                    }),
+                    decision: RefreshDecision::Omit {
+                        reason: OmissionReason::ReadError {
+                            kind: crate::inventory::StableIoErrorKind::PermissionDenied,
+                        },
+                        impact: OmissionImpact::IncompleteSourceSet,
+                    },
                 },
                 RefreshEntry {
                     path: path("new.rs"),
@@ -287,5 +372,48 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn plan_preserves_directory_omission_impact_that_cannot_be_rederived_from_path() {
+        let directory_omission = OmittedFile::traversal_directory(
+            path("vendor"),
+            OmissionReason::ReadError {
+                kind: crate::inventory::StableIoErrorKind::PermissionDenied,
+            },
+        );
+        let ordinary_non_source = OmittedFile::new(
+            path("vendor"),
+            OmissionReason::ReadError {
+                kind: crate::inventory::StableIoErrorKind::PermissionDenied,
+            },
+        );
+        assert_eq!(
+            directory_omission.impact,
+            OmissionImpact::IncompleteSourceSet
+        );
+        assert_eq!(ordinary_non_source.impact, OmissionImpact::IgnoredNonSource);
+
+        for (omission, expected) in [
+            (directory_omission, OmissionImpact::IncompleteSourceSet),
+            (ordinary_non_source, OmissionImpact::IgnoredNonSource),
+        ] {
+            let discovery = SourceDiscovery {
+                candidates: Vec::new(),
+                omitted: vec![omission],
+            };
+            let plan = RefreshPlan::from_metadata(RefreshInputs {
+                discovery: &discovery,
+                prior: &[],
+                package_assignments: &BTreeMap::new(),
+                force: false,
+                trust_mtime: false,
+                tier: ResolverTier::Scope,
+            });
+            assert!(matches!(
+                &plan.entries[0].decision,
+                RefreshDecision::Omit { impact, .. } if *impact == expected
+            ));
+        }
     }
 }

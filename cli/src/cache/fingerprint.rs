@@ -13,7 +13,7 @@ use super::types::{CacheOmission, CandidateCompleteness};
 
 /// Manual cache compatibility epoch for unreleased (`0.0.0`) workspace builds.
 /// Bump this when cache-affecting behavior changes without a crate version change.
-pub const CACHE_IMPLEMENTATION_EPOCH: u32 = 1;
+pub const CACHE_IMPLEMENTATION_EPOCH: u32 = 2;
 
 macro_rules! fingerprint {
     ($name:ident) => {

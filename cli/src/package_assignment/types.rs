@@ -158,6 +158,37 @@ impl ManifestInput {
 }
 
 impl SourcePackageAssignment {
+    /// Canonical identity for this source's selected package, including the
+    /// explicit `none` outcome. It is suitable for refresh reuse checks.
+    pub fn canonical_identity(&self) -> String {
+        self.fingerprint_record()
+    }
+
+    /// Validates that an opaque persisted assignment is the exact canonical
+    /// record for `source_path`, including an explicit `none` selection.
+    pub(crate) fn is_canonical_identity_for_path(value: &str, source_path: &str) -> bool {
+        let Some(fields) = parse_canonical_record(value) else {
+            return false;
+        };
+        // Parsing alone is insufficient: decimal lengths with leading zeroes
+        // describe the same fields but are not the one canonical encoding.
+        if canonical_record(&fields) != value {
+            return false;
+        }
+        matches!(
+            fields.as_slice(),
+            [kind, path, state]
+                if kind == "assignment" && path == source_path && state == "none"
+        ) || matches!(
+            fields.as_slice(),
+            [kind, path, state, manifest, _manager, _name, _version]
+                if kind == "assignment"
+                    && path == source_path
+                    && state == "selected"
+                    && ProjectPath::new(std::path::Path::new(manifest)).is_ok()
+        )
+    }
+
     fn fingerprint_record(&self) -> String {
         let mut fields = vec!["assignment".to_owned(), self.source_path.to_string()];
         match (&self.manifest_path, &self.package) {
@@ -206,6 +237,21 @@ fn canonical_record(fields: &[String]) -> String {
     output
 }
 
+fn parse_canonical_record(mut value: &str) -> Option<Vec<String>> {
+    let mut fields = Vec::new();
+    while !value.is_empty() {
+        let colon = value.find(':')?;
+        let length: usize = value[..colon].parse().ok()?;
+        value = &value[colon + 1..];
+        if value.len() < length || !value.is_char_boundary(length) {
+            return None;
+        }
+        fields.push(value[..length].to_owned());
+        value = &value[length..];
+    }
+    Some(fields)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,5 +279,32 @@ mod tests {
             package: None,
         };
         assert_ne!(first.fingerprint_record(), second.fingerprint_record());
+    }
+
+    #[test]
+    fn canonical_assignment_validation_accepts_empty_package_fields_and_rejects_alias_encodings() {
+        let assignment = SourcePackageAssignment {
+            source_path: ProjectPath::new(std::path::Path::new("src/main.go")).expect("path"),
+            manifest_path: Some("go.mod".into()),
+            package: Some(Package {
+                manager: "go".into(),
+                name: "example.test/project".into(),
+                version: String::new(),
+            }),
+        };
+        let canonical = assignment.canonical_identity();
+        assert!(SourcePackageAssignment::is_canonical_identity_for_path(
+            &canonical,
+            "src/main.go"
+        ));
+        let alias = canonical.replacen("10:assignment", "010:assignment", 1);
+        assert!(!SourcePackageAssignment::is_canonical_identity_for_path(
+            &alias,
+            "src/main.go"
+        ));
+        assert!(!SourcePackageAssignment::is_canonical_identity_for_path(
+            &canonical,
+            "src/other.go"
+        ));
     }
 }

@@ -4,21 +4,94 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use code2graph::Language;
 
+use crate::cache::{LoadedSnapshot, ResolverCacheTier};
 use crate::config::ResolverTier;
-use crate::inventory::{MtimeHint, OmissionReason, SourceCandidate, SourceDiscovery};
+use crate::inventory::{
+    MtimeHint, OmissionImpact, OmissionReason, OmittedFile, SourceCandidate, SourceDiscovery,
+};
 use crate::project::ProjectPath;
+use crate::{CliError, Result};
+
+/// Maximum bounded attempts allowed when a filesystem input drifts during refresh.
+pub const MAX_REFRESH_ATTEMPTS: u8 = 3;
+
+/// Stable source-free extraction failure for refresh orchestration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtractionError {
+    /// The source changed while it was being materialized.
+    Drift,
+}
 
 /// Cached per-file facts metadata sufficient for refresh planning.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PriorFileRecord {
     pub path: ProjectPath,
     pub language: Language,
-    pub content_hash: String,
+    pub content_hash: [u8; 32],
     pub size_bytes: u64,
     pub mtime: Option<MtimeHint>,
     /// Canonical package-assignment identity, including selected manifest path.
     pub package_assignment: String,
     pub tier: ResolverTier,
+}
+
+impl PriorFileRecord {
+    /// Converts a loaded cache candidate into refresh metadata only after
+    /// validating the persistence invariants needed for reuse.
+    pub fn from_loaded_snapshot(
+        snapshot: &LoadedSnapshot,
+        requested_tier: ResolverTier,
+    ) -> Result<Vec<Self>> {
+        let requested_cache_tier = match requested_tier {
+            ResolverTier::Name => ResolverCacheTier::Name,
+            ResolverTier::Scope => ResolverCacheTier::Scope,
+            ResolverTier::Dense => ResolverCacheTier::Dense,
+        };
+        if !snapshot
+            .tier_graphs
+            .iter()
+            .any(|(tier, _)| *tier == requested_cache_tier)
+        {
+            return Err(CliError::Cache(
+                "requested resolver tier is absent from snapshot".into(),
+            ));
+        }
+        let mut records = Vec::with_capacity(snapshot.files.len());
+        let mut previous: Option<&str> = None;
+        for file in &snapshot.files {
+            if previous.is_some_and(|path| path >= file.path.as_str()) {
+                return Err(CliError::Cache(
+                    "snapshot file paths are not strictly sorted and unique".into(),
+                ));
+            }
+            let path = ProjectPath::new(std::path::Path::new(&file.path))
+                .map_err(|_| CliError::Cache("snapshot contains an invalid project path".into()))?;
+            let language = Language::ALL
+                .iter()
+                .copied()
+                .find(|language| language.as_str() == file.language)
+                .ok_or_else(|| CliError::Cache("snapshot contains an unknown language".into()))?;
+            if !crate::package_assignment::SourcePackageAssignment::is_canonical_identity_for_path(
+                &file.package_assignment,
+                path.as_str(),
+            ) {
+                return Err(CliError::Cache(
+                    "snapshot contains a non-canonical package assignment".into(),
+                ));
+            }
+            records.push(Self {
+                path,
+                language,
+                content_hash: file.content_hash,
+                size_bytes: file.size_bytes,
+                mtime: file.mtime,
+                package_assignment: file.package_assignment.clone(),
+                tier: requested_tier,
+            });
+            previous = Some(file.path.as_str());
+        }
+        Ok(records)
+    }
 }
 
 /// Immutable inputs to the filesystem-free refresh planner.
@@ -40,7 +113,10 @@ pub enum RefreshDecision {
     ReuseFacts,
     Extract,
     Remove,
-    Omit(OmissionReason),
+    Omit {
+        reason: OmissionReason,
+        impact: OmissionImpact,
+    },
 }
 
 /// One deterministic per-path refresh action.
@@ -85,7 +161,7 @@ impl RefreshPlan {
             current.insert(omission.path.clone());
             entries.push(RefreshEntry {
                 path: omission.path.clone(),
-                decision: RefreshDecision::Omit(omission.reason.clone()),
+                decision: omission_decision(omission),
             });
         }
         for record in prior.values() {
@@ -103,7 +179,7 @@ impl RefreshPlan {
     /// Finalizes `NeedHash` actions after bounded materialization produced exact hashes.
     pub fn finalize_hashes(
         &mut self,
-        materialized_hashes: &BTreeMap<ProjectPath, String>,
+        materialized_hashes: &BTreeMap<ProjectPath, [u8; 32]>,
         prior: &[PriorFileRecord],
         package_assignments: &BTreeMap<ProjectPath, String>,
         candidates: &[SourceCandidate],
@@ -144,6 +220,13 @@ impl RefreshPlan {
     }
 }
 
+fn omission_decision(omission: &OmittedFile) -> RefreshDecision {
+    RefreshDecision::Omit {
+        reason: omission.reason.clone(),
+        impact: omission.impact,
+    }
+}
+
 fn metadata_decision(
     candidate: &SourceCandidate,
     prior: Option<&PriorFileRecord>,
@@ -153,7 +236,7 @@ fn metadata_decision(
     tier: ResolverTier,
 ) -> RefreshDecision {
     let Some(language) = candidate.language else {
-        return RefreshDecision::Omit(match candidate.classification {
+        let reason = match candidate.classification {
             crate::inventory::FileClassification::FeatureDisabled(language) => {
                 OmissionReason::FeatureDisabled { language }
             }
@@ -163,7 +246,8 @@ fn metadata_decision(
             crate::inventory::FileClassification::Enabled(_) => {
                 OmissionReason::UnrecognizedExtension
             }
-        });
+        };
+        return omission_decision(&OmittedFile::new(candidate.path.clone(), reason));
     };
     if force {
         return RefreshDecision::Extract;

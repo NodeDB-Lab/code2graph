@@ -6,7 +6,10 @@ use code2graph::{CodeGraph, FileFacts, FileSubgraph};
 
 use crate::inventory::MtimeHint;
 
-use super::{CandidateId, CompatibilityFingerprint, ProjectInputDigest};
+use super::{
+    CandidateId, CompatibilityFingerprint, LanguageFeatureFingerprint, PackageFingerprint,
+    ProjectInputDigest,
+};
 
 /// Resolver output stored in a cache graph snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -37,6 +40,10 @@ pub struct CacheOmission {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompatibilityRecord {
     pub id: CompatibilityFingerprint,
+    /// Independently persisted extractor/language compatibility input.
+    pub language_fingerprint: LanguageFeatureFingerprint,
+    /// Independently persisted manifest/package compatibility input.
+    pub package_fingerprint: PackageFingerprint,
     pub created_at_ns: u64,
 }
 
@@ -48,6 +55,8 @@ pub struct CandidateFileRecord {
     pub content_hash: [u8; 32],
     pub size_bytes: u64,
     pub mtime: Option<MtimeHint>,
+    /// Canonical source package assignment identity, including `none`.
+    pub package_assignment: String,
     pub facts: FileFacts,
     pub subgraph: Option<FileSubgraph>,
 }

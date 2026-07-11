@@ -4,12 +4,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, Metadata};
-use std::io::{Read, Result as IoResult};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use crate::inventory::{InventoryFile, MtimeHint, SourceCandidate};
 use crate::project::ProjectPath;
+use crate::{Cancellation, Deadline, NeverCancelled, Result};
 
 use super::{
     ManifestInput, ManifestOutcome, ManifestParserKind, PackageAssignmentSet, PackageDiagnostic,
@@ -45,11 +46,32 @@ pub fn assign_packages<T: PackageSourcePath>(
     files: &[T],
     max_manifest_bytes: usize,
 ) -> PackageAssignmentSet {
-    let candidates = candidate_paths(root, files);
+    let deadline = Deadline::new(None);
+    // This cannot fail for an unbounded, never-cancelled deadline.
+    assign_packages_checked(root, files, max_manifest_bytes, &deadline, &NeverCancelled)
+        .unwrap_or_else(|_| PackageAssignmentSet {
+            manifests: Vec::new(),
+            assignments: Vec::new(),
+            diagnostics: Vec::new(),
+        })
+}
+
+/// Checked package assignment. Deadline/cancellation failures abort assignment
+/// rather than being represented as manifest diagnostics.
+pub fn assign_packages_checked<T: PackageSourcePath>(
+    root: &Path,
+    files: &[T],
+    max_manifest_bytes: usize,
+    deadline: &Deadline,
+    cancellation: &dyn Cancellation,
+) -> Result<PackageAssignmentSet> {
+    deadline.check(cancellation)?;
+    let candidates = candidate_paths(root, files, deadline, cancellation)?;
     let mut manifests = BTreeMap::new();
     let mut diagnostics = Vec::new();
 
     for path in candidates {
+        deadline.check(cancellation)?;
         let Ok(relative_path) = path.strip_prefix(root) else {
             continue;
         };
@@ -68,25 +90,26 @@ pub fn assign_packages<T: PackageSourcePath>(
             continue;
         }
 
-        let (content_hash, outcome) = match read_manifest(&path, max_manifest_bytes) {
-            Ok(bytes) => {
-                let content_hash = Some(blake3::hash(&bytes).to_hex().to_string());
-                match String::from_utf8(bytes) {
-                    Ok(text) => match code2graph::package::from_manifest(name, &text) {
-                        Some(package) => (content_hash, ManifestOutcome::Parsed(package)),
-                        None => (
+        let (content_hash, outcome) =
+            match read_manifest(&path, max_manifest_bytes, deadline, cancellation)? {
+                Ok(bytes) => {
+                    let content_hash = Some(blake3::hash(&bytes).to_hex().to_string());
+                    match String::from_utf8(bytes) {
+                        Ok(text) => match code2graph::package::from_manifest(name, &text) {
+                            Some(package) => (content_hash, ManifestOutcome::Parsed(package)),
+                            None => (
+                                content_hash,
+                                ManifestOutcome::Failed(PackageDiagnosticKind::Unparseable),
+                            ),
+                        },
+                        Err(_) => (
                             content_hash,
-                            ManifestOutcome::Failed(PackageDiagnosticKind::Unparseable),
+                            ManifestOutcome::Failed(PackageDiagnosticKind::InvalidUtf8),
                         ),
-                    },
-                    Err(_) => (
-                        content_hash,
-                        ManifestOutcome::Failed(PackageDiagnosticKind::InvalidUtf8),
-                    ),
+                    }
                 }
-            }
-            Err(kind) => (None, ManifestOutcome::Failed(kind)),
-        };
+                Err(kind) => (None, ManifestOutcome::Failed(kind)),
+            };
         let input = ManifestInput {
             path: relative,
             content_hash,
@@ -112,21 +135,29 @@ pub fn assign_packages<T: PackageSourcePath>(
         .collect();
     assignments.sort_by(|left, right| left.source_path.cmp(&right.source_path));
 
-    PackageAssignmentSet {
+    deadline.check(cancellation)?;
+    Ok(PackageAssignmentSet {
         manifests,
         assignments,
         diagnostics,
-    }
+    })
 }
 
-fn candidate_paths<T: PackageSourcePath>(root: &Path, files: &[T]) -> BTreeSet<PathBuf> {
+fn candidate_paths<T: PackageSourcePath>(
+    root: &Path,
+    files: &[T],
+    deadline: &Deadline,
+    cancellation: &dyn Cancellation,
+) -> Result<BTreeSet<PathBuf>> {
     let mut candidates = BTreeSet::new();
     for file in files {
+        deadline.check(cancellation)?;
         let mut directory = root
             .join(file.package_source_path().as_str())
             .parent()
             .map(Path::to_path_buf);
         while let Some(current) = directory {
+            deadline.check(cancellation)?;
             if current.strip_prefix(root).is_err() {
                 break;
             }
@@ -139,7 +170,7 @@ fn candidate_paths<T: PackageSourcePath>(root: &Path, files: &[T]) -> BTreeSet<P
             directory = current.parent().map(Path::to_path_buf);
         }
     }
-    candidates
+    Ok(candidates)
 }
 
 fn select_package(
@@ -180,7 +211,7 @@ fn select_package(
     }
 }
 
-fn path_utf8(path: &Path) -> Result<String, ()> {
+fn path_utf8(path: &Path) -> std::result::Result<String, ()> {
     let value = path.to_str().ok_or(())?;
     #[cfg(windows)]
     {
@@ -195,35 +226,57 @@ fn path_utf8(path: &Path) -> Result<String, ()> {
 /// Reads exactly one regular, non-symlink manifest up to `limit` bytes.
 /// Metadata from the pathname and open handle must agree before and after the
 /// read, preventing a replaced path or a symlink race from being accepted.
-fn read_manifest(path: &Path, limit: usize) -> Result<Vec<u8>, PackageDiagnosticKind> {
-    let path_before_metadata = fs::symlink_metadata(path).map_err(read_error)?;
+fn read_manifest(
+    path: &Path,
+    limit: usize,
+    deadline: &Deadline,
+    cancellation: &dyn Cancellation,
+) -> Result<std::result::Result<Vec<u8>, PackageDiagnosticKind>> {
+    deadline.check(cancellation)?;
+    let path_before_metadata = match fs::symlink_metadata(path) {
+        Ok(value) => value,
+        Err(error) => return Ok(Err(read_error(error))),
+    };
     if path_before_metadata.file_type().is_symlink() {
-        return Err(PackageDiagnosticKind::Symlink);
+        return Ok(Err(PackageDiagnosticKind::Symlink));
     }
     if !path_before_metadata.is_file() {
-        return Err(PackageDiagnosticKind::NotRegularFile);
+        return Ok(Err(PackageDiagnosticKind::NotRegularFile));
     }
     if path_before_metadata.len() > limit as u64 {
-        return Err(PackageDiagnosticKind::TooLarge { limit });
+        return Ok(Err(PackageDiagnosticKind::TooLarge { limit }));
     }
     let path_before = FileFingerprint::from_metadata(&path_before_metadata);
-
-    let mut file = File::open(path).map_err(read_error)?;
-    let handle_before_metadata = file.metadata().map_err(read_error)?;
+    deadline.check(cancellation)?;
+    let mut file = match File::open(path) {
+        Ok(value) => value,
+        Err(error) => return Ok(Err(read_error(error))),
+    };
+    let handle_before_metadata = match file.metadata() {
+        Ok(value) => value,
+        Err(error) => return Ok(Err(read_error(error))),
+    };
     if !handle_before_metadata.is_file()
         || FileFingerprint::from_metadata(&handle_before_metadata) != path_before
     {
-        return Err(PackageDiagnosticKind::ChangedDuringRead);
+        return Ok(Err(PackageDiagnosticKind::ChangedDuringRead));
     }
-
     let mut bytes = Vec::with_capacity(limit.saturating_add(1).min(65_536));
-    read_at_most(&mut file, limit, &mut bytes).map_err(read_error)?;
-    if bytes.len() > limit {
-        return Err(PackageDiagnosticKind::TooLarge { limit });
+    if let Err(kind) = read_at_most(&mut file, limit, &mut bytes, deadline, cancellation)? {
+        return Ok(Err(kind));
     }
-
-    let handle_after_metadata = file.metadata().map_err(read_error)?;
-    let path_after_metadata = fs::symlink_metadata(path).map_err(read_error)?;
+    if bytes.len() > limit {
+        return Ok(Err(PackageDiagnosticKind::TooLarge { limit }));
+    }
+    deadline.check(cancellation)?;
+    let handle_after_metadata = match file.metadata() {
+        Ok(value) => value,
+        Err(error) => return Ok(Err(read_error(error))),
+    };
+    let path_after_metadata = match fs::symlink_metadata(path) {
+        Ok(value) => value,
+        Err(error) => return Ok(Err(read_error(error))),
+    };
     if path_after_metadata.file_type().is_symlink()
         || !path_after_metadata.is_file()
         || FileFingerprint::from_metadata(&handle_before_metadata)
@@ -231,26 +284,36 @@ fn read_manifest(path: &Path, limit: usize) -> Result<Vec<u8>, PackageDiagnostic
         || FileFingerprint::from_metadata(&handle_after_metadata)
             != FileFingerprint::from_metadata(&path_after_metadata)
     {
-        return Err(PackageDiagnosticKind::ChangedDuringRead);
+        return Ok(Err(PackageDiagnosticKind::ChangedDuringRead));
     }
-    Ok(bytes)
+    Ok(Ok(bytes))
 }
 
-fn read_at_most(file: &mut File, limit: usize, bytes: &mut Vec<u8>) -> IoResult<()> {
+fn read_at_most(
+    file: &mut File,
+    limit: usize,
+    bytes: &mut Vec<u8>,
+    deadline: &Deadline,
+    cancellation: &dyn Cancellation,
+) -> Result<std::result::Result<(), PackageDiagnosticKind>> {
     let mut buffer = [0; 8192];
     loop {
+        deadline.check(cancellation)?;
         let remaining = limit.saturating_add(1).saturating_sub(bytes.len());
         if remaining == 0 {
             break;
         }
         let chunk_len = buffer.len().min(remaining);
-        let read = file.read(&mut buffer[..chunk_len])?;
+        let read = match file.read(&mut buffer[..chunk_len]) {
+            Ok(read) => read,
+            Err(error) => return Ok(Err(read_error(error))),
+        };
         if read == 0 {
             break;
         }
         bytes.extend_from_slice(&buffer[..read]);
     }
-    Ok(())
+    Ok(Ok(()))
 }
 
 fn read_error(error: std::io::Error) -> PackageDiagnosticKind {
@@ -460,7 +523,13 @@ mod tests {
         assert!(empty.assignments[0].package.is_none());
         assert!(empty.manifests.is_empty());
 
-        let candidates = candidate_paths(root, &[file("nested/file.rs")]);
+        let candidates = candidate_paths(
+            root,
+            &[file("nested/file.rs")],
+            &Deadline::new(None),
+            &NeverCancelled,
+        )
+        .expect("candidate paths");
         assert!(
             candidates
                 .iter()

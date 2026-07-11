@@ -17,6 +17,7 @@ use super::{
 use crate::config::ResourceLimits;
 use crate::error::Result;
 use crate::project::{ProjectPath, ProjectSelection};
+use crate::{Cancellation, Deadline, NeverCancelled};
 
 const HARD: &[&str] = &[
     ".git",
@@ -41,6 +42,26 @@ pub fn discover_sources(
     limits: &ResourceLimits,
     include_hidden: bool,
 ) -> Result<SourceDiscovery> {
+    let deadline = Deadline::new(None);
+    discover_sources_checked(
+        selection,
+        limits,
+        include_hidden,
+        &deadline,
+        &NeverCancelled,
+    )
+}
+
+/// Checked variant of [`discover_sources`]. Cancellation and deadline expiry
+/// abort discovery rather than being recorded as filesystem omissions.
+pub fn discover_sources_checked(
+    selection: &ProjectSelection,
+    limits: &ResourceLimits,
+    include_hidden: bool,
+    deadline: &Deadline,
+    cancellation: &dyn Cancellation,
+) -> Result<SourceDiscovery> {
+    deadline.check(cancellation)?;
     let root = &selection.canonical_root;
     let mut builder = WalkBuilder::new(root);
     builder
@@ -62,6 +83,7 @@ pub fn discover_sources(
     let mut candidates = Vec::new();
     let mut omitted = Vec::new();
     for result in builder.build() {
+        deadline.check(cancellation)?;
         let entry = match result {
             Ok(entry) => entry,
             Err(error) => {
@@ -69,14 +91,14 @@ pub fn discover_sources(
                     .and_then(|path| path.strip_prefix(root).ok())
                     .and_then(|path| ProjectPath::new(path).ok())
                 {
-                    omitted.push(OmittedFile {
+                    omitted.push(OmittedFile::traversal_directory(
                         path,
-                        reason: OmissionReason::ReadError {
+                        OmissionReason::ReadError {
                             kind: error
                                 .io_error()
                                 .map_or(StableIoErrorKind::Other, |error| error.kind().into()),
                         },
-                    });
+                    ));
                 }
                 continue;
             }
@@ -105,29 +127,26 @@ pub fn discover_sources(
         let metadata = match fs::symlink_metadata(entry.path()) {
             Ok(value) => value,
             Err(error) => {
-                omitted.push(OmittedFile {
+                omitted.push(OmittedFile::new(
                     path,
-                    reason: OmissionReason::ReadError {
+                    OmissionReason::ReadError {
                         kind: error.kind().into(),
                     },
-                });
+                ));
                 continue;
             }
         };
         if metadata.file_type().is_symlink() {
-            omitted.push(OmittedFile {
+            omitted.push(OmittedFile::new(
                 path,
-                reason: if fs::metadata(entry.path()).is_ok_and(|m| m.is_dir()) {
+                if fs::metadata(entry.path()).is_ok_and(|m| m.is_dir()) {
                     OmissionReason::SymlinkDirectory
                 } else {
                     OmissionReason::SymlinkFile
                 },
-            });
+            ));
         } else if !metadata.is_dir() && !metadata.is_file() {
-            omitted.push(OmittedFile {
-                path,
-                reason: OmissionReason::NotRegularFile,
-            });
+            omitted.push(OmittedFile::new(path, OmissionReason::NotRegularFile));
         } else if metadata.is_file() {
             let classification = classify(&path);
             candidates.push(SourceCandidate {
@@ -157,13 +176,51 @@ pub fn materialize_candidate(
     candidate: &SourceCandidate,
     limits: &ResourceLimits,
 ) -> MaterializedCandidate {
+    // An unbounded, never-cancelled wrapper preserves the historical API.
+    materialize_candidate_unchecked(candidate, limits)
+}
+
+/// Checked variant of [`materialize_candidate`]. Timeout and cancellation are
+/// returned to the caller and are never converted to omissions.
+pub fn materialize_candidate_checked(
+    candidate: &SourceCandidate,
+    limits: &ResourceLimits,
+    deadline: &Deadline,
+    cancellation: &dyn Cancellation,
+) -> Result<MaterializedCandidate> {
+    deadline.check(cancellation)?;
+    let result = materialize_candidate_inner(candidate, limits, Some((deadline, cancellation)))?;
+    deadline.check(cancellation)?;
+    Ok(result)
+}
+
+fn materialize_candidate_unchecked(
+    candidate: &SourceCandidate,
+    limits: &ResourceLimits,
+) -> MaterializedCandidate {
+    // The legacy API intentionally has no cancellation source.
+    materialize_candidate_inner(candidate, limits, None)
+        .expect("unchecked materialization cannot fail")
+}
+
+fn materialize_candidate_inner(
+    candidate: &SourceCandidate,
+    limits: &ResourceLimits,
+    checked: Option<(&Deadline, &dyn Cancellation)>,
+) -> Result<MaterializedCandidate> {
     let Some(language) = candidate.language else {
-        return MaterializedCandidate::Omitted(OmittedFile {
-            path: candidate.path.clone(),
-            reason: classification_omission(candidate.classification),
-        });
+        return Ok(MaterializedCandidate::Omitted(OmittedFile::new(
+            candidate.path.clone(),
+            classification_omission(candidate.classification),
+        )));
     };
-    match read_bounded(candidate, limits.max_file_bytes) {
+    let read = match checked {
+        Some((deadline, cancellation)) => {
+            read_bounded_checked(candidate, limits.max_file_bytes, deadline, cancellation)?
+        }
+        None => read_bounded(candidate, limits.max_file_bytes),
+    };
+    Ok(match read {
         Ok((bytes, fingerprint)) => match String::from_utf8(bytes.clone()) {
             Ok(text) => MaterializedCandidate::File(InventoryFile {
                 path: candidate.path.clone(),
@@ -173,26 +230,26 @@ pub fn materialize_candidate(
                 text,
                 mtime: fingerprint.mtime,
             }),
-            Err(_) => MaterializedCandidate::Omitted(OmittedFile {
-                path: candidate.path.clone(),
-                reason: OmissionReason::InvalidUtf8,
-            }),
+            Err(_) => MaterializedCandidate::Omitted(OmittedFile::new(
+                candidate.path.clone(),
+                OmissionReason::InvalidUtf8,
+            )),
         },
-        Err(Failure::TooLarge) => MaterializedCandidate::Omitted(OmittedFile {
-            path: candidate.path.clone(),
-            reason: OmissionReason::FileTooLarge {
+        Err(Failure::TooLarge) => MaterializedCandidate::Omitted(OmittedFile::new(
+            candidate.path.clone(),
+            OmissionReason::FileTooLarge {
                 limit: limits.max_file_bytes,
             },
-        }),
-        Err(Failure::Changed) => MaterializedCandidate::Omitted(OmittedFile {
-            path: candidate.path.clone(),
-            reason: OmissionReason::ChangedDuringRead,
-        }),
-        Err(Failure::Io(kind)) => MaterializedCandidate::Omitted(OmittedFile {
-            path: candidate.path.clone(),
-            reason: OmissionReason::ReadError { kind },
-        }),
-    }
+        )),
+        Err(Failure::Changed) => MaterializedCandidate::Omitted(OmittedFile::new(
+            candidate.path.clone(),
+            OmissionReason::ChangedDuringRead,
+        )),
+        Err(Failure::Io(kind)) => MaterializedCandidate::Omitted(OmittedFile::new(
+            candidate.path.clone(),
+            OmissionReason::ReadError { kind },
+        )),
+    })
 }
 
 /// Builds the historical full inventory by composing metadata discovery and materialization.
@@ -207,19 +264,19 @@ pub fn build_inventory(
     let mut total = 0usize;
     for candidate in discovery.candidates {
         if candidate.language.is_none() {
-            omitted.push(OmittedFile {
-                path: candidate.path,
-                reason: classification_omission(candidate.classification),
-            });
+            omitted.push(OmittedFile::new(
+                candidate.path,
+                classification_omission(candidate.classification),
+            ));
             continue;
         }
         if files.len() >= limits.max_files {
-            omitted.push(OmittedFile {
-                path: candidate.path,
-                reason: OmissionReason::FileCountLimit {
+            omitted.push(OmittedFile::new(
+                candidate.path,
+                OmissionReason::FileCountLimit {
                     limit: limits.max_files,
                 },
-            });
+            ));
             continue;
         }
         match materialize_candidate(&candidate, limits) {
@@ -229,12 +286,12 @@ pub fn build_inventory(
                 total += file.bytes.len();
                 files.push(file);
             }
-            MaterializedCandidate::File(file) => omitted.push(OmittedFile {
-                path: file.path,
-                reason: OmissionReason::TotalBytesLimit {
+            MaterializedCandidate::File(file) => omitted.push(OmittedFile::new(
+                file.path,
+                OmissionReason::TotalBytesLimit {
                     limit: limits.max_total_bytes,
                 },
-            }),
+            )),
             MaterializedCandidate::Omitted(omission) => omitted.push(omission),
         }
     }
@@ -247,10 +304,13 @@ pub fn build_inventory(
         entry.1 += 1;
     }
     Ok(SourceInventory {
-        completeness: if omitted.is_empty() {
-            InventoryCompleteness::Complete
-        } else {
+        completeness: if omitted
+            .iter()
+            .any(|omission| omission.impact == super::OmissionImpact::IncompleteSourceSet)
+        {
             InventoryCompleteness::Partial
+        } else {
+            InventoryCompleteness::Complete
         },
         summary: InventorySummary {
             admitted_files: files.len(),
@@ -325,10 +385,37 @@ fn read_bounded(
     candidate: &SourceCandidate,
     limit: usize,
 ) -> std::result::Result<(Vec<u8>, Fingerprint), Failure> {
+    read_bounded_inner(candidate, limit, None).expect("unchecked bounded read cannot be cancelled")
+}
+
+fn read_bounded_checked(
+    candidate: &SourceCandidate,
+    limit: usize,
+    deadline: &Deadline,
+    cancellation: &dyn Cancellation,
+) -> Result<std::result::Result<(Vec<u8>, Fingerprint), Failure>> {
+    read_bounded_inner(candidate, limit, Some((deadline, cancellation)))
+}
+
+fn read_bounded_inner(
+    candidate: &SourceCandidate,
+    limit: usize,
+    checked: Option<(&Deadline, &dyn Cancellation)>,
+) -> Result<std::result::Result<(Vec<u8>, Fingerprint), Failure>> {
+    let check = || -> Result<()> {
+        if let Some((deadline, cancellation)) = checked {
+            deadline.check(cancellation)?;
+        }
+        Ok(())
+    };
+    check()?;
     let path = &candidate.absolute_path;
-    let path_before_meta = fs::symlink_metadata(path).map_err(io_fail)?;
+    let path_before_meta = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) => return Ok(Err(io_fail(error))),
+    };
     if path_before_meta.file_type().is_symlink() || !path_before_meta.is_file() {
-        return Err(Failure::Changed);
+        return Ok(Err(Failure::Changed));
     }
     let path_before = Fingerprint::from_metadata(&path_before_meta);
     let discovered = Fingerprint {
@@ -337,47 +424,66 @@ fn read_bounded(
         identity: candidate.identity.clone(),
     };
     if path_before != discovered {
-        return Err(Failure::Changed);
+        return Ok(Err(Failure::Changed));
     }
     if path_before.length > limit as u64 {
-        return Err(Failure::TooLarge);
+        return Ok(Err(Failure::TooLarge));
     }
-    let mut file = File::open(path).map_err(io_fail)?;
-    let handle_before_meta = file.metadata().map_err(io_fail)?;
+    check()?;
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) => return Ok(Err(io_fail(error))),
+    };
+    let handle_before_meta = match file.metadata() {
+        Ok(metadata) => metadata,
+        Err(error) => return Ok(Err(io_fail(error))),
+    };
     if !handle_before_meta.is_file() {
-        return Err(Failure::Changed);
+        return Ok(Err(Failure::Changed));
     }
     let handle_before = Fingerprint::from_metadata(&handle_before_meta);
     if path_before != handle_before {
-        return Err(Failure::Changed);
+        return Ok(Err(Failure::Changed));
     }
     let mut bytes = Vec::with_capacity(limit.saturating_add(1).min(65536));
     let mut buffer = [0; 8192];
     loop {
+        check()?;
         let remaining = limit.saturating_add(1).saturating_sub(bytes.len());
         if remaining == 0 {
-            return Err(Failure::TooLarge);
+            return Ok(Err(Failure::TooLarge));
         }
         let chunk_len = buffer.len().min(remaining);
-        let count = file.read(&mut buffer[..chunk_len]).map_err(io_fail)?;
+        let count = match file.read(&mut buffer[..chunk_len]) {
+            Ok(count) => count,
+            Err(error) => return Ok(Err(io_fail(error))),
+        };
         if count == 0 {
             break;
         }
         bytes.extend_from_slice(&buffer[..count]);
     }
     if bytes.len() > limit {
-        return Err(Failure::TooLarge);
+        return Ok(Err(Failure::TooLarge));
     }
-    let handle_after = Fingerprint::from_metadata(&file.metadata().map_err(io_fail)?);
-    let path_after_meta = fs::symlink_metadata(path).map_err(io_fail)?;
-    if path_after_meta.file_type().is_symlink() || !path_after_meta.is_file() {
-        return Err(Failure::Changed);
-    }
-    if handle_before != handle_after || handle_after != Fingerprint::from_metadata(&path_after_meta)
+    check()?;
+    let handle_after_metadata = match file.metadata() {
+        Ok(metadata) => metadata,
+        Err(error) => return Ok(Err(io_fail(error))),
+    };
+    let path_after_meta = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) => return Ok(Err(io_fail(error))),
+    };
+    if path_after_meta.file_type().is_symlink()
+        || !path_after_meta.is_file()
+        || handle_before != Fingerprint::from_metadata(&handle_after_metadata)
+        || Fingerprint::from_metadata(&handle_after_metadata)
+            != Fingerprint::from_metadata(&path_after_meta)
     {
-        return Err(Failure::Changed);
+        return Ok(Err(Failure::Changed));
     }
-    Ok((bytes, handle_before))
+    Ok(Ok((bytes, handle_before)))
 }
 fn io_fail(error: io::Error) -> Failure {
     Failure::Io(error.kind().into())
@@ -721,7 +827,7 @@ mod tests {
         assert_eq!(result.summary.admitted_files, 2);
         assert_eq!(result.summary.admitted_bytes, 2);
         assert_eq!(result.summary.omitted_files, 1);
-        assert_eq!(result.completeness, InventoryCompleteness::Partial);
+        assert_eq!(result.completeness, InventoryCompleteness::Complete);
         assert_eq!(
             result.summary.omission_reasons,
             vec![(OmissionReason::UnrecognizedExtension, 1)]

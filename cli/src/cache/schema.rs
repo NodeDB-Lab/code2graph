@@ -30,7 +30,7 @@ const TABLES: &[(&str, &str)] = &[
     ),
     (
         "compatibility",
-        "CREATE TABLE compatibility (compatibility_id BLOB PRIMARY KEY CHECK (length(compatibility_id) = 32), created_at_ns INTEGER NOT NULL CHECK (created_at_ns >= 0))",
+        "CREATE TABLE compatibility (compatibility_id BLOB PRIMARY KEY CHECK (length(compatibility_id) = 32), language_fingerprint BLOB NOT NULL CHECK (length(language_fingerprint) = 32), package_fingerprint BLOB NOT NULL CHECK (length(package_fingerprint) = 32), created_at_ns INTEGER NOT NULL CHECK (created_at_ns >= 0), UNIQUE (language_fingerprint, package_fingerprint))",
     ),
     (
         "candidates",
@@ -42,7 +42,7 @@ const TABLES: &[(&str, &str)] = &[
     ),
     (
         "candidate_files",
-        "CREATE TABLE candidate_files (candidate_id BLOB NOT NULL REFERENCES candidates(candidate_id) ON DELETE CASCADE, path TEXT NOT NULL CHECK (path <> '' AND instr(path, '\\') = 0), language TEXT NOT NULL CHECK (language <> ''), content_hash BLOB NOT NULL CHECK (length(content_hash) = 32), size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0), mtime_seconds INTEGER, mtime_nanoseconds INTEGER CHECK (mtime_nanoseconds IS NULL OR (mtime_nanoseconds >= 0 AND mtime_nanoseconds < 1000000000)), file_facts BLOB NOT NULL CHECK (length(file_facts) <= 16777216), file_subgraph BLOB CHECK (file_subgraph IS NULL OR length(file_subgraph) <= 16777216), CHECK ((mtime_seconds IS NULL) = (mtime_nanoseconds IS NULL)), PRIMARY KEY (candidate_id, path))",
+        "CREATE TABLE candidate_files (candidate_id BLOB NOT NULL REFERENCES candidates(candidate_id) ON DELETE CASCADE, path TEXT NOT NULL CHECK (path <> '' AND instr(path, '\\') = 0), language TEXT NOT NULL CHECK (language <> ''), content_hash BLOB NOT NULL CHECK (length(content_hash) = 32), size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0), mtime_seconds INTEGER, mtime_nanoseconds INTEGER CHECK (mtime_nanoseconds IS NULL OR (mtime_nanoseconds >= 0 AND mtime_nanoseconds < 1000000000)), package_assignment TEXT NOT NULL CHECK (package_assignment <> ''), file_facts BLOB NOT NULL CHECK (length(file_facts) <= 16777216), file_subgraph BLOB CHECK (file_subgraph IS NULL OR length(file_subgraph) <= 16777216), CHECK ((mtime_seconds IS NULL) = (mtime_nanoseconds IS NULL)), PRIMARY KEY (candidate_id, path))",
     ),
     (
         "graph_snapshots",
