@@ -38,6 +38,13 @@ pub enum QueryError {
         actual: ScopeSnapshotToken,
     },
 
+    /// The transition would reuse the index's current snapshot token.
+    ///
+    /// Tokens are opaque rather than ordered, so inequality is the only
+    /// advancement property enforced here.
+    #[error("scope delta snapshot does not advance")]
+    ScopeDeltaSnapshotDoesNotAdvance,
+
     /// A removal named a symbol that is not present in the index.
     #[error("missing removed symbol: {0}")]
     MissingRemovedSymbol(SymbolId),
@@ -45,12 +52,6 @@ pub enum QueryError {
     /// A removal named an edge that is not present in the index.
     #[error("missing removed edge: {0:?}")]
     MissingRemovedEdge(EdgeKey),
-
-    /// A scope delta declared the index's current token as its result.
-    ///
-    /// Retained as the typed public rejection for repeated transitions.
-    #[error("scope delta snapshot does not advance")]
-    ScopeDeltaSnapshotDoesNotAdvance,
 
     /// A delta lists a symbol identity for removal more than once.
     #[error("duplicate removed symbol in delta: {0}")]
@@ -67,6 +68,10 @@ pub enum QueryError {
     /// A delta lists an edge identity for upsert more than once.
     #[error("duplicate upserted edge in delta: {0:?}")]
     DuplicateUpsertedEdge(EdgeKey),
+
+    /// The index's incrementally maintained derived state is inconsistent.
+    #[error("index invariant violation: {0}")]
+    IndexInvariant(String),
 }
 
 /// A bounded, non-debug representation of an opaque snapshot token.

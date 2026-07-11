@@ -17,6 +17,7 @@ pub struct GraphIndex {
     pub(crate) definitions: BTreeMap<SymbolId, Symbol>,
     pub(crate) edges: BTreeMap<EdgeKey, Edge>,
     pub(crate) known_ids: BTreeSet<SymbolId>,
+    pub(crate) endpoint_refcounts: BTreeMap<SymbolId, usize>,
     pub(crate) definitions_by_name: BTreeMap<String, Vec<SymbolId>>,
     pub(crate) ids_by_scip: BTreeMap<String, Vec<SymbolId>>,
     pub(crate) definitions_by_scip: BTreeMap<String, Vec<SymbolId>>,
@@ -80,6 +81,12 @@ impl GraphIndex {
             }
 
             for id in [&edge.from, &edge.to] {
+                let count = index.endpoint_refcounts.entry(id.clone()).or_default();
+                *count = count.checked_add(1).ok_or_else(|| {
+                    QueryError::IndexInvariant(format!(
+                        "endpoint reference count overflow for {id}"
+                    ))
+                })?;
                 if index.known_ids.insert(id.clone()) {
                     index
                         .ids_by_scip
