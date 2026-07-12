@@ -136,8 +136,25 @@ fn rust_namespaces(file: &str) -> Vec<String> {
         .map(str::to_owned)
         .collect();
     if let Some(last) = segs.last() {
-        if matches!(last.as_str(), "mod" | "lib" | "main") {
-            segs.pop();
+        match last.as_str() {
+            // `foo/mod.rs` always denotes module `foo`: the stem is never part of
+            // the path.
+            "mod" => {
+                segs.pop();
+            }
+            // `lib.rs`/`main.rs` are crate roots ONLY at the crate source root,
+            // where popping the stem leaves an empty namespace and the module is
+            // named by its stem in `module_symbol`. Pop only in that case. When
+            // the crate is nested (a workspace member, e.g. `<crate>/src/lib.rs`,
+            // whose leading `src/` was not stripped), popping would collapse
+            // `lib.rs` and `main.rs` onto the SAME `<crate>/src` namespace and mint
+            // colliding crate-root module symbols; keep the stem to keep the two
+            // roots distinct. A deeper `foo/lib.rs` is likewise a real submodule
+            // named `lib`, not a crate root, so keeping its stem is also correct.
+            "lib" | "main" if segs.len() == 1 => {
+                segs.pop();
+            }
+            _ => {}
         }
     }
     segs
@@ -1705,6 +1722,42 @@ impl std::fmt::Display for Point {
             vec!["Result"],
             "expected ['Result'], got {import_names:?}"
         );
+    }
+
+    #[test]
+    fn nested_crate_root_lib_and_main_have_distinct_module_ids() {
+        // A workspace member (`<crate>/src/lib.rs` + `<crate>/src/main.rs`) is a
+        // package with both a library and a binary crate. Their crate-root module
+        // symbols must NOT collide — a shared id fails cache publication with a
+        // duplicate-symbol error, blocking any multi-crate workspace index.
+        let lib = crate::extract::module_symbol(
+            Language::Rust,
+            &rust_namespaces("app/src/lib.rs"),
+            "app/src/lib.rs",
+            0,
+        );
+        let main = crate::extract::module_symbol(
+            Language::Rust,
+            &rust_namespaces("app/src/main.rs"),
+            "app/src/main.rs",
+            0,
+        );
+        assert_ne!(
+            lib.id.to_scip_string(),
+            main.id.to_scip_string(),
+            "nested lib.rs and main.rs must have distinct crate-root module ids"
+        );
+    }
+
+    #[test]
+    fn crate_root_lib_and_main_collapse_to_empty_namespace() {
+        // At the true crate source root the stem is popped: contained items keep
+        // their crate-relative identity (`helper().`, not `lib/helper().`).
+        assert!(rust_namespaces("src/lib.rs").is_empty());
+        assert!(rust_namespaces("src/main.rs").is_empty());
+        // A deeper file literally named lib.rs is a real submodule, not a crate
+        // root, so its stem is retained.
+        assert_eq!(rust_namespaces("src/util/lib.rs"), vec!["util", "lib"]);
     }
 
     #[test]
