@@ -49,6 +49,8 @@ pub(crate) struct PendingRef {
     /// namespace one. All other pending refs (imports, same-namespace deferrals,
     /// cross-artifact `TypeRef`s) match on the namespace chain only.
     pub qualified: bool,
+    /// Restrict a TypeRef to actual type definitions rather than modules.
+    pub type_only: bool,
 }
 
 /// The resolution facts for ONE file, isolated from all other files.
@@ -148,6 +150,23 @@ pub(crate) fn build_subgraph(f: &FileFacts) -> FileSubgraph {
                 occ: r.occ.clone(),
                 confidence: Confidence::Scoped,
                 qualified: false,
+                type_only: false,
+            });
+            continue;
+        }
+
+        // Type-only references without a path qualifier bypass lexical module
+        // bindings and resolve only against actual type definitions.
+        if r.role == RefRole::TypeRef && r.type_ref_ctx.is_some() && r.qualifier.is_none() {
+            pending.push(PendingRef {
+                from,
+                name: r.name.clone(),
+                segs: Vec::new(),
+                role: r.role,
+                occ: r.occ.clone(),
+                confidence: Confidence::Scoped,
+                qualified: false,
+                type_only: true,
             });
             continue;
         }
@@ -178,6 +197,7 @@ pub(crate) fn build_subgraph(f: &FileFacts) -> FileSubgraph {
                     occ: r.occ.clone(),
                     confidence: Confidence::Exact,
                     qualified: true,
+                    type_only: r.role == RefRole::TypeRef && r.type_ref_ctx.is_some(),
                 });
             }
             continue; // qualified ref handled (deferred or honest no-op)
@@ -208,6 +228,7 @@ pub(crate) fn build_subgraph(f: &FileFacts) -> FileSubgraph {
                     occ: r.occ.clone(),
                     confidence: Confidence::Scoped,
                     qualified: false,
+                    type_only: r.type_ref_ctx.is_some(),
                 });
                 continue;
             }
@@ -227,6 +248,7 @@ pub(crate) fn build_subgraph(f: &FileFacts) -> FileSubgraph {
                     occ: r.occ.clone(),
                     confidence: Confidence::Scoped,
                     qualified: false,
+                    type_only: false,
                 });
             }
             continue;
@@ -296,6 +318,7 @@ pub(crate) fn build_subgraph(f: &FileFacts) -> FileSubgraph {
                             occ: r.occ.clone(),
                             confidence: Confidence::Exact,
                             qualified: false,
+                            type_only: false,
                         });
                     }
                     // Empty segs → drop (Tier-B never fakes precision; Tier-A

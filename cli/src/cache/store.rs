@@ -159,6 +159,41 @@ impl CacheStore {
         self.writable
     }
 
+    /// Atomically discard derived snapshots while preserving cache identity and schema.
+    pub fn invalidate_derived(&self, deadline: &Deadline) -> Result<(), CacheError> {
+        if !self.writable {
+            return Err(CacheError::ReadOnly);
+        }
+        ensure_time(deadline)?;
+        set_busy_timeout(&self.connection, deadline)?;
+        self.connection
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|error| map_sqlite_error(error, deadline))?;
+        let result = (|| {
+            self.connection
+                .execute("DELETE FROM candidates", [])
+                .map_err(|error| map_sqlite_error(error, deadline))?;
+            self.connection
+                .execute("DELETE FROM compatibility", [])
+                .map_err(|error| map_sqlite_error(error, deadline))?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => match self.connection.execute_batch("COMMIT") {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    let mapped = map_sqlite_error(error, deadline);
+                    let _ = self.connection.execute_batch("ROLLBACK");
+                    Err(mapped)
+                }
+            },
+            Err(error) => {
+                let _ = self.connection.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
     /// Atomically persists a fully validated candidate and makes each supplied
     /// tier active only for the candidate's own completeness class.
     pub fn publish_candidate(
@@ -1231,6 +1266,49 @@ mod tests {
                 },
             )],
         }
+    }
+
+    #[test]
+    fn derived_invalidation_preserves_schema_and_removes_active_candidates() {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().join("project");
+        fs::create_dir(&root).expect("project");
+        let cache_location = location(&root, temp.path());
+        let store =
+            CacheStore::open_writable(&cache_location, &root, &Deadline::new(None)).expect("open");
+        let complete = candidate(CacheCompleteness::Complete, ResolverCacheTier::Name);
+        let partial = candidate(CacheCompleteness::Partial, ResolverCacheTier::Name);
+        store
+            .publish_candidate(&complete, &Deadline::new(None))
+            .expect("publish complete");
+        store
+            .publish_candidate(&partial, &Deadline::new(None))
+            .expect("publish partial");
+
+        store
+            .invalidate_derived(&Deadline::new(None))
+            .expect("invalidate");
+
+        for completeness in [CacheCompleteness::Complete, CacheCompleteness::Partial] {
+            assert!(
+                store
+                    .load_latest_active(ResolverCacheTier::Name, completeness, &Deadline::new(None))
+                    .expect("load after invalidation")
+                    .is_none()
+            );
+        }
+        let version: i64 = store
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("schema version");
+        assert_eq!(version, SCHEMA_VERSION);
+        drop(store);
+        let read_only = CacheStore::open_read_only(&cache_location, &root, &Deadline::new(None))
+            .expect("read-only open");
+        assert!(matches!(
+            read_only.invalidate_derived(&Deadline::new(None)),
+            Err(CacheError::ReadOnly)
+        ));
     }
 
     #[test]

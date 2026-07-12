@@ -230,7 +230,7 @@ pub fn execute(request: CliRequest, context: &ExecutionContext<'_>) -> Result<Co
                 file: file.as_deref(),
                 kind,
                 require_unique,
-                role: Some(role.unwrap_or(code2graph::RefRole::Call)),
+                role,
                 depth,
                 max_nodes: result_limit,
                 min_confidence,

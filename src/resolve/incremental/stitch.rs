@@ -22,6 +22,18 @@ use super::subgraph::PendingRef;
 /// A physical definition record in a [`GlobalIndex`]. Its key is deliberately
 /// structural rather than a SCIP identity: equal symbol IDs in different files
 /// (or duplicate records in one file) remain distinct resolution candidates.
+fn is_type_kind(kind: SymbolKind) -> bool {
+    matches!(
+        kind,
+        SymbolKind::Struct
+            | SymbolKind::Enum
+            | SymbolKind::Trait
+            | SymbolKind::Class
+            | SymbolKind::Interface
+            | SymbolKind::TypeAlias
+    )
+}
+
 #[derive(Clone, Hash, PartialEq, Eq)]
 struct DefinitionInstance {
     owner_file: Arc<str>,
@@ -36,6 +48,7 @@ pub(crate) struct GlobalIndex {
     /// Module-name → module definition instances. Kept separate from `by_name`
     /// because module symbols have a `Namespace`-only id (no leaf name).
     modules_by_name: HashMap<String, HashSet<DefinitionInstance>>,
+    types_by_name: HashMap<String, HashSet<DefinitionInstance>>,
 }
 
 impl GlobalIndex {
@@ -46,6 +59,7 @@ impl GlobalIndex {
         Self {
             by_name: HashMap::new(),
             modules_by_name: HashMap::new(),
+            types_by_name: HashMap::new(),
         }
     }
 
@@ -80,7 +94,13 @@ impl GlobalIndex {
                 self.by_name
                     .entry(n.to_string())
                     .or_default()
-                    .insert(instance);
+                    .insert(instance.clone());
+                if is_type_kind(s.kind) {
+                    self.types_by_name
+                        .entry(n.to_string())
+                        .or_default()
+                        .insert(instance);
+                }
             }
         }
     }
@@ -99,16 +119,28 @@ impl GlobalIndex {
                         self.modules_by_name.remove(&s.name);
                     }
                 }
-            } else if let Some(n) = s.id.leaf_name()
-                && let Some(bucket) = self.by_name.get_mut(n)
-            {
-                bucket.retain(|instance| {
-                    instance.owner_file.as_ref() != owner_file
-                        || instance.ordinal != ordinal
-                        || instance.id != s.id
-                });
-                if bucket.is_empty() {
-                    self.by_name.remove(n);
+            } else if let Some(n) = s.id.leaf_name() {
+                if let Some(bucket) = self.by_name.get_mut(n) {
+                    bucket.retain(|instance| {
+                        instance.owner_file.as_ref() != owner_file
+                            || instance.ordinal != ordinal
+                            || instance.id != s.id
+                    });
+                    if bucket.is_empty() {
+                        self.by_name.remove(n);
+                    }
+                }
+                if is_type_kind(s.kind)
+                    && let Some(bucket) = self.types_by_name.get_mut(n)
+                {
+                    bucket.retain(|instance| {
+                        instance.owner_file.as_ref() != owner_file
+                            || instance.ordinal != ordinal
+                            || instance.id != s.id
+                    });
+                    if bucket.is_empty() {
+                        self.types_by_name.remove(n);
+                    }
                 }
             }
         }
@@ -131,6 +163,18 @@ impl GlobalIndex {
         })
     }
 
+    fn unique_type_match(&self, name: &str, segs: &[String]) -> Option<&SymbolId> {
+        self.types_by_name.get(name).and_then(|candidates| {
+            let mut matches = candidates
+                .iter()
+                .filter(|instance| segs.is_empty() || namespaces_end_with(&instance.id, segs));
+            match (matches.next(), matches.next()) {
+                (Some(only), None) => Some(&only.id),
+                _ => None,
+            }
+        })
+    }
+
     /// Whether a definition could participate in resolving this pending ref.
     /// This is deliberately the same role dispatch and compatibility predicate
     /// used by [`resolve_pending`], allowing the incremental store to restitch
@@ -140,6 +184,11 @@ impl GlobalIndex {
             RefRole::ModuleRef => {
                 symbol.kind == SymbolKind::Module
                     && symbol.name == p.name
+                    && (p.segs.is_empty() || namespaces_end_with(&symbol.id, &p.segs))
+            }
+            RefRole::TypeRef if p.type_only => {
+                is_type_kind(symbol.kind)
+                    && symbol.id.leaf_name() == Some(p.name.as_str())
                     && (p.segs.is_empty() || namespaces_end_with(&symbol.id, &p.segs))
             }
             RefRole::TypeRef => {
@@ -213,6 +262,7 @@ pub(crate) fn resolve_pending(p: &PendingRef, index: &GlobalIndex) -> Option<Edg
         RefRole::ModuleRef => index.unique_module_match(&p.name, &p.segs),
         // HCL and similar DSLs use type-like references to modules. Prefer a
         // unique module target, then retain ordinary type lookup.
+        RefRole::TypeRef if p.type_only => index.unique_type_match(&p.name, &p.segs),
         RefRole::TypeRef => index
             .unique_module_match(&p.name, &p.segs)
             .or_else(|| index.unique_match(&p.name, &p.segs)),
@@ -488,6 +538,7 @@ mod tests {
             },
             confidence: Confidence::Scoped,
             qualified: false,
+            type_only: false,
         }];
 
         let edges = stitch(&pending, &index);

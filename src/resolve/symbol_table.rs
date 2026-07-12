@@ -32,6 +32,18 @@ use super::{
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SymbolTableResolver;
 
+fn is_type_definition(kind: SymbolKind) -> bool {
+    matches!(
+        kind,
+        SymbolKind::Struct
+            | SymbolKind::Enum
+            | SymbolKind::Trait
+            | SymbolKind::Class
+            | SymbolKind::Interface
+            | SymbolKind::TypeAlias
+    )
+}
+
 impl Resolver for SymbolTableResolver {
     fn resolve(&self, files: &[FileFacts]) -> crate::Result<CodeGraph> {
         crate::validate_file_facts(files)?;
@@ -125,7 +137,11 @@ impl Resolver for SymbolTableResolver {
                 let mut import_match_first: Option<usize> = None;
                 let mut import_match_second: Option<usize> = None;
                 for &i in targets.iter() {
-                    if i == from_idx {
+                    if i == from_idx
+                        || (r.role == RefRole::TypeRef
+                            && r.type_ref_ctx.is_some()
+                            && !is_type_definition(symbols[i].kind))
+                    {
                         continue;
                     }
                     non_self_count += 1;
@@ -145,7 +161,12 @@ impl Resolver for SymbolTableResolver {
                     None
                 };
 
-                for &to_idx in targets.iter().filter(|&&i| i != from_idx) {
+                for &to_idx in targets.iter().filter(|&&i| {
+                    i != from_idx
+                        && !(r.role == RefRole::TypeRef
+                            && r.type_ref_ctx.is_some()
+                            && !is_type_definition(symbols[i].kind))
+                }) {
                     // Decide per-edge confidence:
                     // - If Win-2 fired (import_bound == Some(to_idx)): Scoped
                     //   for the matched target, NameOnly for all others.

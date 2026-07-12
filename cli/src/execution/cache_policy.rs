@@ -2,7 +2,7 @@
 
 //! Cache selection rules shared by refresh and graph-loading lifecycles.
 
-use crate::cache::{CacheCompleteness, CacheStore, LoadedSnapshot, ResolverCacheTier};
+use crate::cache::{CacheCompleteness, CacheError, CacheStore, LoadedSnapshot, ResolverCacheTier};
 use crate::{CliError, Deadline, Result};
 
 /// Selects a refresh prior without claiming compatibility before preparation has
@@ -13,13 +13,39 @@ pub(super) fn refresh_prior(
     allow_partial: bool,
     deadline: &Deadline,
 ) -> Result<Option<LoadedSnapshot>> {
-    let complete = store.load_latest_active(tier, CacheCompleteness::Complete, deadline)?;
+    let complete = load_or_invalidate(store, tier, CacheCompleteness::Complete, deadline)?;
     if complete.is_some() || !allow_partial {
         return Ok(complete);
     }
-    store
-        .load_latest_active(tier, CacheCompleteness::Partial, deadline)
-        .map_err(Into::into)
+    load_or_invalidate(store, tier, CacheCompleteness::Partial, deadline)
+}
+
+fn load_or_invalidate(
+    store: &CacheStore,
+    tier: ResolverCacheTier,
+    completeness: CacheCompleteness,
+    deadline: &Deadline,
+) -> Result<Option<LoadedSnapshot>> {
+    match store.load_latest_active(tier, completeness, deadline) {
+        Ok(snapshot) => Ok(snapshot),
+        Err(error)
+            if store.is_writable()
+                && matches!(
+                    error,
+                    CacheError::Malformed
+                        | CacheError::Incompatible
+                        | CacheError::Limits
+                        | CacheError::InvalidFacts
+                        | CacheError::InvalidSubgraph
+                        | CacheError::Corrupt
+                        | CacheError::InvalidCandidate
+                ) =>
+        {
+            store.invalidate_derived(deadline)?;
+            Ok(None)
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Selects a frozen or stale snapshot without filesystem-derived compatibility.

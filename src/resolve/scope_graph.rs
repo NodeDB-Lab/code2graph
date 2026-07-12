@@ -915,6 +915,26 @@ mod tests {
 
     #[cfg(feature = "rust")]
     #[test]
+    fn scoped_struct_field_type_resolves_across_files() {
+        use crate::graph::types::RefRole;
+
+        let provider = RustExtractor
+            .extract("pub struct FusionParams {}", "src/params.rs")
+            .unwrap();
+        let consumer = RustExtractor
+            .extract(
+                "pub struct Graph { params: crate::params::FusionParams }",
+                "src/graph.rs",
+            )
+            .unwrap();
+        let graph = ScopeGraphResolver.resolve(&[provider, consumer]).unwrap();
+        assert!(graph.edges.iter().any(|edge| {
+            edge.role == RefRole::TypeRef
+                && edge.to.to_scip_string().ends_with("params/FusionParams#")
+        }));
+    }
+
+    #[test]
     fn typeref_resolves_to_same_file_definition() {
         use crate::graph::types::RefRole;
 

@@ -900,7 +900,7 @@ mod tests {
                 "cached_omissions": [{
                     "path": "src/large.rs", "reason": "file-too-large", "detail": "limit=1024"
                 }],
-                "max_files": 1000,
+                "max_files": 10000,
                 "max_file_bytes": 1048576,
                 "max_total_bytes": 26214400,
                 "max_depth": 32,

@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use code2graph::{EdgeKey, RefRole, SymbolId};
+use code2graph::{EdgeKey, RefRole, SymbolId, SymbolKind};
 use code2graph_query::{EdgeFilter, GraphIndex, ImpactOptions};
 
 use crate::commands::QueryCommandContext;
@@ -58,11 +58,6 @@ pub(crate) fn execute_impact(
             options: &options,
         },
     )?;
-    let filter = EdgeFilter {
-        role: request.role,
-        min_confidence: request.min_confidence,
-        provenance: None,
-    };
     let mut rows: Vec<(ImpactOutput, EdgeKey)> = Vec::new();
     let mut truncated = false;
     // `--limit` is a command-wide output bound, not a fresh allowance for each
@@ -72,6 +67,12 @@ pub(crate) fn execute_impact(
     // whether that seed had matching reachable work.
     for seed in &resolution.ids {
         context.deadline.check(context.cancellation)?;
+        let implicit_role = default_impact_role(context.index, seed);
+        let filter = EdgeFilter {
+            role: request.role.or(implicit_role),
+            min_confidence: request.min_confidence,
+            provenance: None,
+        };
         truncated |= append_seed_impact(
             context.index,
             seed,
@@ -108,6 +109,25 @@ pub(crate) fn execute_impact(
     envelope.returned = envelope.results.len();
     envelope.truncated = truncated;
     Ok(envelope)
+}
+
+fn default_impact_role(index: &GraphIndex, seed: &SymbolId) -> Option<RefRole> {
+    match index.symbol(seed) {
+        Some(symbol)
+            if matches!(
+                symbol.kind,
+                SymbolKind::Struct
+                    | SymbolKind::Enum
+                    | SymbolKind::Trait
+                    | SymbolKind::Class
+                    | SymbolKind::Interface
+                    | SymbolKind::TypeAlias
+            ) =>
+        {
+            None
+        }
+        _ => Some(RefRole::Call),
+    }
 }
 
 fn append_seed_impact(
@@ -147,11 +167,12 @@ fn append_seed_impact(
 #[cfg(test)]
 mod tests {
     use code2graph::{
-        CodeGraph, Confidence, Descriptor, Edge, Occurrence, Provenance, RefRole, SymbolId,
+        ByteSpan, CodeGraph, Confidence, Descriptor, Edge, Occurrence, Provenance, RefRole, Symbol,
+        SymbolId, SymbolKind, Visibility,
     };
     use code2graph_query::{EdgeFilter, GraphIndex};
 
-    use super::append_seed_impact;
+    use super::{append_seed_impact, default_impact_role};
 
     fn id(name: &str) -> SymbolId {
         SymbolId::global("rust", vec![Descriptor::Term(name.into())])
@@ -171,6 +192,41 @@ mod tests {
                 byte,
             },
         }
+    }
+
+    #[test]
+    fn type_seeds_default_to_all_roles_and_functions_default_to_calls() {
+        let type_id = SymbolId::global("rust", vec![Descriptor::Type("Config".into())]);
+        let function_id = id("run");
+        let symbol = |id: SymbolId, name: &str, kind: SymbolKind| Symbol {
+            id,
+            name: name.into(),
+            kind,
+            visibility: Visibility::Public,
+            entry_points: vec![],
+            file: "src/lib.rs".into(),
+            line: 1,
+            span: ByteSpan { start: 0, end: 1 },
+            signature: name.into(),
+        };
+        let index = GraphIndex::from_graph(CodeGraph {
+            symbols: vec![
+                symbol(type_id.clone(), "Config", SymbolKind::Struct),
+                symbol(function_id.clone(), "run", SymbolKind::Function),
+            ],
+            edges: vec![],
+        })
+        .unwrap();
+
+        assert_eq!(default_impact_role(&index, &type_id), None);
+        assert_eq!(
+            default_impact_role(&index, &function_id),
+            Some(RefRole::Call)
+        );
+        assert_eq!(
+            default_impact_role(&index, &id("external")),
+            Some(RefRole::Call)
+        );
     }
 
     #[test]

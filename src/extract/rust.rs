@@ -18,7 +18,7 @@ use tree_sitter::{Language as TsLanguage, Node, Parser, Query, QueryCursor, Stre
 use crate::error::{CodegraphError, Result};
 use crate::graph::types::{
     Binding, BindingKind, ByteSpan, EntryPoint, FfiAbi, FfiExport, FileFacts, RefRole, Reference,
-    Scope, ScopeId, ScopeKind, Symbol, SymbolKind, Visibility,
+    Scope, ScopeId, ScopeKind, Symbol, SymbolKind, TypeRefContext, Visibility,
 };
 use crate::lang::Language;
 use crate::symbol::Descriptor;
@@ -38,6 +38,12 @@ const CALL_QUERY: &str = r#"
     (scoped_identifier path: (_) @qualifier name: (identifier) @callee)
   ]
 )
+"#;
+
+/// Type-like path written as the subject of an associated call.
+const ASSOCIATED_CALL_SUBJECT_QUERY: &str = r#"
+(call_expression
+  function: (scoped_identifier path: (_) @subject name: (identifier)))
 "#;
 
 /// Tree-sitter query capturing type-position nodes for [`RefRole::TypeRef`] extraction.
@@ -98,6 +104,7 @@ impl Extractor for RustExtractor {
         collect_module_decl_refs(&root, bytes, file, &mut references);
         collect_imports(&root, bytes, file, &mut references, &module_id);
         collect_type_references(&root, &ts_language, bytes, file, &mut references)?;
+        collect_associated_call_type_references(&root, &ts_language, bytes, file, &mut references)?;
         collect_read_references(&root, bytes, file, &mut references);
         collect_write_references(&root, bytes, file, &mut references);
 
@@ -902,6 +909,56 @@ fn base_type_name(node: &Node, bytes: &[u8]) -> Option<(String, Option<String>)>
 /// `primitive_type` nodes are deferred by [`base_type_name`] — they produce
 /// no reference. All other unrecognised type forms (tuples, slices, …) are
 /// also silently skipped per the v1 boundary.
+fn collect_associated_call_type_references(
+    root: &Node,
+    ts_lang: &TsLanguage,
+    bytes: &[u8],
+    file: &str,
+    out: &mut Vec<Reference>,
+) -> Result<()> {
+    let query =
+        Query::new(ts_lang, ASSOCIATED_CALL_SUBJECT_QUERY).map_err(|e| CodegraphError::Query {
+            lang: "rust".to_owned(),
+            msg: e.to_string(),
+        })?;
+    let subject_idx =
+        query
+            .capture_index_for_name("subject")
+            .ok_or_else(|| CodegraphError::Query {
+                lang: "rust".to_owned(),
+                msg: "missing @subject capture".to_owned(),
+            })?;
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(&query, *root, bytes);
+    while let Some(m) = matches.next() {
+        for capture in m
+            .captures
+            .iter()
+            .filter(|capture| capture.index == subject_idx)
+        {
+            let written = node_text(&capture.node, bytes);
+            let name = super::simple_type_name(written, "::");
+            if name.len() < MIN_REF_LEN {
+                continue;
+            }
+            let qualifier = written
+                .rsplit_once("::")
+                .map(|(prefix, _)| prefix.to_owned());
+            out.push(Reference {
+                name: name.to_owned(),
+                occ: node_occurrence(&capture.node, file),
+                role: RefRole::TypeRef,
+                source_module: None,
+                from_path: None,
+                qualifier,
+                scope: None,
+                type_ref_ctx: Some(TypeRefContext::Other),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn collect_type_references(
     root: &Node,
     ts_lang: &TsLanguage,
@@ -2448,6 +2505,17 @@ impl std::fmt::Display for Point {
             "qualifier should be 'std::io', got {:?}",
             r.qualifier
         );
+    }
+
+    #[test]
+    fn associated_call_subject_emits_type_reference() {
+        let src = "fn parse(node: &Node) { crate::params::FusionParams::extract(node); }";
+        let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
+        let reference = type_refs(&facts)
+            .into_iter()
+            .find(|reference| reference.name == "FusionParams")
+            .expect("associated call subject TypeRef");
+        assert_eq!(reference.qualifier.as_deref(), Some("crate::params"));
     }
 
     #[test]
