@@ -4,7 +4,7 @@
 
 use std::io::{Read, Write};
 
-use code2graph::{extract_file, validate_file_facts};
+use code2graph::{BindingRules, extract_file_with_bindings, validate_file_facts};
 
 use super::frame::{decode_request_frame, read_frame, reject_trailing_bytes, write_frame};
 use super::protocol::{
@@ -32,10 +32,16 @@ pub fn run_worker<R: Read, W: Write>(
         .ok_or(WorkerProtocolError::Malformed("missing request frame"))?;
     reject_trailing_bytes(input)?;
     let request = decode_request_frame(&frame)?;
+    // Cross-artifact code→SQL edges are on by default: extraction applies the
+    // built-in query-binding rules so embedded SQL in recognized constructs
+    // (e.g. `sqlx::query("… FROM users")`) yields references to SQL entities.
+    let rules = BindingRules::with_defaults();
     let response = match validate_request(&request) {
         Ok(language) => match std::str::from_utf8(&request.source)
             .ok()
-            .and_then(|source| extract_file(language, source, &request.path).ok())
+            .and_then(|source| {
+                extract_file_with_bindings(language, source, &request.path, &rules).ok()
+            })
             .filter(|facts| validate_file_facts(std::slice::from_ref(facts)).is_ok())
         {
             Some(facts) => WorkerResponse {
