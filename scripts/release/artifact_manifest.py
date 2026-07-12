@@ -141,7 +141,9 @@ def bundle_contract(directory: Path, version: str) -> dict[str, Any]:
     packages: dict[str, str] = {}
     root_metadata: dict[str, Any] | None = None
     for path in npm_files:
-        metadata = npm_metadata(path)
+        contents = normalized_archive(path, require_package_json=True)
+        metadata = json.loads(contents["package/package.json"])
+        native_members = sorted(name for name in contents if name.endswith(".node"))
         name = metadata.get("name")
         if name == ROOT_NODE_PACKAGE:
             if root_metadata is not None:
@@ -149,8 +151,13 @@ def bundle_contract(directory: Path, version: str) -> dict[str, Any]:
             root_metadata = metadata
             if metadata.get("dependencies") is not None:
                 raise ValueError("root npm package must not carry regular dependencies")
+            if native_members:
+                raise ValueError("root npm package must not embed platform binaries")
         elif name in NODE_TARGETS:
             os_name, cpu, libc = NODE_TARGETS[name]
+            target = name.removeprefix(f"{ROOT_NODE_PACKAGE}-")
+            if native_members != [f"package/code2graph-node.{target}.node"]:
+                raise ValueError(f"{path.name}: platform package must contain exactly its native binary")
             if metadata.get("version") != version or metadata.get("os") != [os_name] or metadata.get("cpu") != [cpu]:
                 raise ValueError(f"{path.name}: platform package metadata mismatch")
             if (metadata.get("libc") if libc else None) != ([libc] if libc else None):

@@ -207,10 +207,11 @@ jobs:
           npx napi artifacts --output-dir ./artifacts --npm-dir ./npm
           npm run harden-loader
           npm run harden-types
-          npx napi prepublish -t npm --npm-dir ./npm --skip-optional-publish
+          npx napi prepublish -t npm --npm-dir ./npm --skip-optional-publish --no-gh-release
           npm test
+          rm -f ./*.node
           npm pack --pack-destination "$BUNDLE_NPM"
-          for directory in npm/*; do npm pack "$directory" --pack-destination "$BUNDLE_NPM"; done
+          for directory in npm/*; do npm pack "./$directory" --pack-destination "$BUNDLE_NPM"; done
           ROOT_TARBALL="$(find "$BUNDLE_NPM" -maxdepth 1 -name 'nodedb-lab-code2graph-*.tgz' ! -name '*linux-*' ! -name '*darwin-*' ! -name '*win32-*' -print -quit)"
           HOST_TARBALL="$(find "$BUNDLE_NPM" -maxdepth 1 -name '*linux-x64-gnu*.tgz' -print -quit)"
           test -n "$ROOT_TARBALL" && test -n "$HOST_TARBALL"
@@ -239,7 +240,6 @@ jobs:
           export CODE2GRAPH_CORE_PLATFORM_TARBALL="$HOST_TARBALL"
           cd release-source/bindings/pi
           npm install --no-save --package-lock=false "$ROOT_TARBALL" "$HOST_TARBALL" ignore tsx typescript @types/node @earendil-works/pi-ai @earendil-works/pi-coding-agent @earendil-works/pi-tui
-          npm install --global @earendil-works/pi-coding-agent@latest
           npm run test:all
       - name: Create canonical manifest and checksums
         shell: bash

@@ -80,12 +80,25 @@ class VersionContractTests(unittest.TestCase):
 class ManifestTests(unittest.TestCase):
     VERSION = "1.2.3-rc.0"
 
-    def npm_tarball(self, path: Path, metadata: dict) -> None:
+    def npm_tarball(self, path: Path, metadata: dict, native: str | bool = True, extra_native: str | None = None) -> None:
         data = json.dumps(metadata).encode()
         with tarfile.open(path, "w:gz") as archive:
             info = tarfile.TarInfo("package/package.json")
             info.size = len(data)
             archive.addfile(info, io.BytesIO(data))
+            name = metadata.get("name", "")
+            prefix = artifact_manifest.ROOT_NODE_PACKAGE + "-"
+            target = name.removeprefix(prefix) if native is True and name.startswith(prefix) else native
+            if isinstance(target, str):
+                native_data = b"native"
+                info = tarfile.TarInfo(f"package/code2graph-node.{target}.node")
+                info.size = len(native_data)
+                archive.addfile(info, io.BytesIO(native_data))
+            if extra_native is not None:
+                native_data = b"unexpected-native"
+                info = tarfile.TarInfo(f"package/{extra_native}")
+                info.size = len(native_data)
+                archive.addfile(info, io.BytesIO(native_data))
 
     def make_bundle(self, root: Path) -> list[str]:
         npm = root / "npm"
@@ -154,6 +167,29 @@ class ManifestTests(unittest.TestCase):
             root_tarball.unlink()
             self.npm_tarball(root_tarball, {"name": artifact_manifest.ROOT_NODE_PACKAGE, "version": self.VERSION, "optionalDependencies": {}})
             with self.assertRaises(ValueError): artifact_manifest.bundle_contract(root, self.VERSION)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); self.make_bundle(root)
+            root_tarball = root / "npm" / "nodedb-lab-code2graph-1.2.3-rc.0.tgz"
+            self.npm_tarball(root_tarball, {"name": artifact_manifest.ROOT_NODE_PACKAGE, "version": self.VERSION, "optionalDependencies": {name: self.VERSION for name in artifact_manifest.NODE_TARGETS}}, native="linux-x64-gnu")
+            with self.assertRaises(ValueError): artifact_manifest.bundle_contract(root, self.VERSION)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); self.make_bundle(root)
+            package = next(iter(artifact_manifest.NODE_TARGETS))
+            platform_tarball = root / "npm" / f"{package.removeprefix('@').replace('/', '-')}-{self.VERSION}.tgz"
+            os_name, cpu, libc = artifact_manifest.NODE_TARGETS[package]
+            metadata = {"name": package, "version": self.VERSION, "os": [os_name], "cpu": [cpu]}
+            if libc: metadata["libc"] = [libc]
+            self.npm_tarball(platform_tarball, metadata, native=False)
+            with self.assertRaises(ValueError): artifact_manifest.bundle_contract(root, self.VERSION)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); self.make_bundle(root)
+            package = next(iter(artifact_manifest.NODE_TARGETS))
+            platform_tarball = root / "npm" / f"{package.removeprefix('@').replace('/', '-')}-{self.VERSION}.tgz"
+            os_name, cpu, libc = artifact_manifest.NODE_TARGETS[package]
+            metadata = {"name": package, "version": self.VERSION, "os": [os_name], "cpu": [cpu]}
+            if libc: metadata["libc"] = [libc]
+            self.npm_tarball(platform_tarball, metadata, extra_native="code2graph-node.unexpected.node")
+            with self.assertRaises(ValueError): artifact_manifest.bundle_contract(root, self.VERSION)
 
     def test_inventory_and_archive_comparison_reject_hostile_content(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -173,7 +209,11 @@ class WorkflowContractTests(unittest.TestCase):
         for required in ("npm run harden-loader", "npm run harden-types", "npm test", "unittest discover", "npm run test:all", "BUNDLE_NPM=\"$GITHUB_WORKSPACE/bundle/npm\""):
             self.assertIn(required, text)
         self.assertLess(text.index("npx napi artifacts"), text.rindex("npm run harden-loader"))
-        for forbidden in ("npm publish", "cargo publish"):
+        self.assertIn("npx napi prepublish -t npm --npm-dir ./npm --skip-optional-publish --no-gh-release", text)
+        self.assertIn('npm pack "./$directory" --pack-destination "$BUNDLE_NPM"', text)
+        self.assertNotIn('npm pack "$directory" --pack-destination "$BUNDLE_NPM"', text)
+        self.assertLess(text.index("rm -f ./*.node"), text.index('npm pack --pack-destination "$BUNDLE_NPM"'))
+        for forbidden in ("npm publish", "cargo publish", "npm install --global"):
             self.assertNotIn(forbidden, text)
 
     def test_validation_uses_only_canonical_tag_helper(self):
