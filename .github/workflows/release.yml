@@ -276,6 +276,7 @@ jobs:
     needs: [validate, provenance]
     if: inputs.github
     runs-on: ubuntu-latest
+    environment: github
     permissions:
       contents: write
       actions: read
@@ -292,7 +293,10 @@ jobs:
       - name: Create or update exact GitHub release
         shell: bash
         env:
-          GH_TOKEN: ${{ github.token }}
+          # Organization policy may cap GITHUB_TOKEN at read-only even when this
+          # job requests contents: write. A fine-grained token scoped to this
+          # repository provides the protected-environment fallback.
+          GH_TOKEN: ${{ secrets.GH_RELEASE_TOKEN || github.token }}
           TAG: ${{ inputs.tag }}
           VERSION: ${{ needs.validate.outputs.version }}
           PRERELEASE: ${{ needs.validate.outputs.is_prerelease }}
