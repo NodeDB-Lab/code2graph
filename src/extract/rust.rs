@@ -921,6 +921,7 @@ fn collect_named_type_nodes(
             qualifier: None,
             scope: None,
             type_ref_ctx: Some(context),
+            cross_artifact: false,
         }),
         "scoped_type_identifier" => {
             let Some(name_node) = node.child_by_field_name("name") else {
@@ -939,6 +940,7 @@ fn collect_named_type_nodes(
                     .map(|path| node_text(&path, bytes).to_owned()),
                 scope: None,
                 type_ref_ctx: Some(context),
+                cross_artifact: false,
             });
         }
         "generic_type" => {
@@ -1012,6 +1014,7 @@ fn collect_associated_call_type_references(
                 qualifier,
                 scope: None,
                 type_ref_ctx: Some(TypeRefContext::Other),
+                cross_artifact: false,
             });
         }
     }

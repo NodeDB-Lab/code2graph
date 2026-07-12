@@ -268,6 +268,7 @@ fn collect_references(root: &Node, bytes: &[u8], file: &str) -> Vec<Reference> {
             qualifier: e.qualifier,
             scope: None,
             type_ref_ctx: None,
+            cross_artifact: false,
         })
         .collect()
 }

@@ -143,6 +143,7 @@ mod tests {
                     qualifier: Some("external".into()),
                     scope: None,
                     type_ref_ctx: None,
+                    cross_artifact: false,
                 },
                 Reference {
                     name: "local".into(),
@@ -160,6 +161,7 @@ mod tests {
                     qualifier: None,
                     scope: None,
                     type_ref_ctx: None,
+                    cross_artifact: false,
                 },
                 Reference {
                     name: "opaque".into(),
@@ -177,6 +179,7 @@ mod tests {
                     qualifier: None,
                     scope: None,
                     type_ref_ctx: None,
+                    cross_artifact: false,
                 },
             ],
             scopes: vec![],

@@ -139,6 +139,7 @@ mod tests {
             qualifier: None,
             scope: None,
             type_ref_ctx: None,
+            cross_artifact: false,
         });
 
         let graph = NormalizedNameResolver.resolve(&[lib, caller]).unwrap();
@@ -218,6 +219,7 @@ mod tests {
             qualifier: None,
             scope: None,
             type_ref_ctx: None,
+            cross_artifact: false,
         });
 
         let graph = NormalizedNameResolver.resolve(&[lib, caller]).unwrap();
@@ -267,6 +269,7 @@ mod tests {
             qualifier: None,
             scope: None,
             type_ref_ctx: None,
+            cross_artifact: false,
         });
 
         let graph = NormalizedNameResolver.resolve(&[lib, caller]).unwrap();

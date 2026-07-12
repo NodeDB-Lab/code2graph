@@ -373,6 +373,7 @@ mod tests {
                 qualifier: None,
                 scope: Some(0),
                 type_ref_ctx: None,
+                cross_artifact: false,
             }],
             scopes: vec![Scope {
                 parent: None,

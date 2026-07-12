@@ -265,6 +265,7 @@ mod tests {
             qualifier: Some(qualifier.to_owned()),
             scope: None,
             type_ref_ctx: None,
+            cross_artifact: false,
         }
     }
 

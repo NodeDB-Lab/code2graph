@@ -244,6 +244,12 @@ pub struct Reference {
     pub scope: Option<ScopeId>,
     /// Sub-type context for [`RefRole::TypeRef`] references; `None` for all other roles.
     pub type_ref_ctx: Option<TypeRefContext>,
+    /// True when this reference was derived from a secondary artifact embedded in
+    /// the source (e.g. SQL inside a code string). The resolver attributes such
+    /// references to [`Provenance::CrossArtifact`] with [`Confidence::NameOnly`].
+    /// Extractors leave this false unless they emit a cross-artifact reference.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub cross_artifact: bool,
 }
 
 // ── Scope / binding data model ──────────────────────────────────────────────
@@ -391,6 +397,11 @@ pub enum Provenance {
     /// empty for the consumer to enrich (e.g. a software-composition-analysis tool
     /// that maps `from_path` to a CVE advisory).
     External,
+    /// Derived by matching a reference to a secondary artifact embedded in source
+    /// (e.g. a SQL query string inside code) to that artifact's symbol by name.
+    /// Always paired with [`Confidence::NameOnly`] — a bare embedded name is
+    /// inherently ambiguous, never type/scope-precise.
+    CrossArtifact,
 }
 
 // ── FFI / cross-language boundary facts ──────────────────────────────────────
@@ -699,6 +710,7 @@ mod confidence_tests {
             Provenance::Conformance,
             Provenance::NormalizedName,
             Provenance::External,
+            Provenance::CrossArtifact,
         ];
         assert!(provenances.windows(2).all(|pair| pair[0] < pair[1]));
     }
@@ -890,6 +902,7 @@ mod serde_tests {
                 qualifier: None,
                 scope: None,
                 type_ref_ctx: None,
+                cross_artifact: false,
             }],
             scopes: vec![],
             bindings: vec![],

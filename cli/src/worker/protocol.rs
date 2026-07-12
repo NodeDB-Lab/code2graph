@@ -209,6 +209,7 @@ pub struct ReferenceWire {
     pub qualifier: Option<String>,
     pub scope: Option<u64>,
     pub type_ref_ctx: Option<u8>,
+    pub cross_artifact: Option<bool>,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScopeWire {
@@ -339,7 +340,7 @@ impl_numeric_map_codec!(OccurrenceWire {
 });
 impl_numeric_map_codec!(ReferenceWire {
     required { 0 => name: String, 1 => occ: OccurrenceWire, 2 => role: u8 }
-    optional { 3 => source_module: Option<String>, 4 => from_path: Option<String>, 5 => qualifier: Option<String>, 6 => scope: Option<u64>, 7 => type_ref_ctx: Option<u8>, 8 => is_reexport: Option<bool>, 9 => imported_name: Option<String> }
+    optional { 3 => source_module: Option<String>, 4 => from_path: Option<String>, 5 => qualifier: Option<String>, 6 => scope: Option<u64>, 7 => type_ref_ctx: Option<u8>, 8 => is_reexport: Option<bool>, 9 => imported_name: Option<String>, 10 => cross_artifact: Option<bool> }
 });
 impl ToMessagePack for ScopeWire {
     fn write<W: Write>(&self, writer: &mut W) -> zerompk::Result<()> {
@@ -902,6 +903,7 @@ impl From<&Reference> for ReferenceWire {
             qualifier: r.qualifier.clone(),
             scope: r.scope.map(|v| v as u64),
             type_ref_ctx: r.type_ref_ctx.map(type_ref_context_tag),
+            cross_artifact: Some(r.cross_artifact),
         }
     }
 }
@@ -957,6 +959,7 @@ impl TryFrom<ReferenceWire> for Reference {
             qualifier: r.qualifier,
             scope: r.scope.map(usize_from).transpose()?,
             type_ref_ctx: r.type_ref_ctx.map(|v| tag(v, &ctx).copied()).transpose()?,
+            cross_artifact: r.cross_artifact.unwrap_or(false),
         })
     }
 }
@@ -1111,6 +1114,7 @@ mod tests {
                     qualifier: Some("crate::module".into()),
                     scope: Some(0),
                     type_ref_ctx: Some(TypeRefContext::ReturnType),
+                    cross_artifact: false,
                 },
                 Reference {
                     name: "dependency".into(),
@@ -1128,6 +1132,7 @@ mod tests {
                     qualifier: None,
                     scope: None,
                     type_ref_ctx: None,
+                    cross_artifact: false,
                 },
             ],
             scopes: vec![Scope {

@@ -329,6 +329,7 @@ fn provenance(value: crate::ProvenanceOutput) -> &'static str {
         crate::ProvenanceOutput::Conformance => "conformance",
         crate::ProvenanceOutput::NormalizedName => "normalized-name",
         crate::ProvenanceOutput::External => "external",
+        crate::ProvenanceOutput::CrossArtifact => "cross-artifact",
     }
 }
 fn completeness(value: CacheCompletenessOutput) -> &'static str {

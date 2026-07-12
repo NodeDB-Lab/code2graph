@@ -169,19 +169,26 @@ impl Resolver for SymbolTableResolver {
                             && r.type_ref_ctx.is_some()
                             && !is_type_definition(symbols[i].kind))
                 }) {
-                    // Decide per-edge confidence:
-                    // - If Win-2 fired (import_bound == Some(to_idx)): Scoped
-                    //   for the matched target, NameOnly for all others.
+                    // Decide per-edge confidence and provenance:
+                    // - A reference derived from a secondary artifact embedded in
+                    //   source (e.g. SQL inside a code string) is attributed to
+                    //   Provenance::CrossArtifact and forced to Confidence::NameOnly
+                    //   — a bare embedded name is inherently ambiguous, never
+                    //   type/scope-precise, regardless of candidate count.
+                    // - Otherwise, if Win-2 fired (import_bound == Some(to_idx)):
+                    //   Scoped for the matched target, NameOnly for all others.
                     // - Otherwise fall back to Win-1: Scoped iff unique candidate.
-                    let confidence = if import_bound == Some(to_idx) {
-                        Confidence::Scoped
+                    let (confidence, provenance) = if r.cross_artifact {
+                        (Confidence::NameOnly, Provenance::CrossArtifact)
+                    } else if import_bound == Some(to_idx) {
+                        (Confidence::Scoped, Provenance::SymbolTable)
                     } else if import_bound.is_some() {
                         // Win-2 fired but this is not the matched target.
-                        Confidence::NameOnly
+                        (Confidence::NameOnly, Provenance::SymbolTable)
                     } else if non_self_count == 1 {
-                        Confidence::Scoped
+                        (Confidence::Scoped, Provenance::SymbolTable)
                     } else {
-                        Confidence::NameOnly
+                        (Confidence::NameOnly, Provenance::SymbolTable)
                     };
 
                     edges.push(Edge {
@@ -189,7 +196,7 @@ impl Resolver for SymbolTableResolver {
                         to: symbols[to_idx].id.clone(),
                         role: r.role,
                         confidence,
-                        provenance: Provenance::SymbolTable,
+                        provenance,
                         occ: r.occ.clone(),
                     });
                 }
@@ -443,6 +450,7 @@ mod tests {
             qualifier: None,
             scope: None,
             type_ref_ctx: None,
+            cross_artifact: false,
         });
 
         let graph = SymbolTableResolver.resolve(&[a, b]).unwrap();
@@ -832,6 +840,80 @@ mod tests {
             e.confidence,
             Confidence::Scoped,
             "unique global candidate → Scoped (Win-1), got {:?}",
+            e.confidence
+        );
+        assert_eq!(e.occ.file, "src/app.rs");
+    }
+
+    /// Code→SQL, marked cross-artifact: the same `users` TypeRef reference as
+    /// [`code_to_sql_typeref_edge_rust_to_table`], but with `cross_artifact: true`
+    /// set (as a future SQL-in-string extractor would). The resolver must
+    /// override both provenance and confidence: `Provenance::CrossArtifact` and
+    /// `Confidence::NameOnly`, regardless of the unique-candidate count that
+    /// would otherwise yield `Scoped`.
+    #[cfg(all(feature = "rust", feature = "sql"))]
+    #[test]
+    fn cross_artifact_reference_yields_cross_artifact_provenance_and_name_only_confidence() {
+        use crate::extract::SqlExtractor;
+
+        // SQL file: defines the `users` table.
+        let schema = SqlExtractor
+            .extract("CREATE TABLE users (id INT);", "db/schema.sql")
+            .unwrap();
+
+        // Rust file: references `users` as a type name in a function signature.
+        let mut rust_file = RustExtractor
+            .extract("pub fn run(u: users) {}", "src/app.rs")
+            .unwrap();
+
+        // Mark the `users` TypeRef reference as cross-artifact, simulating a
+        // future extractor that derives it from an embedded secondary artifact
+        // (e.g. a SQL string) rather than an ordinary code type reference.
+        let marked = rust_file
+            .references
+            .iter_mut()
+            .find(|r| r.role == RefRole::TypeRef && r.name == "users")
+            .expect("Rust extractor must emit a TypeRef ref for 'users'");
+        marked.cross_artifact = true;
+
+        let graph = SymbolTableResolver.resolve(&[schema, rust_file]).unwrap();
+
+        let edges_to_sql_table: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.role == RefRole::TypeRef && e.to.to_scip_string().ends_with("users#"))
+            .collect();
+
+        assert_eq!(
+            edges_to_sql_table.len(),
+            1,
+            "expected one Code→SQL TypeRef edge to 'users#', got {:?}: {:?}",
+            edges_to_sql_table.len(),
+            graph
+                .edges
+                .iter()
+                .map(|e| format!(
+                    "{} → {} ({:?}/{:?}/{:?})",
+                    e.from.to_scip_string(),
+                    e.to.to_scip_string(),
+                    e.role,
+                    e.confidence,
+                    e.provenance
+                ))
+                .collect::<Vec<_>>()
+        );
+
+        let e = edges_to_sql_table[0];
+        assert_eq!(
+            e.provenance,
+            Provenance::CrossArtifact,
+            "cross-artifact reference must yield Provenance::CrossArtifact, got {:?}",
+            e.provenance
+        );
+        assert_eq!(
+            e.confidence,
+            Confidence::NameOnly,
+            "cross-artifact reference must be forced to NameOnly regardless of candidate count, got {:?}",
             e.confidence
         );
         assert_eq!(e.occ.file, "src/app.rs");

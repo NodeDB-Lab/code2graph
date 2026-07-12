@@ -200,6 +200,7 @@ pub enum ProvenanceOutput {
     Conformance,
     NormalizedName,
     External,
+    CrossArtifact,
 }
 
 impl From<Provenance> for ProvenanceOutput {
@@ -211,6 +212,7 @@ impl From<Provenance> for ProvenanceOutput {
             Provenance::Conformance => Self::Conformance,
             Provenance::NormalizedName => Self::NormalizedName,
             Provenance::External => Self::External,
+            Provenance::CrossArtifact => Self::CrossArtifact,
         }
     }
 }

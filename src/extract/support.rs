@@ -213,6 +213,7 @@ pub(crate) fn push_ref(
         qualifier: None,
         scope: None,
         type_ref_ctx: None,
+        cross_artifact: false,
     });
 }
 
@@ -249,6 +250,7 @@ pub(crate) fn push_import_ref(
         qualifier: None,
         scope: None,
         type_ref_ctx: None,
+        cross_artifact: false,
     });
 }
 
@@ -279,6 +281,7 @@ pub(crate) fn push_type_ref(
         qualifier: None,
         scope: None,
         type_ref_ctx: Some(ctx),
+        cross_artifact: false,
     });
 }
 
@@ -363,6 +366,7 @@ pub(crate) fn collect_call_references(
                 qualifier: qualifier.clone(),
                 scope: None,
                 type_ref_ctx: None,
+                cross_artifact: false,
             });
         }
     }
