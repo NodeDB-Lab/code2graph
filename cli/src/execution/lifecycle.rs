@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use code2graph::CodeGraph;
+use code2graph::{CodeGraph, Edge, EdgeKey, Symbol, SymbolId};
+use code2graph_query::{EdgeFilter, GraphIndex, GraphPage, GraphRead};
 
 use crate::cache::{
-    CacheCompleteness, CacheError, CacheLocation, CacheStore, CandidateSnapshot, LoadedSnapshot,
-    ResolverCacheTier,
+    ActiveSnapshotMetadata, CacheCompleteness, CacheError, CacheGraphRead, CacheLocation,
+    CacheStore, CandidateSnapshot, LoadedSnapshot, ResolverCacheTier,
 };
 use crate::commands::{
     DefinitionCommandRequest, ImpactCommandRequest, ImportsCommandRequest,
@@ -13,6 +14,7 @@ use crate::commands::{
     execute_impact, execute_imports, execute_module_deps, execute_references, execute_relations,
     execute_symbols,
 };
+use crate::inventory::{OmissionImpact, discover_sources_checked};
 use crate::refresh::{
     PrepareCandidateInputs, PreparedRefreshCandidate, prepare_and_publish,
     prepare_refresh_candidate,
@@ -56,6 +58,164 @@ pub struct LoadedGraph {
 struct ExecutionRefreshOptions {
     force: bool,
     trust_mtime: bool,
+}
+
+enum QueryGraph<'a, 'deadline> {
+    InMemory(GraphIndex),
+    Cached(CacheGraphRead<'a, 'deadline>),
+}
+
+impl GraphRead for QueryGraph<'_, '_> {
+    type Error = CliError;
+
+    fn symbol(&self, id: &SymbolId) -> std::result::Result<Option<Symbol>, Self::Error> {
+        match self {
+            Self::InMemory(graph) => GraphRead::symbol(graph, id).map_err(|never| match never {}),
+            Self::Cached(graph) => graph.symbol(id).map_err(Into::into),
+        }
+    }
+    fn contains_id(&self, id: &SymbolId) -> std::result::Result<bool, Self::Error> {
+        match self {
+            Self::InMemory(graph) => {
+                GraphRead::contains_id(graph, id).map_err(|never| match never {})
+            }
+            Self::Cached(graph) => graph.contains_id(id).map_err(Into::into),
+        }
+    }
+    fn symbols(
+        &self,
+        after: Option<&SymbolId>,
+        limit: usize,
+    ) -> std::result::Result<GraphPage<Symbol, SymbolId>, Self::Error> {
+        match self {
+            Self::InMemory(graph) => {
+                GraphRead::symbols(graph, after, limit).map_err(|never| match never {})
+            }
+            Self::Cached(graph) => graph.symbols(after, limit).map_err(Into::into),
+        }
+    }
+    fn symbols_named(
+        &self,
+        name: &str,
+        after: Option<&SymbolId>,
+        limit: usize,
+    ) -> std::result::Result<GraphPage<Symbol, SymbolId>, Self::Error> {
+        match self {
+            Self::InMemory(graph) => {
+                GraphRead::symbols_named(graph, name, after, limit).map_err(|never| match never {})
+            }
+            Self::Cached(graph) => graph.symbols_named(name, after, limit).map_err(Into::into),
+        }
+    }
+    fn symbols_with_scip(
+        &self,
+        scip: &str,
+        after: Option<&SymbolId>,
+        limit: usize,
+    ) -> std::result::Result<GraphPage<Symbol, SymbolId>, Self::Error> {
+        match self {
+            Self::InMemory(graph) => GraphRead::symbols_with_scip(graph, scip, after, limit)
+                .map_err(|never| match never {}),
+            Self::Cached(graph) => graph
+                .symbols_with_scip(scip, after, limit)
+                .map_err(Into::into),
+        }
+    }
+    fn ids_with_scip(
+        &self,
+        scip: &str,
+        after: Option<&SymbolId>,
+        limit: usize,
+    ) -> std::result::Result<GraphPage<SymbolId, SymbolId>, Self::Error> {
+        match self {
+            Self::InMemory(graph) => {
+                GraphRead::ids_with_scip(graph, scip, after, limit).map_err(|never| match never {})
+            }
+            Self::Cached(graph) => graph.ids_with_scip(scip, after, limit).map_err(Into::into),
+        }
+    }
+    fn symbols_in_file(
+        &self,
+        file: &str,
+        after: Option<&SymbolId>,
+        limit: usize,
+    ) -> std::result::Result<GraphPage<Symbol, SymbolId>, Self::Error> {
+        match self {
+            Self::InMemory(graph) => GraphRead::symbols_in_file(graph, file, after, limit)
+                .map_err(|never| match never {}),
+            Self::Cached(graph) => graph
+                .symbols_in_file(file, after, limit)
+                .map_err(Into::into),
+        }
+    }
+    fn symbol_at_byte(
+        &self,
+        file: &str,
+        byte: usize,
+    ) -> std::result::Result<Option<Symbol>, Self::Error> {
+        match self {
+            Self::InMemory(graph) => {
+                GraphRead::symbol_at_byte(graph, file, byte).map_err(|never| match never {})
+            }
+            Self::Cached(graph) => graph.symbol_at_byte(file, byte).map_err(Into::into),
+        }
+    }
+    fn edges(
+        &self,
+        filter: EdgeFilter,
+        after: Option<&EdgeKey>,
+        limit: usize,
+    ) -> std::result::Result<GraphPage<Edge, EdgeKey>, Self::Error> {
+        match self {
+            Self::InMemory(graph) => {
+                GraphRead::edges(graph, filter, after, limit).map_err(|never| match never {})
+            }
+            Self::Cached(graph) => graph.edges(filter, after, limit).map_err(Into::into),
+        }
+    }
+    fn edges_in_file(
+        &self,
+        file: &str,
+        filter: EdgeFilter,
+        after: Option<&EdgeKey>,
+        limit: usize,
+    ) -> std::result::Result<GraphPage<Edge, EdgeKey>, Self::Error> {
+        match self {
+            Self::InMemory(graph) => GraphRead::edges_in_file(graph, file, filter, after, limit)
+                .map_err(|never| match never {}),
+            Self::Cached(graph) => graph
+                .edges_in_file(file, filter, after, limit)
+                .map_err(Into::into),
+        }
+    }
+    fn incoming(
+        &self,
+        id: &SymbolId,
+        filter: EdgeFilter,
+        after: Option<&EdgeKey>,
+        limit: usize,
+    ) -> std::result::Result<GraphPage<Edge, EdgeKey>, Self::Error> {
+        match self {
+            Self::InMemory(graph) => {
+                GraphRead::incoming(graph, id, filter, after, limit).map_err(|never| match never {})
+            }
+            Self::Cached(graph) => graph.incoming(id, filter, after, limit).map_err(Into::into),
+        }
+    }
+    fn outgoing(
+        &self,
+        id: &SymbolId,
+        filter: EdgeFilter,
+        after: Option<&EdgeKey>,
+        limit: usize,
+    ) -> std::result::Result<GraphPage<Edge, EdgeKey>, Self::Error> {
+        match self {
+            Self::InMemory(graph) => {
+                GraphRead::outgoing(graph, id, filter, after, limit).map_err(|never| match never {})
+            }
+            Self::Cached(graph) => graph.outgoing(id, filter, after, limit).map_err(Into::into),
+        }
+    }
 }
 
 struct ExecutionRefreshInputs<'a> {
@@ -244,18 +404,9 @@ fn execute_imports_query(
     execution: &ExecutionContext<'_>,
     command: ImportsCommandRequest<'_>,
 ) -> Result<CommandOutput> {
-    let loaded = load_query_graph(&request, execution)?;
-    let deadline = Deadline::new(request.global.limits.timeout);
-    deadline.check(execution.cancellation)?;
-    let index = crate::build_graph_index(&loaded)?;
-    let context = QueryCommandContext::new(
-        &loaded,
-        &index,
-        &deadline,
-        execution.cancellation,
-        request.global.limits.max_file_bytes,
-    )?;
-    Ok(CommandOutput::Imports(execute_imports(&context, command)?))
+    execute_query_backend(request, execution, |context| {
+        execute_imports(context, command).map(CommandOutput::Imports)
+    })
 }
 
 fn execute_references_query(
@@ -263,20 +414,9 @@ fn execute_references_query(
     execution: &ExecutionContext<'_>,
     command: ReferencesCommandRequest<'_>,
 ) -> Result<CommandOutput> {
-    let loaded = load_query_graph(&request, execution)?;
-    let deadline = Deadline::new(request.global.limits.timeout);
-    deadline.check(execution.cancellation)?;
-    let index = crate::build_graph_index(&loaded)?;
-    let context = QueryCommandContext::new(
-        &loaded,
-        &index,
-        &deadline,
-        execution.cancellation,
-        request.global.limits.max_file_bytes,
-    )?;
-    Ok(CommandOutput::References(execute_references(
-        &context, command,
-    )?))
+    execute_query_backend(request, execution, |context| {
+        execute_references(context, command).map(CommandOutput::References)
+    })
 }
 
 fn execute_module_deps_query(
@@ -284,20 +424,9 @@ fn execute_module_deps_query(
     execution: &ExecutionContext<'_>,
     command: ModuleDepsCommandRequest,
 ) -> Result<CommandOutput> {
-    let loaded = load_query_graph(&request, execution)?;
-    let deadline = Deadline::new(request.global.limits.timeout);
-    deadline.check(execution.cancellation)?;
-    let index = crate::build_graph_index(&loaded)?;
-    let context = QueryCommandContext::new(
-        &loaded,
-        &index,
-        &deadline,
-        execution.cancellation,
-        request.global.limits.max_file_bytes,
-    )?;
-    Ok(CommandOutput::ModuleDeps(execute_module_deps(
-        &context, command,
-    )?))
+    execute_query_backend(request, execution, |context| {
+        execute_module_deps(context, command).map(CommandOutput::ModuleDeps)
+    })
 }
 
 fn execute_symbols_query(
@@ -305,18 +434,9 @@ fn execute_symbols_query(
     execution: &ExecutionContext<'_>,
     command: SymbolsCommandRequest<'_>,
 ) -> Result<CommandOutput> {
-    let loaded = load_query_graph(&request, execution)?;
-    let deadline = Deadline::new(request.global.limits.timeout);
-    deadline.check(execution.cancellation)?;
-    let index = crate::build_graph_index(&loaded)?;
-    let context = QueryCommandContext::new(
-        &loaded,
-        &index,
-        &deadline,
-        execution.cancellation,
-        request.global.limits.max_file_bytes,
-    )?;
-    Ok(CommandOutput::Symbols(execute_symbols(&context, command)?))
+    execute_query_backend(request, execution, |context| {
+        execute_symbols(context, command).map(CommandOutput::Symbols)
+    })
 }
 
 fn execute_relations_query(
@@ -325,18 +445,9 @@ fn execute_relations_query(
     command: RelationCommandRequest<'_>,
     output: fn(OutputEnvelope<Vec<crate::RelationOutput>>) -> CommandOutput,
 ) -> Result<CommandOutput> {
-    let loaded = load_query_graph(&request, execution)?;
-    let deadline = Deadline::new(request.global.limits.timeout);
-    deadline.check(execution.cancellation)?;
-    let index = crate::build_graph_index(&loaded)?;
-    let context = QueryCommandContext::new(
-        &loaded,
-        &index,
-        &deadline,
-        execution.cancellation,
-        request.global.limits.max_file_bytes,
-    )?;
-    Ok(output(execute_relations(&context, command)?))
+    execute_query_backend(request, execution, |context| {
+        execute_relations(context, command).map(output)
+    })
 }
 
 fn execute_impact_query(
@@ -344,18 +455,9 @@ fn execute_impact_query(
     execution: &ExecutionContext<'_>,
     command: ImpactCommandRequest<'_>,
 ) -> Result<CommandOutput> {
-    let loaded = load_query_graph(&request, execution)?;
-    let deadline = Deadline::new(request.global.limits.timeout);
-    deadline.check(execution.cancellation)?;
-    let index = crate::build_graph_index(&loaded)?;
-    let context = QueryCommandContext::new(
-        &loaded,
-        &index,
-        &deadline,
-        execution.cancellation,
-        request.global.limits.max_file_bytes,
-    )?;
-    Ok(CommandOutput::Impact(execute_impact(&context, command)?))
+    execute_query_backend(request, execution, |context| {
+        execute_impact(context, command).map(CommandOutput::Impact)
+    })
 }
 
 fn execute_definition_query(
@@ -363,18 +465,228 @@ fn execute_definition_query(
     execution: &ExecutionContext<'_>,
     command: DefinitionCommandRequest<'_>,
 ) -> Result<CommandOutput> {
-    let loaded = load_query_graph(&request, execution)?;
-    let deadline = Deadline::new(request.global.limits.timeout);
-    deadline.check(execution.cancellation)?;
-    let index = crate::build_graph_index(&loaded)?;
-    let context = QueryCommandContext::new(
+    execute_query_backend(request, execution, |context| {
+        execute_definition(context, command).map(CommandOutput::Def)
+    })
+}
+
+fn execute_query_backend(
+    request: CliRequest,
+    execution: &ExecutionContext<'_>,
+    run: impl FnOnce(&QueryCommandContext<'_, QueryGraph<'_, '_>>) -> Result<CommandOutput>,
+) -> Result<CommandOutput> {
+    let deadline = deadline_before_selection(&request, execution)?;
+    let selection = select_project(&request, &execution.cwd)?;
+    let tier = ResolverCacheTier::from(request.global.tier);
+    if request.global.no_cache {
+        let LoadedGraph {
+            selection,
+            snapshot,
+            graph: resolved,
+            project,
+        } = load_query_graph(&request, execution)?;
+        let loaded = LoadedGraph {
+            selection,
+            snapshot,
+            graph: CodeGraph {
+                symbols: Vec::new(),
+                edges: Vec::new(),
+            },
+            project,
+        };
+        let graph = QueryGraph::InMemory(
+            GraphIndex::from_graph(resolved).map_err(|error| CliError::Index(error.to_string()))?,
+        );
+        let context = QueryCommandContext::new(
+            &loaded,
+            &graph,
+            &deadline,
+            execution.cancellation,
+            request.global.limits.max_file_bytes,
+        )?;
+        return run(&context);
+    }
+
+    let location = cache_location(execution, &selection)?;
+    let store = if request.global.frozen {
+        open_frozen(&location, &selection.canonical_root, &deadline)?
+    } else {
+        CacheStore::open_writable(&location, &selection.canonical_root, &deadline)?
+    };
+    let (metadata, freshness, cache) = if request.global.frozen {
+        (
+            active_metadata(&store, tier, request.global.allow_partial, &deadline)?
+                .ok_or_else(frozen_missing)?,
+            Freshness::Frozen,
+            CacheDisposition::Hit,
+        )
+    } else {
+        let prepared_at_ns = execution.clock.unix_time_ns()?;
+        // Cached query execution never hydrates a whole prior snapshot. A refresh
+        // runs only when no active metadata exists; source-changing operations
+        // use the explicit index/status refresh path below.
+        let prior: Option<LoadedSnapshot> = None;
+        let active = active_metadata(&store, tier, request.global.allow_partial, &deadline)?;
+        let current = match active.as_ref() {
+            Some(metadata) => cached_sources_are_current(
+                &store,
+                metadata,
+                &request,
+                &selection,
+                &deadline,
+                execution.cancellation,
+            )?,
+            None => false,
+        };
+        match if current {
+            Ok(None)
+        } else {
+            prepare_and_publish(
+                &store,
+                ExecutionRefreshInputs {
+                    request: &request,
+                    selection: &selection,
+                    options: ExecutionRefreshOptions::default(),
+                    prior: prior.as_ref(),
+                    prepared_at_ns,
+                    deadline: &deadline,
+                    context: execution,
+                }
+                .candidate_inputs(),
+                request.global.allow_partial,
+            )
+            .map(Some)
+        } {
+            Ok(Some(published)) => (
+                active_metadata(&store, tier, request.global.allow_partial, &deadline)?
+                    .ok_or_else(|| CliError::Cache("published snapshot is not active".into()))?,
+                Freshness::Fresh,
+                refresh_cache_disposition(prior.as_ref(), &published.prepared),
+            ),
+            Ok(None) => (
+                active.expect("checked active metadata"),
+                Freshness::Fresh,
+                CacheDisposition::Hit,
+            ),
+            Err(error) if request.global.allow_stale => (
+                active_metadata(&store, tier, request.global.allow_partial, &deadline)?
+                    .ok_or(error)?,
+                Freshness::Stale,
+                CacheDisposition::Hit,
+            ),
+            Err(error) => return Err(error),
+        }
+    };
+    let hashes = store.candidate_file_hashes(metadata.candidate_id, &deadline)?;
+    let reference_facts = match &request.command {
+        CommandRequest::References { file, .. } => {
+            store.file_facts(metadata.candidate_id, file, &deadline)?
+        }
+        _ => None,
+    };
+    let loaded = loaded_from_metadata(selection, metadata, request.global.tier, freshness, cache);
+    let graph =
+        QueryGraph::Cached(store.graph_reader(loaded.snapshot.candidate_id, tier, &deadline)?);
+    let context = QueryCommandContext::with_candidate_hashes(
         &loaded,
-        &index,
+        &graph,
         &deadline,
         execution.cancellation,
         request.global.limits.max_file_bytes,
+        hashes,
+        reference_facts,
     )?;
-    Ok(CommandOutput::Def(execute_definition(&context, command)?))
+    run(&context)
+}
+
+fn active_metadata(
+    store: &CacheStore,
+    tier: ResolverCacheTier,
+    allow_partial: bool,
+    deadline: &Deadline,
+) -> Result<Option<ActiveSnapshotMetadata>> {
+    let complete = store.active_metadata(tier, CacheCompleteness::Complete, deadline)?;
+    if complete.is_some() || !allow_partial {
+        return Ok(complete);
+    }
+    store
+        .active_metadata(tier, CacheCompleteness::Partial, deadline)
+        .map_err(Into::into)
+}
+
+fn cached_sources_are_current(
+    store: &CacheStore,
+    metadata: &ActiveSnapshotMetadata,
+    request: &CliRequest,
+    selection: &crate::ProjectSelection,
+    deadline: &Deadline,
+    cancellation: &dyn crate::Cancellation,
+) -> Result<bool> {
+    if metadata.completeness != CacheCompleteness::Complete {
+        return Ok(false);
+    }
+    let discovery = discover_sources_checked(
+        selection,
+        &request.global.limits,
+        request.global.include_hidden,
+        deadline,
+        cancellation,
+    )?;
+    if discovery
+        .omitted
+        .iter()
+        .any(|omission| omission.impact == OmissionImpact::IncompleteSourceSet)
+        || discovery.candidates.len() as u64 != metadata.inventory_file_count
+    {
+        return Ok(false);
+    }
+    let cached = store.candidate_file_metadata(metadata.candidate_id, deadline)?;
+    if cached.len() != discovery.candidates.len() {
+        return Ok(false);
+    }
+    Ok(discovery
+        .candidates
+        .iter()
+        .zip(cached)
+        .all(|(candidate, cached)| {
+            candidate.path.as_str() == cached.path
+                && candidate
+                    .language
+                    .is_some_and(|language| language.as_str() == cached.language)
+                && candidate.size_bytes == cached.size_bytes
+                && candidate.mtime == cached.mtime
+        }))
+}
+
+fn loaded_from_metadata(
+    selection: crate::ProjectSelection,
+    metadata: ActiveSnapshotMetadata,
+    tier: crate::ResolverTier,
+    freshness: Freshness,
+    cache: CacheDisposition,
+) -> LoadedGraph {
+    let snapshot = LoadedSnapshot {
+        candidate_id: metadata.candidate_id,
+        compatibility: metadata.compatibility,
+        input_digest: metadata.input_digest,
+        completeness: metadata.completeness,
+        omissions: metadata.omissions,
+        created_at_ns: metadata.created_at_ns,
+        inventory_file_count: metadata.inventory_file_count,
+        inventory_total_bytes: metadata.inventory_total_bytes,
+        files: Vec::new(),
+        tier_graphs: Vec::new(),
+    };
+    let project = project_output(&selection, &snapshot, tier, freshness, cache);
+    LoadedGraph {
+        selection,
+        snapshot,
+        graph: CodeGraph {
+            symbols: Vec::new(),
+            edges: Vec::new(),
+        },
+        project,
+    }
 }
 
 fn deadline_before_selection(
@@ -462,12 +774,19 @@ fn execute_status(request: CliRequest, context: &ExecutionContext<'_>) -> Result
     if request.global.frozen {
         let location = cache_location(context, &selection)?;
         let store = open_frozen(&location, &selection.canonical_root, &deadline)?;
-        let snapshot = latest_active(&store, tier, request.global.allow_partial, &deadline)?
+        let metadata = active_metadata(&store, tier, request.global.allow_partial, &deadline)?
             .ok_or_else(frozen_missing)?;
+        let loaded = loaded_from_metadata(
+            selection.clone(),
+            metadata,
+            request.global.tier,
+            Freshness::Frozen,
+            CacheDisposition::Hit,
+        );
         return Ok(CommandOutput::Status(status_envelope(
             &request,
             &selection,
-            snapshot,
+            loaded.snapshot,
             Freshness::Frozen,
             CacheDisposition::Hit,
         )));
@@ -496,7 +815,32 @@ fn execute_status(request: CliRequest, context: &ExecutionContext<'_>) -> Result
 
     let location = cache_location(context, &selection)?;
     let store = CacheStore::open_writable(&location, &selection.canonical_root, &deadline)?;
-    let prior = refresh_prior(&store, tier, request.global.allow_partial, &deadline)?;
+    if let Some(metadata) = active_metadata(&store, tier, request.global.allow_partial, &deadline)?
+        && cached_sources_are_current(
+            &store,
+            &metadata,
+            &request,
+            &selection,
+            &deadline,
+            context.cancellation,
+        )?
+    {
+        let loaded = loaded_from_metadata(
+            selection.clone(),
+            metadata,
+            request.global.tier,
+            Freshness::Fresh,
+            CacheDisposition::Hit,
+        );
+        return Ok(CommandOutput::Status(status_envelope(
+            &request,
+            &selection,
+            loaded.snapshot,
+            Freshness::Fresh,
+            CacheDisposition::Hit,
+        )));
+    }
+    let prior: Option<LoadedSnapshot> = None;
     let refresh = prepare_and_publish(
         &store,
         ExecutionRefreshInputs {
@@ -512,20 +856,38 @@ fn execute_status(request: CliRequest, context: &ExecutionContext<'_>) -> Result
         request.global.allow_partial,
     );
     match refresh {
-        Ok(published) => Ok(CommandOutput::Status(status_envelope(
-            &request,
-            &selection,
-            published.loaded,
-            Freshness::Fresh,
-            refresh_cache_disposition(prior.as_ref(), &published.prepared),
-        ))),
-        Err(error) if request.global.allow_stale => {
-            let snapshot = latest_active(&store, tier, request.global.allow_partial, &deadline)?
-                .ok_or(error)?;
+        Ok(published) => {
+            let metadata = active_metadata(&store, tier, request.global.allow_partial, &deadline)?
+                .ok_or_else(|| CliError::Cache("published snapshot is not active".into()))?;
+            let loaded = loaded_from_metadata(
+                selection.clone(),
+                metadata,
+                request.global.tier,
+                Freshness::Fresh,
+                refresh_cache_disposition(prior.as_ref(), &published.prepared),
+            );
             Ok(CommandOutput::Status(status_envelope(
                 &request,
                 &selection,
-                snapshot,
+                loaded.snapshot,
+                Freshness::Fresh,
+                refresh_cache_disposition(prior.as_ref(), &published.prepared),
+            )))
+        }
+        Err(error) if request.global.allow_stale => {
+            let metadata = active_metadata(&store, tier, request.global.allow_partial, &deadline)?
+                .ok_or(error)?;
+            let loaded = loaded_from_metadata(
+                selection.clone(),
+                metadata,
+                request.global.tier,
+                Freshness::Stale,
+                CacheDisposition::Hit,
+            );
+            Ok(CommandOutput::Status(status_envelope(
+                &request,
+                &selection,
+                loaded.snapshot,
                 Freshness::Stale,
                 CacheDisposition::Hit,
             )))
@@ -725,19 +1087,25 @@ fn status_envelope(
 
 fn graph_from_snapshot(
     selection: crate::ProjectSelection,
-    snapshot: LoadedSnapshot,
+    mut snapshot: LoadedSnapshot,
     tier: crate::ResolverTier,
     freshness: Freshness,
     cache: CacheDisposition,
 ) -> Result<LoadedGraph> {
-    let graph = snapshot
+    let graph_index = snapshot
         .tier_graphs
         .iter()
-        .find(|(stored, _)| *stored == ResolverCacheTier::from(tier))
-        .map(|(_, graph)| graph.clone())
+        .position(|(stored, _)| *stored == ResolverCacheTier::from(tier))
         .ok_or_else(|| {
             CliError::Cache("selected snapshot lacks the requested resolver tier graph".into())
         })?;
+    let graph = std::mem::replace(
+        &mut snapshot.tier_graphs[graph_index].1,
+        CodeGraph {
+            symbols: Vec::new(),
+            edges: Vec::new(),
+        },
+    );
     let project = project_output(&selection, &snapshot, tier, freshness, cache);
     Ok(LoadedGraph {
         selection,
@@ -888,6 +1256,60 @@ mod tests {
             cancellation,
             clock,
         )
+    }
+
+    #[test]
+    fn frozen_cached_status_and_symbols_never_load_a_whole_graph() {
+        let (_temp, root, cache) = fixture();
+        let cancellation = NeverCancelled;
+        let clock = FixedClock;
+        let context = context(&root, &cache, &cancellation, &clock);
+        execute(index_request(false), &context).expect("index");
+
+        crate::cache::reset_whole_graph_loads();
+        let mut frozen_status = status(false);
+        frozen_status.global.frozen = true;
+        execute(frozen_status, &context).expect("cached status");
+        let frozen_symbols = CliRequest {
+            global: GlobalOptions {
+                frozen: true,
+                ..GlobalOptions::default()
+            },
+            command: CommandRequest::Symbols {
+                text: "run".into(),
+                file: None,
+                kind: None,
+                case_sensitive: true,
+            },
+        };
+        assert!(matches!(
+            execute(frozen_symbols, &context),
+            Err(CliError::NoMatch)
+        ));
+        assert_eq!(crate::cache::whole_graph_loads(), 0);
+    }
+
+    #[test]
+    fn normal_cached_status_and_query_never_load_a_whole_graph() {
+        let (_temp, root, cache) = fixture();
+        let cancellation = NeverCancelled;
+        let clock = FixedClock;
+        let context = context(&root, &cache, &cancellation, &clock);
+        execute(index_request(false), &context).expect("index");
+
+        crate::cache::reset_whole_graph_loads();
+        execute(status(false), &context).expect("cached status");
+        let symbols = CliRequest {
+            global: GlobalOptions::default(),
+            command: CommandRequest::Symbols {
+                text: "run".into(),
+                file: None,
+                kind: None,
+                case_sensitive: true,
+            },
+        };
+        let _ = execute(symbols, &context);
+        assert_eq!(crate::cache::whole_graph_loads(), 0);
     }
 
     #[test]

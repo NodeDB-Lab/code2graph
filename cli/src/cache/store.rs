@@ -2,12 +2,17 @@
 
 //! SQLite cache opening, schema migration, and identity validation.
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::fs;
 use std::io;
 use std::path::Path;
 use std::time::Duration;
 
-use code2graph::{CodeGraph, IncrementalGraph};
+use code2graph::{
+    CodeGraph, Confidence, Edge, EdgeKey, FileFacts, IncrementalGraph, Symbol, SymbolId,
+};
+use code2graph_query::{EdgeFilter, GraphPage, GraphRead};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
 use crate::Deadline;
@@ -17,11 +22,47 @@ use super::schema::{self, SCHEMA_VERSION};
 use super::{
     CacheCompleteness, CacheError, CacheLocation, CandidateFileRecord, CandidateId,
     CandidateSnapshot, CompatibilityFingerprint, CompatibilityRecord, LoadedSnapshot,
-    ProjectInputDigest, ResolverCacheTier, decode_file_facts, decode_graph, encode_file_facts,
-    encode_graph, encode_subgraph, restore_subgraph,
+    ProjectInputDigest, ResolverCacheTier, decode_file_facts, encode_file_facts, encode_subgraph,
+    restore_subgraph,
 };
 
 const LOCK_WAIT_CAP: Duration = Duration::from_secs(2);
+
+#[cfg(test)]
+thread_local! {
+    static WHOLE_GRAPH_LOADS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_whole_graph_loads() {
+    WHOLE_GRAPH_LOADS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn whole_graph_loads() -> usize {
+    WHOLE_GRAPH_LOADS.with(Cell::get)
+}
+
+#[cfg(test)]
+fn record_whole_graph_load() {
+    WHOLE_GRAPH_LOADS.with(|count| count.set(count.get().saturating_add(1)));
+}
+
+const fn confidence_rank(confidence: Confidence) -> i64 {
+    match confidence {
+        Confidence::Heuristic => 0,
+        Confidence::NameOnly => 1,
+        Confidence::Scoped => 2,
+        Confidence::Exact => 3,
+    }
+}
+
+/// CLI-owned ordered reader over one immutable normalized graph snapshot.
+pub struct CacheGraphRead<'store, 'deadline> {
+    store: &'store CacheStore,
+    snapshot_id: i64,
+    deadline: &'deadline Deadline,
+}
 
 #[derive(Debug)]
 struct CandidateFileRow {
@@ -107,7 +148,26 @@ impl CacheStore {
                 configure_writable(&connection, deadline)?;
             }
             SCHEMA_VERSION => {
-                schema::validate_v1(&connection, &root, &key)?;
+                match schema::validate_v1(&connection, &root, &key) {
+                    Ok(()) => {}
+                    Err(CacheError::Incompatible) => {
+                        connection
+                            .execute_batch("BEGIN IMMEDIATE")
+                            .map_err(|error| map_sqlite_error(error, deadline))?;
+                        let reset = schema::reset_legacy_graph_layout(&connection);
+                        match reset {
+                            Ok(true) => connection
+                                .execute_batch("COMMIT")
+                                .map_err(|error| map_sqlite_error(error, deadline))?,
+                            Ok(false) | Err(_) => {
+                                let _ = connection.execute_batch("ROLLBACK");
+                                return Err(CacheError::Incompatible);
+                            }
+                        }
+                        schema::validate_v1(&connection, &root, &key)?;
+                    }
+                    Err(error) => return Err(error),
+                }
                 configure_writable(&connection, deadline)?;
             }
             _ => return Err(CacheError::UnsupportedSchema),
@@ -286,30 +346,78 @@ impl CacheStore {
                 .map_err(|error| map_sqlite_error(error, deadline))?;
             for graph in &encoded.graphs {
                 ensure_time(deadline)?;
-                let existing: Option<Vec<u8>> = self.connection.query_row(
-                    "SELECT graph FROM graph_snapshots WHERE candidate_id = ?1 AND resolver_tier = ?2",
+                let snapshot_id: Option<i64> = self.connection.query_row(
+                    "SELECT snapshot_id FROM graph_snapshots WHERE candidate_id = ?1 AND resolver_tier = ?2",
                     params![encoded.candidate_id.as_slice(), graph.tier], |row| row.get(0),
                 ).optional().map_err(|error| map_sqlite_error(error, deadline))?;
-                if let Some(existing) = existing {
-                    if existing != graph.blob {
-                        return Err(CacheError::CandidateConflict);
-                    }
-                    let stored_created_at: i64 = self.connection.query_row(
-                        "SELECT created_at_ns FROM graph_snapshots WHERE candidate_id = ?1 AND resolver_tier = ?2",
-                        params![encoded.candidate_id.as_slice(), graph.tier],
-                        |row| row.get(0),
-                    ).map_err(|error| map_sqlite_error(error, deadline))?;
-                    let _ = stored_created_at;
+                let snapshot_id = if let Some(snapshot_id) = snapshot_id {
+                    self.verify_existing_graph(snapshot_id, graph, deadline)?;
+                    snapshot_id
                 } else {
                     self.connection.execute(
-                        "INSERT INTO graph_snapshots (candidate_id, resolver_tier, graph, created_at_ns) VALUES (?1, ?2, ?3, ?4)",
-                        params![encoded.candidate_id.as_slice(), graph.tier, graph.blob, candidate_created_at],
+                        "INSERT INTO graph_snapshots (candidate_id, resolver_tier, created_at_ns) VALUES (?1, ?2, ?3)",
+                        params![encoded.candidate_id.as_slice(), graph.tier, candidate_created_at],
                     ).map_err(|error| map_sqlite_error(error, deadline))?;
-                }
+                    let snapshot_id = self.connection.last_insert_rowid();
+                    let mut known_ids =
+                        Vec::with_capacity(graph.symbols.len() + graph.edges.len() * 2);
+                    for payload in &graph.symbols {
+                        known_ids.push(
+                            serde_json::from_slice::<Symbol>(payload)
+                                .map_err(|_| CacheError::Corrupt)?
+                                .id,
+                        );
+                    }
+                    for payload in &graph.edges {
+                        let edge: Edge =
+                            serde_json::from_slice(payload).map_err(|_| CacheError::Corrupt)?;
+                        known_ids.extend([edge.from, edge.to]);
+                    }
+                    known_ids.sort();
+                    known_ids.dedup();
+                    for (ordinal, id) in known_ids.iter().enumerate() {
+                        self.connection.execute(
+                            "INSERT INTO graph_ids (snapshot_id, ordinal, id, scip) VALUES (?1, ?2, ?3, ?4)",
+                            params![snapshot_id, i64::try_from(ordinal).map_err(|_| CacheError::Limits)?, serde_json::to_vec(id).map_err(|_| CacheError::Limits)?, id.to_scip_string()],
+                        ).map_err(|error| map_sqlite_error(error, deadline))?;
+                    }
+                    for (ordinal, payload) in graph.symbols.iter().enumerate() {
+                        let symbol: Symbol =
+                            serde_json::from_slice(payload).map_err(|_| CacheError::Corrupt)?;
+                        let id = serde_json::to_vec(&symbol.id).map_err(|_| CacheError::Limits)?;
+                        let kind =
+                            serde_json::to_string(&symbol.kind).map_err(|_| CacheError::Limits)?;
+                        self.connection.execute(
+                            "INSERT INTO graph_symbols (snapshot_id, ordinal, id, scip, name, file, span_start, span_end, kind, symbol) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                            params![snapshot_id, i64::try_from(ordinal).map_err(|_| CacheError::Limits)?, id.clone(), symbol.id.to_scip_string(), symbol.name, symbol.file, i64::try_from(symbol.span.start).map_err(|_| CacheError::Limits)?, i64::try_from(symbol.span.end).map_err(|_| CacheError::Limits)?, kind, payload],
+                        ).map_err(|error| map_sqlite_error(error, deadline))?;
+                    }
+                    for (ordinal, payload) in graph.edges.iter().enumerate() {
+                        let edge: Edge =
+                            serde_json::from_slice(payload).map_err(|_| CacheError::Corrupt)?;
+                        let from_id =
+                            serde_json::to_vec(&edge.from).map_err(|_| CacheError::Limits)?;
+                        let to_id = serde_json::to_vec(&edge.to).map_err(|_| CacheError::Limits)?;
+                        let role =
+                            serde_json::to_string(&edge.role).map_err(|_| CacheError::Limits)?;
+                        let confidence = serde_json::to_string(&edge.confidence)
+                            .map_err(|_| CacheError::Limits)?;
+                        let provenance = serde_json::to_string(&edge.provenance)
+                            .map_err(|_| CacheError::Limits)?;
+                        let confidence_rank = confidence_rank(edge.confidence);
+                        let edge_key =
+                            serde_json::to_vec(&edge.key()).map_err(|_| CacheError::Limits)?;
+                        self.connection.execute(
+                            "INSERT INTO graph_edges (snapshot_id, ordinal, edge_key, from_id, to_id, role, confidence, confidence_rank, provenance, occurrence_file, occurrence_byte, edge) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                            params![snapshot_id, i64::try_from(ordinal).map_err(|_| CacheError::Limits)?, edge_key, from_id.clone(), to_id.clone(), role, confidence, confidence_rank, provenance, edge.occ.file, i64::try_from(edge.occ.byte).map_err(|_| CacheError::Limits)?, payload],
+                        ).map_err(|error| map_sqlite_error(error, deadline))?;
+                    }
+                    snapshot_id
+                };
                 // Do this last: a failed file/graph write cannot change visibility.
                 self.connection.execute(
-                    "INSERT INTO active_snapshots (resolver_tier, completeness, snapshot_id) SELECT resolver_tier, ?1, snapshot_id FROM graph_snapshots WHERE candidate_id = ?2 AND resolver_tier = ?3 ON CONFLICT(resolver_tier, completeness) DO UPDATE SET snapshot_id = excluded.snapshot_id",
-                    params![encoded.completeness, encoded.candidate_id.as_slice(), graph.tier],
+                    "INSERT INTO active_snapshots (resolver_tier, completeness, snapshot_id) VALUES (?1, ?2, ?3) ON CONFLICT(resolver_tier, completeness) DO UPDATE SET snapshot_id = excluded.snapshot_id",
+                    params![graph.tier, encoded.completeness, snapshot_id],
                 ).map_err(|error| map_sqlite_error(error, deadline))?;
             }
             ensure_time(deadline)
@@ -328,6 +436,80 @@ impl CacheStore {
                 Err(error)
             }
         }
+    }
+
+    fn verify_existing_graph(
+        &self,
+        snapshot_id: i64,
+        graph: &PreparedGraph,
+        deadline: &Deadline,
+    ) -> Result<(), CacheError> {
+        let stored_symbols =
+            self.load_graph_payloads(snapshot_id, "graph_symbols", "symbol", deadline)?;
+        let stored_edges =
+            self.load_graph_payloads(snapshot_id, "graph_edges", "edge", deadline)?;
+        if stored_symbols != graph.symbols || stored_edges != graph.edges {
+            return Err(CacheError::CandidateConflict);
+        }
+        Ok(())
+    }
+
+    fn load_graph_payloads(
+        &self,
+        snapshot_id: i64,
+        table: &str,
+        column: &str,
+        deadline: &Deadline,
+    ) -> Result<Vec<Vec<u8>>, CacheError> {
+        let sql =
+            format!("SELECT {column} FROM {table} WHERE snapshot_id = ?1 ORDER BY ordinal ASC");
+        let mut statement = self
+            .connection
+            .prepare(&sql)
+            .map_err(|error| map_sqlite_error(error, deadline))?;
+        statement
+            .query_map([snapshot_id], |row| row.get::<_, Vec<u8>>(0))
+            .map_err(|error| map_sqlite_error(error, deadline))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| map_sqlite_error(error, deadline))
+    }
+
+    fn load_graph_rows(
+        &self,
+        snapshot_id: i64,
+        deadline: &Deadline,
+    ) -> Result<CodeGraph, CacheError> {
+        let mut symbols = Vec::new();
+        let mut statement = self
+            .connection
+            .prepare("SELECT symbol FROM graph_symbols WHERE snapshot_id = ?1 ORDER BY ordinal ASC")
+            .map_err(|error| map_sqlite_error(error, deadline))?;
+        let rows = statement
+            .query_map([snapshot_id], |row| row.get::<_, Vec<u8>>(0))
+            .map_err(|error| map_sqlite_error(error, deadline))?;
+        for row in rows {
+            ensure_time(deadline)?;
+            symbols.push(
+                serde_json::from_slice(&row.map_err(|error| map_sqlite_error(error, deadline))?)
+                    .map_err(|_| CacheError::Corrupt)?,
+            );
+        }
+        let mut edges = Vec::new();
+        let mut statement = self
+            .connection
+            .prepare("SELECT edge FROM graph_edges WHERE snapshot_id = ?1 ORDER BY ordinal ASC")
+            .map_err(|error| map_sqlite_error(error, deadline))?;
+        let rows = statement
+            .query_map([snapshot_id], |row| row.get::<_, Vec<u8>>(0))
+            .map_err(|error| map_sqlite_error(error, deadline))?;
+        for row in rows {
+            ensure_time(deadline)?;
+            edges.push(
+                serde_json::from_slice(&row.map_err(|error| map_sqlite_error(error, deadline))?)
+                    .map_err(|_| CacheError::Corrupt)?,
+            );
+        }
+        Ok(CodeGraph { symbols, edges })
     }
 
     /// Loads the currently active graph for an isolated `(tier, completeness)` slot
@@ -378,6 +560,142 @@ impl CacheStore {
         })
     }
 
+    /// Selects an active snapshot without loading graph rows, file facts, or subgraphs.
+    pub fn active_metadata(
+        &self,
+        tier: ResolverCacheTier,
+        completeness: CacheCompleteness,
+        deadline: &Deadline,
+    ) -> Result<Option<super::ActiveSnapshotMetadata>, CacheError> {
+        self.with_read_transaction(deadline, || {
+            let row: Option<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, i64, i64, i64, i64, i64, String)> = self.connection.query_row(
+                "SELECT c.candidate_id, c.compatibility_id, k.language_fingerprint, k.package_fingerprint, k.created_at_ns, c.completeness, c.created_at_ns, c.inventory_file_count, c.inventory_total_bytes, g.resolver_tier FROM active_snapshots a JOIN graph_snapshots g ON g.snapshot_id = a.snapshot_id JOIN candidates c ON c.candidate_id = g.candidate_id JOIN compatibility k ON k.compatibility_id = c.compatibility_id WHERE a.resolver_tier = ?1 AND a.completeness = ?2",
+                params![tier.as_sql(), completeness.as_sql()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?)),
+            ).optional().map_err(|error| map_sqlite_error(error, deadline))?;
+            let Some((candidate, compatibility, language, package, compatibility_created, completeness, created, files, bytes, stored_tier)) = row else { return Ok(None); };
+            let candidate_id = fingerprint_from_blob(candidate)?;
+            let compatibility = CompatibilityFingerprint::from_bytes(fixed_32(compatibility)?);
+            let language_fingerprint = super::LanguageFeatureFingerprint::from_bytes(fixed_32(language)?);
+            let package_fingerprint = super::PackageFingerprint::from_bytes(fixed_32(package)?);
+            if compatibility != CompatibilityFingerprint::new(language_fingerprint, package_fingerprint) {
+                return Err(CacheError::Corrupt);
+            }
+            let omissions = self.load_omissions(candidate_id, deadline)?;
+            Ok(Some(super::ActiveSnapshotMetadata {
+                candidate_id,
+                compatibility: super::CompatibilityRecord { id: compatibility, language_fingerprint, package_fingerprint, created_at_ns: nonnegative(compatibility_created)? },
+                input_digest: self.candidate_input_digest(candidate_id, deadline)?,
+                completeness: CacheCompleteness::from_sql(completeness)?,
+                omissions,
+                created_at_ns: nonnegative(created)?,
+                inventory_file_count: nonnegative(files)?,
+                inventory_total_bytes: nonnegative(bytes)?,
+                tier: ResolverCacheTier::from_sql(stored_tier)?,
+            }))
+        })
+    }
+
+    /// Lists content hashes without decoding any file facts or graph rows.
+    pub fn candidate_file_hashes(
+        &self,
+        candidate_id: CandidateId,
+        deadline: &Deadline,
+    ) -> Result<std::collections::HashMap<String, [u8; 32]>, CacheError> {
+        self.with_read_transaction(deadline, || {
+            let mut statement = self
+                .connection
+                .prepare("SELECT path, content_hash FROM candidate_files WHERE candidate_id = ?1 ORDER BY path")
+                .map_err(|error| map_sqlite_error(error, deadline))?;
+            let rows = statement
+                .query_map([candidate_id.as_bytes().as_slice()], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })
+                .map_err(|error| map_sqlite_error(error, deadline))?;
+            let mut hashes = std::collections::HashMap::new();
+            for row in rows {
+                ensure_time(deadline)?;
+                let (path, hash) = row.map_err(|error| map_sqlite_error(error, deadline))?;
+                if hashes.insert(path.clone(), fixed_32(hash)?).is_some() {
+                    return Err(CacheError::Corrupt);
+                }
+            }
+            Ok(hashes)
+        })
+    }
+
+    /// Lists cached file metadata without decoding facts, subgraphs, or graph rows.
+    pub fn candidate_file_metadata(
+        &self,
+        candidate_id: CandidateId,
+        deadline: &Deadline,
+    ) -> Result<Vec<super::CachedFileMetadata>, CacheError> {
+        self.with_read_transaction(deadline, || {
+            let mut statement = self.connection.prepare(
+                "SELECT path, language, content_hash, size_bytes, mtime_seconds, mtime_nanoseconds, package_assignment, file_subgraph FROM candidate_files WHERE candidate_id = ?1 ORDER BY path ASC",
+            ).map_err(|error| map_sqlite_error(error, deadline))?;
+            let rows = statement.query_map([candidate_id.as_bytes().as_slice()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Vec<u8>>(2)?, row.get::<_, i64>(3)?, row.get::<_, Option<i64>>(4)?, row.get::<_, Option<i64>>(5)?, row.get::<_, String>(6)?, row.get::<_, Option<Vec<u8>>>(7)?))
+            }).map_err(|error| map_sqlite_error(error, deadline))?;
+            let mut files = Vec::new();
+            for row in rows {
+                ensure_time(deadline)?;
+                let (path, language, hash, bytes, seconds, nanos, assignment, subgraph) = row.map_err(|error| map_sqlite_error(error, deadline))?;
+                files.push(super::CachedFileMetadata {
+                    path,
+                    language,
+                    content_hash: fixed_32(hash)?,
+                    size_bytes: nonnegative(bytes)?,
+                    mtime: decode_mtime(seconds, nanos)?,
+                    package_assignment: assignment,
+                    has_subgraph: subgraph.is_some(),
+                });
+            }
+            Ok(files)
+        })
+    }
+
+    /// Loads metadata for one cached file without decoding its facts or subgraph.
+    pub fn file_metadata(
+        &self,
+        candidate_id: CandidateId,
+        path: &str,
+        deadline: &Deadline,
+    ) -> Result<Option<super::CachedFileMetadata>, CacheError> {
+        self.with_read_transaction(deadline, || {
+            let row: Option<(String, Vec<u8>, i64, Option<i64>, Option<i64>, String, Option<Vec<u8>>)> = self.connection.query_row(
+                "SELECT language, content_hash, size_bytes, mtime_seconds, mtime_nanoseconds, package_assignment, file_subgraph FROM candidate_files WHERE candidate_id = ?1 AND path = ?2",
+                params![candidate_id.as_bytes().as_slice(), path],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
+            ).optional().map_err(|error| map_sqlite_error(error, deadline))?;
+            row.map(|(language, hash, bytes, seconds, nanos, assignment, subgraph)| Ok(super::CachedFileMetadata {
+                path: path.to_owned(), language, content_hash: fixed_32(hash)?, size_bytes: nonnegative(bytes)?,
+                mtime: decode_mtime(seconds, nanos)?, package_assignment: assignment, has_subgraph: subgraph.is_some(),
+            })).transpose()
+        })
+    }
+
+    /// Loads one cached file's validated facts without loading the candidate or graph.
+    pub fn file_facts(
+        &self,
+        candidate_id: CandidateId,
+        path: &str,
+        deadline: &Deadline,
+    ) -> Result<Option<FileFacts>, CacheError> {
+        self.with_read_transaction(deadline, || {
+            let blob: Option<Vec<u8>> = self
+                .connection
+                .query_row(
+                    "SELECT file_facts FROM candidate_files WHERE candidate_id = ?1 AND path = ?2",
+                    params![candidate_id.as_bytes().as_slice(), path],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| map_sqlite_error(error, deadline))?;
+            blob.map(|blob| decode_file_facts(&blob, None)).transpose()
+        })
+    }
+
     /// Loads a single resolver graph without silently accepting a missing row.
     pub fn load_graph(
         &self,
@@ -385,12 +703,39 @@ impl CacheStore {
         tier: ResolverCacheTier,
         deadline: &Deadline,
     ) -> Result<CodeGraph, CacheError> {
+        #[cfg(test)]
+        record_whole_graph_load();
         self.with_read_transaction(deadline, || {
-            let blob: Option<Vec<u8>> = self.connection.query_row(
-                "SELECT graph FROM graph_snapshots WHERE candidate_id = ?1 AND resolver_tier = ?2",
+            let snapshot_id: Option<i64> = self.connection.query_row(
+                "SELECT snapshot_id FROM graph_snapshots WHERE candidate_id = ?1 AND resolver_tier = ?2",
                 params![candidate_id.as_bytes().as_slice(), tier.as_sql()], |row| row.get(0),
             ).optional().map_err(|error| map_sqlite_error(error, deadline))?;
-            decode_graph(&blob.ok_or(CacheError::SnapshotMissing)?)
+            self.load_graph_rows(snapshot_id.ok_or(CacheError::SnapshotMissing)?, deadline)
+        })
+    }
+
+    /// Opens a bounded query reader for one persisted graph snapshot without
+    /// loading candidate facts, subgraphs, or the whole resolved graph.
+    pub fn graph_reader<'store, 'deadline>(
+        &'store self,
+        candidate_id: CandidateId,
+        tier: ResolverCacheTier,
+        deadline: &'deadline Deadline,
+    ) -> Result<CacheGraphRead<'store, 'deadline>, CacheError> {
+        ensure_time(deadline)?;
+        let snapshot_id: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT snapshot_id FROM graph_snapshots WHERE candidate_id = ?1 AND resolver_tier = ?2",
+                params![candidate_id.as_bytes().as_slice(), tier.as_sql()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| map_sqlite_error(error, deadline))?;
+        Ok(CacheGraphRead {
+            store: self,
+            snapshot_id: snapshot_id.ok_or(CacheError::SnapshotMissing)?,
+            deadline,
         })
     }
 
@@ -444,6 +789,43 @@ impl CacheStore {
                 Err(error)
             }
         }
+    }
+
+    fn load_omissions(
+        &self,
+        candidate_id: CandidateId,
+        deadline: &Deadline,
+    ) -> Result<Vec<super::CacheOmission>, CacheError> {
+        let mut statement = self.connection.prepare(
+            "SELECT path, reason, detail FROM candidate_omissions WHERE candidate_id = ?1 ORDER BY path ASC, reason ASC, detail ASC",
+        ).map_err(|error| map_sqlite_error(error, deadline))?;
+        statement
+            .query_map([candidate_id.as_bytes().as_slice()], |row| {
+                Ok(super::CacheOmission {
+                    path: row.get(0)?,
+                    reason: row.get(1)?,
+                    detail: row.get(2)?,
+                })
+            })
+            .map_err(|error| map_sqlite_error(error, deadline))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| map_sqlite_error(error, deadline))
+    }
+
+    fn candidate_input_digest(
+        &self,
+        candidate_id: CandidateId,
+        deadline: &Deadline,
+    ) -> Result<ProjectInputDigest, CacheError> {
+        let bytes: Vec<u8> = self
+            .connection
+            .query_row(
+                "SELECT input_digest FROM candidates WHERE candidate_id = ?1",
+                [candidate_id.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .map_err(|error| map_sqlite_error(error, deadline))?;
+        Ok(ProjectInputDigest::from_bytes(fixed_32(bytes)?))
     }
 
     fn load_active_inner(
@@ -571,6 +953,8 @@ impl CacheStore {
         only_tier: Option<ResolverCacheTier>,
         deadline: &Deadline,
     ) -> Result<LoadedSnapshot, CacheError> {
+        #[cfg(test)]
+        record_whole_graph_load();
         ensure_time(deadline)?;
         let row: Option<CandidateSnapshotRow> = self
             .connection
@@ -676,9 +1060,9 @@ impl CacheStore {
             });
         }
         let sql = if only_tier.is_some() {
-            "SELECT resolver_tier, graph, created_at_ns FROM graph_snapshots WHERE candidate_id = ?1 AND resolver_tier = ?2 ORDER BY resolver_tier ASC"
+            "SELECT resolver_tier, snapshot_id, created_at_ns FROM graph_snapshots WHERE candidate_id = ?1 AND resolver_tier = ?2 ORDER BY resolver_tier ASC"
         } else {
-            "SELECT resolver_tier, graph, created_at_ns FROM graph_snapshots WHERE candidate_id = ?1 ORDER BY resolver_tier ASC"
+            "SELECT resolver_tier, snapshot_id, created_at_ns FROM graph_snapshots WHERE candidate_id = ?1 ORDER BY resolver_tier ASC"
         };
         let mut statement = self
             .connection
@@ -707,9 +1091,10 @@ impl CacheStore {
                     row.get::<_, String>(0)
                         .map_err(|error| map_sqlite_error(error, deadline))?,
                 )?,
-                decode_graph(
-                    &row.get::<_, Vec<u8>>(1)
+                self.load_graph_rows(
+                    row.get::<_, i64>(1)
                         .map_err(|error| map_sqlite_error(error, deadline))?,
+                    deadline,
                 )?,
             ));
         }
@@ -789,7 +1174,8 @@ struct PreparedFile {
 
 struct PreparedGraph {
     tier: &'static str,
-    blob: Vec<u8>,
+    symbols: Vec<Vec<u8>>,
+    edges: Vec<Vec<u8>>,
 }
 
 struct PreparedCandidate {
@@ -916,9 +1302,34 @@ impl PreparedCandidate {
         let mut graphs = Vec::with_capacity(candidate.tier_graphs.len());
         for (tier, graph) in &candidate.tier_graphs {
             ensure_time(deadline)?;
+            let mut ordered_symbols = graph.symbols.clone();
+            ordered_symbols.sort_by(|left, right| left.id.cmp(&right.id));
+            if ordered_symbols
+                .windows(2)
+                .any(|pair| pair[0].id == pair[1].id)
+            {
+                return Err(CacheError::InvalidCandidate);
+            }
+            let symbols = ordered_symbols
+                .iter()
+                .map(|symbol| serde_json::to_vec(symbol).map_err(|_| CacheError::Limits))
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut ordered_edges = graph.edges.clone();
+            ordered_edges.sort_by_key(Edge::key);
+            if ordered_edges
+                .windows(2)
+                .any(|pair| pair[0].key() == pair[1].key())
+            {
+                return Err(CacheError::InvalidCandidate);
+            }
+            let edges = ordered_edges
+                .iter()
+                .map(|edge| serde_json::to_vec(edge).map_err(|_| CacheError::Limits))
+                .collect::<Result<Vec<_>, _>>()?;
             graphs.push(PreparedGraph {
                 tier: tier.as_sql(),
-                blob: encode_graph(graph)?,
+                symbols,
+                edges,
             });
         }
         Ok(Self {
@@ -1192,9 +1603,410 @@ fn native_path_bytes(path: &Path) -> Vec<u8> {
     }
 }
 
+impl CacheGraphRead<'_, '_> {
+    fn symbol_page(
+        &self,
+        sql: &str,
+        values: impl rusqlite::Params,
+        limit: usize,
+    ) -> Result<GraphPage<Symbol, SymbolId>, CacheError> {
+        ensure_time(self.deadline)?;
+        if limit == 0 {
+            return Ok(GraphPage {
+                items: Vec::new(),
+                next: None,
+            });
+        }
+        let mut statement = self
+            .store
+            .connection
+            .prepare(sql)
+            .map_err(|error| map_sqlite_error(error, self.deadline))?;
+        let rows = statement
+            .query_map(values, |row| row.get::<_, Vec<u8>>(0))
+            .map_err(|error| map_sqlite_error(error, self.deadline))?;
+        let mut items = Vec::with_capacity(limit);
+        let mut extra = false;
+        for row in rows {
+            ensure_time(self.deadline)?;
+            let symbol: Symbol = serde_json::from_slice(
+                &row.map_err(|error| map_sqlite_error(error, self.deadline))?,
+            )
+            .map_err(|_| CacheError::Corrupt)?;
+            if items.len() == limit {
+                extra = true;
+                break;
+            }
+            items.push(symbol);
+        }
+        let next = extra.then(|| items.last().expect("nonempty page").id.clone());
+        Ok(GraphPage { items, next })
+    }
+
+    fn edge_page(
+        &self,
+        sql: &str,
+        values: impl rusqlite::Params,
+        limit: usize,
+    ) -> Result<GraphPage<Edge, EdgeKey>, CacheError> {
+        ensure_time(self.deadline)?;
+        if limit == 0 {
+            return Ok(GraphPage {
+                items: Vec::new(),
+                next: None,
+            });
+        }
+        let mut statement = self
+            .store
+            .connection
+            .prepare(sql)
+            .map_err(|error| map_sqlite_error(error, self.deadline))?;
+        let rows = statement
+            .query_map(values, |row| row.get::<_, Vec<u8>>(0))
+            .map_err(|error| map_sqlite_error(error, self.deadline))?;
+        let mut items = Vec::with_capacity(limit);
+        let mut extra = false;
+        for row in rows {
+            ensure_time(self.deadline)?;
+            let edge: Edge = serde_json::from_slice(
+                &row.map_err(|error| map_sqlite_error(error, self.deadline))?,
+            )
+            .map_err(|_| CacheError::Corrupt)?;
+            if items.len() == limit {
+                extra = true;
+                break;
+            }
+            items.push(edge);
+        }
+        let next = extra.then(|| items.last().expect("nonempty page").key());
+        Ok(GraphPage { items, next })
+    }
+
+    fn symbols(&self, sql: &str, values: impl rusqlite::Params) -> Result<Vec<Symbol>, CacheError> {
+        ensure_time(self.deadline)?;
+        let mut statement = self
+            .store
+            .connection
+            .prepare(sql)
+            .map_err(|error| map_sqlite_error(error, self.deadline))?;
+        let rows = statement
+            .query_map(values, |row| row.get::<_, Vec<u8>>(0))
+            .map_err(|error| map_sqlite_error(error, self.deadline))?;
+        let mut symbols: Vec<Symbol> = Vec::new();
+        for row in rows {
+            ensure_time(self.deadline)?;
+            symbols.push(
+                serde_json::from_slice(
+                    &row.map_err(|error| map_sqlite_error(error, self.deadline))?,
+                )
+                .map_err(|_| CacheError::Corrupt)?,
+            );
+        }
+        symbols.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(symbols)
+    }
+
+    fn edge_page_with_scope(
+        &self,
+        endpoint: Option<(&str, Vec<u8>)>,
+        file: Option<&str>,
+        filter: EdgeFilter,
+        after: Option<&EdgeKey>,
+        limit: usize,
+    ) -> Result<GraphPage<Edge, EdgeKey>, CacheError> {
+        use rusqlite::types::Value;
+
+        if limit == 0 {
+            return Ok(GraphPage {
+                items: Vec::new(),
+                next: None,
+            });
+        }
+        let mut sql = String::from("SELECT edge FROM graph_edges WHERE snapshot_id = ?");
+        let mut values = vec![Value::Integer(self.snapshot_id)];
+        if let Some((column, id)) = endpoint {
+            sql.push_str(&format!(" AND {column} = ?"));
+            values.push(Value::Blob(id));
+        }
+        if let Some(file) = file {
+            sql.push_str(" AND occurrence_file = ?");
+            values.push(Value::Text(file.to_owned()));
+        }
+        if let Some(role) = filter.role {
+            sql.push_str(" AND role = ?");
+            values.push(Value::Text(
+                serde_json::to_string(&role).map_err(|_| CacheError::Limits)?,
+            ));
+        }
+        sql.push_str(" AND confidence_rank >= ?");
+        values.push(Value::Integer(confidence_rank(filter.min_confidence)));
+        if let Some(provenance) = filter.provenance {
+            sql.push_str(" AND provenance = ?");
+            values.push(Value::Text(
+                serde_json::to_string(&provenance).map_err(|_| CacheError::Limits)?,
+            ));
+        }
+        if let Some(after) = after {
+            let ordinal = self
+                .edge_cursor_ordinal(after)?
+                .ok_or(CacheError::Corrupt)?;
+            sql.push_str(" AND ordinal > ?");
+            values.push(Value::Integer(ordinal));
+        }
+        sql.push_str(" ORDER BY ordinal ASC LIMIT ?");
+        values.push(Value::Integer(
+            i64::try_from(limit.saturating_add(1)).map_err(|_| CacheError::Limits)?,
+        ));
+        self.edge_page(&sql, rusqlite::params_from_iter(values), limit)
+    }
+}
+
+impl CacheGraphRead<'_, '_> {
+    fn symbol_cursor_ordinal(&self, id: &SymbolId) -> Result<Option<i64>, CacheError> {
+        ensure_time(self.deadline)?;
+        let id = serde_json::to_vec(id).map_err(|_| CacheError::Limits)?;
+        self.store
+            .connection
+            .query_row(
+                "SELECT ordinal FROM graph_symbols WHERE snapshot_id = ?1 AND id = ?2",
+                params![self.snapshot_id, id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| map_sqlite_error(error, self.deadline))
+    }
+
+    fn edge_cursor_ordinal(&self, key: &EdgeKey) -> Result<Option<i64>, CacheError> {
+        ensure_time(self.deadline)?;
+        let key = serde_json::to_vec(key).map_err(|_| CacheError::Limits)?;
+        self.store
+            .connection
+            .query_row(
+                "SELECT ordinal FROM graph_edges WHERE snapshot_id = ?1 AND edge_key = ?2",
+                params![self.snapshot_id, key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| map_sqlite_error(error, self.deadline))
+    }
+}
+
+impl GraphRead for CacheGraphRead<'_, '_> {
+    type Error = CacheError;
+
+    fn symbol(&self, id: &SymbolId) -> Result<Option<Symbol>, Self::Error> {
+        let encoded = serde_json::to_vec(id).map_err(|_| CacheError::Limits)?;
+        Ok(self
+            .symbols(
+                "SELECT symbol FROM graph_symbols WHERE snapshot_id = ?1 AND id = ?2",
+                params![self.snapshot_id, encoded],
+            )?
+            .pop())
+    }
+
+    fn contains_id(&self, id: &SymbolId) -> Result<bool, Self::Error> {
+        ensure_time(self.deadline)?;
+        let encoded = serde_json::to_vec(id).map_err(|_| CacheError::Limits)?;
+        self.store
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM graph_ids WHERE snapshot_id = ?1 AND id = ?2)",
+                params![self.snapshot_id, encoded],
+                |row| row.get(0),
+            )
+            .map_err(|error| map_sqlite_error(error, self.deadline))
+    }
+
+    fn symbols(
+        &self,
+        after: Option<&SymbolId>,
+        limit: usize,
+    ) -> Result<GraphPage<Symbol, SymbolId>, Self::Error> {
+        let after = after
+            .map(|id| self.symbol_cursor_ordinal(id))
+            .transpose()?
+            .flatten();
+        self.symbol_page(
+            "SELECT symbol FROM graph_symbols WHERE snapshot_id = ?1 AND (?2 IS NULL OR ordinal > ?2) ORDER BY ordinal ASC LIMIT ?3",
+            params![self.snapshot_id, after, i64::try_from(limit.saturating_add(1)).map_err(|_| CacheError::Limits)?],
+            limit,
+        )
+    }
+
+    fn symbols_named(
+        &self,
+        name: &str,
+        after: Option<&SymbolId>,
+        limit: usize,
+    ) -> Result<GraphPage<Symbol, SymbolId>, Self::Error> {
+        let after = after
+            .map(|id| self.symbol_cursor_ordinal(id))
+            .transpose()?
+            .flatten();
+        self.symbol_page(
+            "SELECT symbol FROM graph_symbols WHERE snapshot_id = ?1 AND name = ?2 AND (?3 IS NULL OR ordinal > ?3) ORDER BY ordinal ASC LIMIT ?4",
+            params![self.snapshot_id, name, after, i64::try_from(limit.saturating_add(1)).map_err(|_| CacheError::Limits)?],
+            limit,
+        )
+    }
+
+    fn symbols_with_scip(
+        &self,
+        scip: &str,
+        after: Option<&SymbolId>,
+        limit: usize,
+    ) -> Result<GraphPage<Symbol, SymbolId>, Self::Error> {
+        let after = after
+            .map(|id| self.symbol_cursor_ordinal(id))
+            .transpose()?
+            .flatten();
+        self.symbol_page(
+            "SELECT symbol FROM graph_symbols WHERE snapshot_id = ?1 AND scip = ?2 AND (?3 IS NULL OR ordinal > ?3) ORDER BY ordinal ASC LIMIT ?4",
+            params![self.snapshot_id, scip, after, i64::try_from(limit.saturating_add(1)).map_err(|_| CacheError::Limits)?],
+            limit,
+        )
+    }
+
+    fn ids_with_scip(
+        &self,
+        scip: &str,
+        after: Option<&SymbolId>,
+        limit: usize,
+    ) -> Result<GraphPage<SymbolId, SymbolId>, Self::Error> {
+        ensure_time(self.deadline)?;
+        if limit == 0 {
+            return Ok(GraphPage {
+                items: Vec::new(),
+                next: None,
+            });
+        }
+        let after = match after {
+            Some(id) => {
+                let id = serde_json::to_vec(id).map_err(|_| CacheError::Limits)?;
+                self.store
+                    .connection
+                    .query_row(
+                        "SELECT ordinal FROM graph_ids WHERE snapshot_id = ?1 AND id = ?2",
+                        params![self.snapshot_id, id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()
+                    .map_err(|error| map_sqlite_error(error, self.deadline))?
+                    .ok_or(CacheError::Corrupt)?
+            }
+            None => -1,
+        };
+        let mut statement = self.store.connection.prepare(
+            "SELECT id FROM graph_ids WHERE snapshot_id = ?1 AND scip = ?2 AND ordinal > ?3 ORDER BY ordinal ASC LIMIT ?4",
+        ).map_err(|error| map_sqlite_error(error, self.deadline))?;
+        let rows = statement
+            .query_map(
+                params![
+                    self.snapshot_id,
+                    scip,
+                    after,
+                    i64::try_from(limit.saturating_add(1)).map_err(|_| CacheError::Limits)?
+                ],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .map_err(|error| map_sqlite_error(error, self.deadline))?;
+        let mut items = Vec::with_capacity(limit);
+        let mut extra = false;
+        for row in rows {
+            ensure_time(self.deadline)?;
+            let id: SymbolId = serde_json::from_slice(
+                &row.map_err(|error| map_sqlite_error(error, self.deadline))?,
+            )
+            .map_err(|_| CacheError::Corrupt)?;
+            if items.len() == limit {
+                extra = true;
+                break;
+            }
+            items.push(id);
+        }
+        let next = extra.then(|| items.last().expect("nonempty page").clone());
+        Ok(GraphPage { items, next })
+    }
+
+    fn symbol_at_byte(&self, file: &str, byte: usize) -> Result<Option<Symbol>, Self::Error> {
+        ensure_time(self.deadline)?;
+        let byte = i64::try_from(byte).map_err(|_| CacheError::Limits)?;
+        let payload: Option<Vec<u8>> = self.store.connection.query_row(
+            "SELECT symbol FROM graph_symbols WHERE snapshot_id = ?1 AND file = ?2 AND span_start <= ?3 AND span_end > ?3 AND span_end > span_start ORDER BY (span_end - span_start) ASC, span_start DESC, span_end ASC, id ASC LIMIT 1",
+            params![self.snapshot_id, file, byte],
+            |row| row.get(0),
+        ).optional().map_err(|error| map_sqlite_error(error, self.deadline))?;
+        payload
+            .map(|payload| serde_json::from_slice(&payload).map_err(|_| CacheError::Corrupt))
+            .transpose()
+    }
+
+    fn symbols_in_file(
+        &self,
+        file: &str,
+        after: Option<&SymbolId>,
+        limit: usize,
+    ) -> Result<GraphPage<Symbol, SymbolId>, Self::Error> {
+        let after = after
+            .map(|id| self.symbol_cursor_ordinal(id))
+            .transpose()?
+            .flatten();
+        self.symbol_page(
+            "SELECT symbol FROM graph_symbols WHERE snapshot_id = ?1 AND file = ?2 AND (?3 IS NULL OR ordinal > ?3) ORDER BY ordinal ASC LIMIT ?4",
+            params![self.snapshot_id, file, after, i64::try_from(limit.saturating_add(1)).map_err(|_| CacheError::Limits)?],
+            limit,
+        )
+    }
+
+    fn edges(
+        &self,
+        filter: EdgeFilter,
+        after: Option<&EdgeKey>,
+        limit: usize,
+    ) -> Result<GraphPage<Edge, EdgeKey>, Self::Error> {
+        self.edge_page_with_scope(None, None, filter, after, limit)
+    }
+
+    fn edges_in_file(
+        &self,
+        file: &str,
+        filter: EdgeFilter,
+        after: Option<&EdgeKey>,
+        limit: usize,
+    ) -> Result<GraphPage<Edge, EdgeKey>, Self::Error> {
+        self.edge_page_with_scope(None, Some(file), filter, after, limit)
+    }
+
+    fn incoming(
+        &self,
+        id: &SymbolId,
+        filter: EdgeFilter,
+        after: Option<&EdgeKey>,
+        limit: usize,
+    ) -> Result<GraphPage<Edge, EdgeKey>, Self::Error> {
+        let id = serde_json::to_vec(id).map_err(|_| CacheError::Limits)?;
+        self.edge_page_with_scope(Some(("to_id", id)), None, filter, after, limit)
+    }
+
+    fn outgoing(
+        &self,
+        id: &SymbolId,
+        filter: EdgeFilter,
+        after: Option<&EdgeKey>,
+        limit: usize,
+    ) -> Result<GraphPage<Edge, EdgeKey>, Self::Error> {
+        let id = serde_json::to_vec(id).map_err(|_| CacheError::Limits)?;
+        self.edge_page_with_scope(Some(("from_id", id)), None, filter, after, limit)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use code2graph::{
+        Confidence, Descriptor, Occurrence, Provenance, RefRole, SymbolKind, Visibility,
+    };
+    use code2graph_query::{EdgeFilter, GraphRead};
     use rusqlite::OptionalExtension;
     use tempfile::tempdir;
 
@@ -1223,7 +2035,7 @@ mod tests {
             path: "src/a.rs".into(),
             language: "rust".into(),
             content_hash: [3; 32],
-            size_bytes: 0,
+            size_bytes: 1,
             mtime: Some(MtimeHint {
                 seconds_since_unix_epoch: 0,
                 nanoseconds: 4,
@@ -1256,7 +2068,7 @@ mod tests {
             omissions,
             created_at_ns: 2,
             inventory_file_count: 1,
-            inventory_total_bytes: 0,
+            inventory_total_bytes: 1,
             files: vec![file],
             tier_graphs: vec![(
                 tier,
@@ -1309,6 +2121,201 @@ mod tests {
             read_only.invalidate_derived(&Deadline::new(None)),
             Err(CacheError::ReadOnly)
         ));
+    }
+
+    #[test]
+    fn normalized_graph_rows_publish_a_logical_graph_larger_than_the_legacy_blob_limit() {
+        use code2graph::{Confidence, Descriptor, Edge, Occurrence, Provenance, RefRole, SymbolId};
+
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().join("project");
+        fs::create_dir(&root).expect("project");
+        let cache_location = location(&root, temp.path());
+        let store =
+            CacheStore::open_writable(&cache_location, &root, &Deadline::new(None)).expect("open");
+        let mut snapshot = candidate(CacheCompleteness::Complete, ResolverCacheTier::Name);
+        let payload = "x".repeat(4_096);
+        snapshot.tier_graphs[0].1.edges = (0..5_000)
+            .map(|ordinal| Edge {
+                from: SymbolId::global(
+                    "rust",
+                    vec![Descriptor::Term(format!("from-{ordinal}-{payload}"))],
+                ),
+                to: SymbolId::global(
+                    "rust",
+                    vec![Descriptor::Term(format!("to-{ordinal}-{payload}"))],
+                ),
+                role: RefRole::Call,
+                confidence: Confidence::Scoped,
+                provenance: Provenance::ScopeGraph,
+                occ: Occurrence {
+                    file: "src/large.rs".into(),
+                    line: 1,
+                    col: 0,
+                    byte: ordinal,
+                },
+            })
+            .collect();
+        store
+            .publish_candidate(&snapshot, &Deadline::new(None))
+            .expect("normalized publication must not have a whole-graph blob cap");
+        assert_eq!(
+            store
+                .load_graph(
+                    snapshot.candidate_id,
+                    ResolverCacheTier::Name,
+                    &Deadline::new(None)
+                )
+                .expect("load")
+                .edges
+                .len(),
+            5_000
+        );
+    }
+
+    #[test]
+    fn sqlite_graph_reader_matches_persisted_adjacency_pages() {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().join("project");
+        fs::create_dir(&root).expect("project");
+        let cache_location = location(&root, temp.path());
+        let store =
+            CacheStore::open_writable(&cache_location, &root, &Deadline::new(None)).expect("open");
+        let mut snapshot = candidate(CacheCompleteness::Complete, ResolverCacheTier::Name);
+        let target = SymbolId::global("rust", vec![Descriptor::Type("Target".into())]);
+        let caller = SymbolId::global("rust", vec![Descriptor::Term("caller".into())]);
+        let endpoint = SymbolId::local("vendor.rs", "external");
+        let symbols = vec![
+            Symbol {
+                id: target.clone(),
+                name: "Target".into(),
+                kind: SymbolKind::Struct,
+                visibility: Visibility::Public,
+                entry_points: vec![],
+                file: "src/a.rs".into(),
+                line: 1,
+                span: code2graph::ByteSpan { start: 0, end: 1 },
+                signature: "struct Target".into(),
+            },
+            Symbol {
+                id: caller.clone(),
+                name: "caller".into(),
+                kind: SymbolKind::Function,
+                visibility: Visibility::Public,
+                entry_points: vec![],
+                file: "src/a.rs".into(),
+                line: 1,
+                span: code2graph::ByteSpan { start: 0, end: 1 },
+                signature: "fn caller".into(),
+            },
+        ];
+        snapshot.files[0].facts.symbols = symbols.clone();
+        snapshot.tier_graphs[0].1 = CodeGraph {
+            symbols,
+            edges: vec![
+                Edge {
+                    from: caller.clone(),
+                    to: target.clone(),
+                    role: RefRole::TypeRef,
+                    confidence: Confidence::Scoped,
+                    provenance: Provenance::ScopeGraph,
+                    occ: Occurrence {
+                        file: "src/a.rs".into(),
+                        line: 1,
+                        col: 0,
+                        byte: 0,
+                    },
+                },
+                Edge {
+                    from: caller.clone(),
+                    to: endpoint.clone(),
+                    role: RefRole::Call,
+                    confidence: Confidence::Scoped,
+                    provenance: Provenance::ScopeGraph,
+                    occ: Occurrence {
+                        file: "src/a.rs".into(),
+                        line: 1,
+                        col: 0,
+                        byte: 2,
+                    },
+                },
+            ],
+        };
+        store
+            .publish_candidate(&snapshot, &Deadline::new(None))
+            .expect("publish");
+        let deadline = Deadline::new(None);
+        let reader = store
+            .graph_reader(snapshot.candidate_id, ResolverCacheTier::Name, &deadline)
+            .expect("reader");
+        assert_eq!(
+            reader.symbol(&target).expect("read").expect("symbol").id,
+            target
+        );
+        let named = reader.symbols_named("caller", None, 1).expect("named");
+        assert_eq!(named.items.len(), 1);
+        let incoming = reader
+            .incoming(&target, EdgeFilter::new(Confidence::Scoped), None, 1)
+            .expect("incoming");
+        assert_eq!(incoming.items.len(), 1);
+        assert_eq!(incoming.items[0].from, caller);
+        let endpoint_ids = reader
+            .ids_with_scip(&endpoint.to_scip_string(), None, 10)
+            .expect("endpoint IDs");
+        assert_eq!(endpoint_ids.items, vec![endpoint]);
+        let all = GraphRead::symbols(&reader, None, 1).expect("all symbols");
+        assert_eq!(all.items.len(), 1);
+        assert!(all.next.is_some(), "SQL page reports a continuation");
+        let by_file = reader
+            .symbols_in_file("src/a.rs", None, 1)
+            .expect("file symbols");
+        assert_eq!(by_file.items.len(), 1);
+        assert_eq!(
+            reader
+                .symbol_at_byte("src/a.rs", 0)
+                .expect("position")
+                .expect("symbol")
+                .id,
+            target
+        );
+        let edges = reader
+            .edges_in_file("src/a.rs", EdgeFilter::new(Confidence::Scoped), None, 1)
+            .expect("file edges");
+        assert_eq!(edges.items.len(), 1);
+    }
+
+    #[test]
+    fn metadata_and_single_file_reads_do_not_require_graph_loading() {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().join("project");
+        fs::create_dir(&root).expect("project");
+        let cache_location = location(&root, temp.path());
+        let store =
+            CacheStore::open_writable(&cache_location, &root, &Deadline::new(None)).expect("open");
+        let snapshot = candidate(CacheCompleteness::Complete, ResolverCacheTier::Name);
+        store
+            .publish_candidate(&snapshot, &Deadline::new(None))
+            .expect("publish");
+        let metadata = store
+            .active_metadata(
+                ResolverCacheTier::Name,
+                CacheCompleteness::Complete,
+                &Deadline::new(None),
+            )
+            .expect("metadata")
+            .expect("active");
+        assert_eq!(metadata.candidate_id, snapshot.candidate_id);
+        let file = store
+            .file_metadata(snapshot.candidate_id, "src/a.rs", &Deadline::new(None))
+            .expect("file metadata")
+            .expect("file");
+        assert_eq!(file.path, "src/a.rs");
+        assert!(
+            store
+                .file_facts(snapshot.candidate_id, "src/a.rs", &Deadline::new(None))
+                .expect("facts")
+                .is_some()
+        );
     }
 
     #[test]
@@ -1643,7 +2650,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_and_missing_graph_blobs_are_typed() {
+    fn missing_normalized_graph_snapshot_is_typed() {
         let temp = tempdir().expect("tempdir");
         let root = temp.path().join("project");
         fs::create_dir(&root).expect("project");
@@ -1662,17 +2669,20 @@ mod tests {
         store
             .publish_candidate(&snapshot, &Deadline::new(None))
             .expect("publish");
-        store.connection.execute(
-            "UPDATE graph_snapshots SET graph = ?1 WHERE candidate_id = ?2 AND resolver_tier = 'name'",
-            params![b"not-json".as_slice(), snapshot.candidate_id.as_bytes().as_slice()],
-        ).expect("corrupt graph");
+        store
+            .connection
+            .execute(
+                "DELETE FROM graph_snapshots WHERE candidate_id = ?1 AND resolver_tier = 'name'",
+                [snapshot.candidate_id.as_bytes().as_slice()],
+            )
+            .expect("remove graph snapshot");
         assert!(matches!(
             store.load_graph(
                 snapshot.candidate_id,
                 ResolverCacheTier::Name,
                 &Deadline::new(None)
             ),
-            Err(CacheError::Malformed)
+            Err(CacheError::SnapshotMissing)
         ));
     }
 
@@ -1960,6 +2970,59 @@ mod tests {
             Err(CacheError::LockContention)
         ));
         blocker.execute_batch("ROLLBACK").expect("unlock");
+    }
+
+    #[test]
+    fn exact_legacy_monolithic_layout_resets_writable_and_frozen_rejects() {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().join("project");
+        fs::create_dir(&root).expect("project");
+        let cache_location = location(&root, temp.path());
+        let store = CacheStore::open_writable(&cache_location, &root, &Deadline::new(None))
+            .expect("create current schema");
+        store
+            .connection
+            .execute_batch(
+                "DROP TABLE active_snapshots; DROP TABLE graph_ids; DROP TABLE graph_edges; \
+                 DROP TABLE graph_symbols; DROP TABLE graph_snapshots; \
+                 DROP INDEX IF EXISTS graph_snapshots_candidate_idx;",
+            )
+            .expect("remove normalized graph layout");
+        store
+            .connection
+            .execute(schema::LEGACY_GRAPH_SNAPSHOTS, [])
+            .expect("create exact legacy graph layout");
+        store
+            .connection
+            .execute(
+                "CREATE TABLE active_snapshots (resolver_tier TEXT NOT NULL CHECK (resolver_tier IN ('name', 'scope', 'dense')), completeness INTEGER NOT NULL CHECK (completeness IN (0, 1)), snapshot_id INTEGER NOT NULL REFERENCES graph_snapshots(snapshot_id) ON DELETE CASCADE, PRIMARY KEY (resolver_tier, completeness))",
+                [],
+            )
+            .expect("create legacy active layout");
+        store
+            .connection
+            .execute(
+                "CREATE INDEX graph_snapshots_candidate_idx ON graph_snapshots (candidate_id)",
+                [],
+            )
+            .expect("create legacy index");
+        drop(store);
+
+        assert!(matches!(
+            CacheStore::open_frozen(&cache_location, &root, &Deadline::new(None)),
+            Err(CacheError::Incompatible)
+        ));
+        let writable = CacheStore::open_writable(&cache_location, &root, &Deadline::new(None))
+            .expect("writable reset");
+        let columns: i64 = writable
+            .connection
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('graph_symbols')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("normalized graph symbols present");
+        assert!(columns > 0);
     }
 
     #[test]

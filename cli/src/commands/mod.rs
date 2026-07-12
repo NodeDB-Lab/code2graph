@@ -4,8 +4,8 @@
 
 use std::collections::HashMap;
 
-use code2graph::SymbolKind;
-use code2graph_query::GraphIndex;
+use code2graph::{FileFacts, SymbolKind};
+use code2graph_query::{GraphIndex, GraphRead};
 
 use crate::{Cancellation, CliError, Deadline, LoadedGraph, Selector};
 
@@ -18,35 +18,51 @@ mod relations;
 mod shared;
 mod symbols;
 
-pub(crate) struct QueryCommandContext<'a> {
+pub(crate) struct QueryCommandContext<'a, G: GraphRead + ?Sized = GraphIndex> {
     pub loaded: &'a LoadedGraph,
-    pub index: &'a GraphIndex,
+    pub index: &'a G,
     pub deadline: &'a Deadline,
     pub cancellation: &'a dyn Cancellation,
     pub max_file_bytes: usize,
     pub candidate_hashes: HashMap<String, [u8; 32]>,
+    /// The single file decoded for a raw `references` query, if applicable.
+    pub reference_facts: Option<FileFacts>,
 }
 
-impl<'a> QueryCommandContext<'a> {
+impl<'a, G: GraphRead + ?Sized> QueryCommandContext<'a, G> {
     pub(crate) fn new(
         loaded: &'a LoadedGraph,
-        index: &'a GraphIndex,
+        index: &'a G,
         deadline: &'a Deadline,
         cancellation: &'a dyn Cancellation,
         max_file_bytes: usize,
     ) -> Result<Self, CliError> {
-        let mut candidate_hashes = HashMap::with_capacity(loaded.snapshot.files.len());
-        for candidate in &loaded.snapshot.files {
-            if candidate_hashes
-                .insert(candidate.path.clone(), candidate.content_hash)
-                .is_some()
-            {
-                return Err(CliError::Index(format!(
-                    "loaded snapshot contains duplicate candidate path: {}",
-                    candidate.path
-                )));
-            }
-        }
+        let candidate_hashes = loaded
+            .snapshot
+            .files
+            .iter()
+            .map(|candidate| (candidate.path.clone(), candidate.content_hash))
+            .collect();
+        Self::with_candidate_hashes(
+            loaded,
+            index,
+            deadline,
+            cancellation,
+            max_file_bytes,
+            candidate_hashes,
+            None,
+        )
+    }
+
+    pub(crate) fn with_candidate_hashes(
+        loaded: &'a LoadedGraph,
+        index: &'a G,
+        deadline: &'a Deadline,
+        cancellation: &'a dyn Cancellation,
+        max_file_bytes: usize,
+        candidate_hashes: HashMap<String, [u8; 32]>,
+        reference_facts: Option<FileFacts>,
+    ) -> Result<Self, CliError> {
         Ok(Self {
             loaded,
             index,
@@ -54,6 +70,7 @@ impl<'a> QueryCommandContext<'a> {
             cancellation,
             max_file_bytes,
             candidate_hashes,
+            reference_facts,
         })
     }
 }

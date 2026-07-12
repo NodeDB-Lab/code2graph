@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::convert::Infallible;
 use std::path::PathBuf;
 
 use crate::exit::ExitCode;
@@ -8,6 +9,12 @@ use crate::worker::WorkerFailure;
 
 /// CLI-library result type.
 pub type Result<T> = std::result::Result<T, CliError>;
+
+impl From<Infallible> for CliError {
+    fn from(value: Infallible) -> Self {
+        match value {}
+    }
+}
 
 /// Typed failure categories with stable process mapping.
 #[derive(Debug, thiserror::Error)]

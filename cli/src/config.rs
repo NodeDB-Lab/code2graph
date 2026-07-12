@@ -10,7 +10,7 @@ pub const DEFAULT_MAX_FILES: usize = 10_000;
 /// Default maximum bytes read from any one source file.
 pub const DEFAULT_MAX_FILE_BYTES: usize = 1_024 * 1_024;
 /// Default maximum aggregate source bytes read by one invocation.
-pub const DEFAULT_MAX_TOTAL_BYTES: usize = 25 * 1_024 * 1_024;
+pub const DEFAULT_MAX_TOTAL_BYTES: usize = 256 * 1_024 * 1_024;
 /// Default directory and traversal depth cap.
 pub const DEFAULT_MAX_DEPTH: u32 = 32;
 /// Default number of rows rendered by a command.

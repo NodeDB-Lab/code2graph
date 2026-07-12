@@ -5,11 +5,9 @@
 use std::collections::HashMap;
 
 use code2graph::{Symbol, SymbolId, SymbolKind};
-use code2graph_query::GraphIndex;
+use code2graph_query::GraphRead;
 
-use crate::{
-    Cancellation, Deadline, ProjectPath, ProjectSelection, Selector, cache::LoadedSnapshot,
-};
+use crate::{Cancellation, Deadline, ProjectPath, ProjectSelection, Selector};
 
 /// The graph population a selector is permitted to address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,13 +31,11 @@ pub struct SelectorOptions {
 
 /// Stable resources shared by selector evaluation.
 ///
-/// The loaded snapshot is retained alongside project selection and the graph
-/// index so position selectors can prove that current source bytes still match
-/// the spans being queried.
-pub struct SelectorContext<'a> {
-    pub index: &'a GraphIndex,
+/// Candidate metadata is separate from graph access so position selectors can
+/// prove that current source bytes still match the spans being queried.
+pub struct SelectorContext<'a, G: GraphRead + ?Sized> {
+    pub graph: &'a G,
     pub selection: &'a ProjectSelection,
-    pub snapshot: &'a LoadedSnapshot,
     /// Candidate content hashes keyed by normalized project-relative path.
     /// Built once at command setup so position resolution does not linearly scan
     /// untrusted cached file records for every selector.

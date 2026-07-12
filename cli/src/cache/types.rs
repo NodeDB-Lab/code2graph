@@ -78,6 +78,32 @@ pub struct CandidateSnapshot {
     pub tier_graphs: Vec<(ResolverCacheTier, CodeGraph)>,
 }
 
+/// Metadata for one active snapshot without file facts, subgraphs, or graph rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveSnapshotMetadata {
+    pub candidate_id: CandidateId,
+    pub compatibility: CompatibilityRecord,
+    pub input_digest: ProjectInputDigest,
+    pub completeness: CacheCompleteness,
+    pub omissions: Vec<CacheOmission>,
+    pub created_at_ns: u64,
+    pub inventory_file_count: u64,
+    pub inventory_total_bytes: u64,
+    pub tier: ResolverCacheTier,
+}
+
+/// Metadata for one cached source file, excluding its potentially large facts blob.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedFileMetadata {
+    pub path: String,
+    pub language: String,
+    pub content_hash: [u8; 32],
+    pub size_bytes: u64,
+    pub mtime: Option<MtimeHint>,
+    pub package_assignment: String,
+    pub has_subgraph: bool,
+}
+
 /// A coherently loaded candidate and its available resolver graphs.
 #[derive(Clone)]
 pub struct LoadedSnapshot {

@@ -5,9 +5,11 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
-use code2graph::{Confidence, Edge, SymbolId};
+use code2graph::{Confidence, Edge, EdgeKey, SymbolId};
 
-use crate::{EdgeFilter, GraphIndex, order};
+use crate::{EdgeFilter, GraphIndex, GraphRead, order};
+
+const IMPACT_READ_PAGE_SIZE: usize = 256;
 
 /// Bounds and relationship constraints for a [`GraphIndex::impact`] traversal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,14 +23,14 @@ pub struct ImpactOptions {
 }
 
 /// One reverse-reachability result row.
-#[derive(Debug)]
-pub struct ImpactStep<'a> {
+#[derive(Debug, Clone)]
+pub struct ImpactStep {
     /// The structurally identified symbol impacted by the seed.
     pub symbol: SymbolId,
     /// The next symbol on the selected path toward the seed.
     pub parent: SymbolId,
     /// The selected edge, for which `from == symbol` and `to == parent`.
-    pub via: &'a Edge,
+    pub via: Edge,
     /// The selected path's minimum edge distance from the seed.
     pub depth: u32,
     /// The minimum confidence of all edges on the selected path.
@@ -37,23 +39,23 @@ pub struct ImpactStep<'a> {
 
 /// The result of a bounded reverse-reachability traversal.
 ///
-/// Its edge references borrow the [`GraphIndex`], so it cannot outlive that
-/// index or survive a mutable borrow that changes the index.
-#[derive(Debug)]
-pub struct ImpactResult<'a> {
+/// Edges are owned so the result remains valid after a database cursor advances
+/// or an in-memory index is replaced.
+#[derive(Debug, Clone)]
+pub struct ImpactResult {
     /// One selected path row per reachable non-seed structural identity.
-    pub steps: Vec<ImpactStep<'a>>,
+    pub steps: Vec<ImpactStep>,
     /// Whether a matching reachable non-seed symbol was omitted by a bound.
     pub truncated: bool,
 }
 
-struct Candidate<'a> {
+struct Candidate {
     parent: SymbolId,
-    via: &'a Edge,
+    via: Edge,
     path_confidence: Confidence,
 }
 
-impl<'a> Candidate<'a> {
+impl Candidate {
     fn is_better_than(&self, other: &Self) -> bool {
         self.path_confidence > other.path_confidence
             || (self.path_confidence == other.path_confidence
@@ -69,101 +71,120 @@ struct FrontierStep {
     path_confidence: Confidence,
 }
 
-impl GraphIndex {
-    /// Traverse matching incoming edges from `seed`, returning reverse-reachable
-    /// callers/consumers in deterministic breadth-first order.
-    ///
-    /// The seed is never returned and is permanently visited. Each structural ID
-    /// has one row: minimum depth wins, then the greatest path bottleneck
-    /// confidence, then full stable edge order and parent structural identity.
-    /// Each breadth level is finalized before any of its IDs are expanded; those
-    /// finalized IDs expand in structural-ID order. Endpoint-only IDs participate
-    /// exactly like locally defined symbols.
-    ///
-    /// Returned edges borrow this index; the result cannot outlive it or survive
-    /// mutation of the index.
-    pub fn impact<'a>(&'a self, seed: &SymbolId, options: ImpactOptions) -> ImpactResult<'a> {
-        let mut steps = Vec::new();
-        let mut visited = BTreeSet::new();
-        visited.insert(seed.clone());
-        let mut frontier = vec![FrontierStep {
-            symbol: seed.clone(),
-            path_confidence: Confidence::Exact,
-        }];
-        let mut depth = 0_u32;
+/// Traverse matching incoming edges from `seed`, returning reverse-reachable
+/// callers/consumers in deterministic breadth-first order.
+///
+/// Reads are paged and fallible so this has the same semantics for in-memory and
+/// database-backed graph readers. The seed is never returned and is permanently
+/// visited. Each structural ID has one row: minimum depth wins, then the greatest
+/// path bottleneck confidence, then full stable edge order and parent identity.
+pub fn impact<R: GraphRead>(
+    reader: &R,
+    seed: &SymbolId,
+    options: ImpactOptions,
+) -> Result<ImpactResult, R::Error> {
+    let mut steps = Vec::new();
+    let mut visited = BTreeSet::new();
+    visited.insert(seed.clone());
+    let mut frontier = vec![FrontierStep {
+        symbol: seed.clone(),
+        path_confidence: Confidence::Exact,
+    }];
+    let mut depth = 0_u32;
 
-        loop {
-            let mut candidates = BTreeMap::<SymbolId, Candidate<'a>>::new();
-            for parent in &frontier {
-                for edge in self.incoming(&parent.symbol, options.filter) {
+    loop {
+        let mut candidates = BTreeMap::<SymbolId, Candidate>::new();
+        for parent in &frontier {
+            let mut after: Option<EdgeKey> = None;
+            loop {
+                let page = reader.incoming(
+                    &parent.symbol,
+                    options.filter,
+                    after.as_ref(),
+                    IMPACT_READ_PAGE_SIZE,
+                )?;
+                for edge in page.items {
                     if visited.contains(&edge.from) {
                         continue;
                     }
+                    let symbol = edge.from.clone();
                     let candidate = Candidate {
                         parent: parent.symbol.clone(),
-                        via: edge,
                         path_confidence: parent.path_confidence.min(edge.confidence),
+                        via: edge,
                     };
-                    match candidates.get_mut(&edge.from) {
+                    match candidates.get_mut(&symbol) {
                         Some(existing) if candidate.is_better_than(existing) => {
                             *existing = candidate
                         }
                         Some(_) => {}
                         None => {
-                            candidates.insert(edge.from.clone(), candidate);
+                            candidates.insert(symbol, candidate);
                         }
                     }
                 }
+                let Some(next) = page.next else { break };
+                after = Some(next);
             }
+        }
 
-            if candidates.is_empty() {
-                return ImpactResult {
-                    steps,
-                    truncated: false,
-                };
-            }
+        if candidates.is_empty() {
+            return Ok(ImpactResult {
+                steps,
+                truncated: false,
+            });
+        }
 
-            if depth >= options.max_depth {
-                return ImpactResult {
-                    steps,
-                    truncated: true,
-                };
-            }
-            let next_depth = match depth.checked_add(1) {
-                Some(next_depth) => next_depth,
-                None => {
-                    return ImpactResult {
-                        steps,
-                        truncated: true,
-                    };
-                }
-            };
-
-            let remaining = options.max_nodes.saturating_sub(steps.len());
-            let node_bound_omits_work = candidates.len() > remaining;
-            let mut next_frontier = Vec::with_capacity(candidates.len().min(remaining));
-            for (symbol, candidate) in candidates.into_iter().take(remaining) {
-                visited.insert(symbol.clone());
-                next_frontier.push(FrontierStep {
-                    symbol: symbol.clone(),
-                    path_confidence: candidate.path_confidence,
-                });
-                steps.push(ImpactStep {
-                    symbol,
-                    parent: candidate.parent,
-                    via: candidate.via,
-                    depth: next_depth,
-                    path_confidence: candidate.path_confidence,
-                });
-            }
-            if node_bound_omits_work {
-                return ImpactResult {
+        if depth >= options.max_depth {
+            return Ok(ImpactResult {
+                steps,
+                truncated: true,
+            });
+        }
+        let next_depth = match depth.checked_add(1) {
+            Some(next_depth) => next_depth,
+            None => {
+                return Ok(ImpactResult {
                     steps,
                     truncated: true,
-                };
+                });
             }
-            frontier = next_frontier;
-            depth = next_depth;
+        };
+
+        let remaining = options.max_nodes.saturating_sub(steps.len());
+        let node_bound_omits_work = candidates.len() > remaining;
+        let mut next_frontier = Vec::with_capacity(candidates.len().min(remaining));
+        for (symbol, candidate) in candidates.into_iter().take(remaining) {
+            visited.insert(symbol.clone());
+            next_frontier.push(FrontierStep {
+                symbol: symbol.clone(),
+                path_confidence: candidate.path_confidence,
+            });
+            steps.push(ImpactStep {
+                symbol,
+                parent: candidate.parent,
+                via: candidate.via,
+                depth: next_depth,
+                path_confidence: candidate.path_confidence,
+            });
+        }
+        if node_bound_omits_work {
+            return Ok(ImpactResult {
+                steps,
+                truncated: true,
+            });
+        }
+        frontier = next_frontier;
+        depth = next_depth;
+    }
+}
+
+impl GraphIndex {
+    /// In-memory convenience wrapper around the generic, fallible traversal.
+    pub fn impact(&self, seed: &SymbolId, options: ImpactOptions) -> ImpactResult {
+        match impact(self, seed, options) {
+            Ok(result) => result,
+            Err(never) => match never {},
         }
     }
 }
@@ -174,7 +195,7 @@ mod tests {
         CodeGraph, Confidence, Descriptor, Edge, Occurrence, Provenance, RefRole, SymbolId,
     };
 
-    use crate::{EdgeFilter, GraphIndex, ImpactOptions};
+    use crate::{EdgeFilter, GraphIndex, GraphPage, GraphRead, ImpactOptions, impact};
 
     fn id(name: &str) -> SymbolId {
         SymbolId::global(
@@ -216,6 +237,230 @@ mod tests {
             edges,
         })
         .expect("valid graph")
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct ReadFailure;
+
+    struct FailingReader;
+
+    impl GraphRead for FailingReader {
+        type Error = ReadFailure;
+
+        fn symbol(&self, _: &SymbolId) -> Result<Option<code2graph::Symbol>, Self::Error> {
+            Err(ReadFailure)
+        }
+        fn contains_id(&self, _: &SymbolId) -> Result<bool, Self::Error> {
+            Err(ReadFailure)
+        }
+        fn symbols(
+            &self,
+            _: Option<&SymbolId>,
+            _: usize,
+        ) -> Result<GraphPage<code2graph::Symbol, SymbolId>, Self::Error> {
+            Err(ReadFailure)
+        }
+        fn symbols_named(
+            &self,
+            _: &str,
+            _: Option<&SymbolId>,
+            _: usize,
+        ) -> Result<GraphPage<code2graph::Symbol, SymbolId>, Self::Error> {
+            Err(ReadFailure)
+        }
+        fn symbols_with_scip(
+            &self,
+            _: &str,
+            _: Option<&SymbolId>,
+            _: usize,
+        ) -> Result<GraphPage<code2graph::Symbol, SymbolId>, Self::Error> {
+            Err(ReadFailure)
+        }
+        fn ids_with_scip(
+            &self,
+            _: &str,
+            _: Option<&SymbolId>,
+            _: usize,
+        ) -> Result<GraphPage<SymbolId, SymbolId>, Self::Error> {
+            Err(ReadFailure)
+        }
+        fn symbols_in_file(
+            &self,
+            _: &str,
+            _: Option<&SymbolId>,
+            _: usize,
+        ) -> Result<GraphPage<code2graph::Symbol, SymbolId>, Self::Error> {
+            Err(ReadFailure)
+        }
+        fn symbol_at_byte(
+            &self,
+            _: &str,
+            _: usize,
+        ) -> Result<Option<code2graph::Symbol>, Self::Error> {
+            Err(ReadFailure)
+        }
+        fn edges(
+            &self,
+            _: EdgeFilter,
+            _: Option<&code2graph::EdgeKey>,
+            _: usize,
+        ) -> Result<GraphPage<Edge, code2graph::EdgeKey>, Self::Error> {
+            Err(ReadFailure)
+        }
+        fn edges_in_file(
+            &self,
+            _: &str,
+            _: EdgeFilter,
+            _: Option<&code2graph::EdgeKey>,
+            _: usize,
+        ) -> Result<GraphPage<Edge, code2graph::EdgeKey>, Self::Error> {
+            Err(ReadFailure)
+        }
+        fn incoming(
+            &self,
+            _: &SymbolId,
+            _: EdgeFilter,
+            _: Option<&code2graph::EdgeKey>,
+            _: usize,
+        ) -> Result<GraphPage<Edge, code2graph::EdgeKey>, Self::Error> {
+            Err(ReadFailure)
+        }
+        fn outgoing(
+            &self,
+            _: &SymbolId,
+            _: EdgeFilter,
+            _: Option<&code2graph::EdgeKey>,
+            _: usize,
+        ) -> Result<GraphPage<Edge, code2graph::EdgeKey>, Self::Error> {
+            Err(ReadFailure)
+        }
+    }
+
+    struct OneEdgePages(GraphIndex);
+
+    impl GraphRead for OneEdgePages {
+        type Error = std::convert::Infallible;
+
+        fn symbol(&self, id: &SymbolId) -> Result<Option<code2graph::Symbol>, Self::Error> {
+            GraphRead::symbol(&self.0, id)
+        }
+        fn contains_id(&self, id: &SymbolId) -> Result<bool, Self::Error> {
+            GraphRead::contains_id(&self.0, id)
+        }
+        fn symbols(
+            &self,
+            after: Option<&SymbolId>,
+            _: usize,
+        ) -> Result<GraphPage<code2graph::Symbol, SymbolId>, Self::Error> {
+            GraphRead::symbols(&self.0, after, 1)
+        }
+        fn symbols_named(
+            &self,
+            name: &str,
+            after: Option<&SymbolId>,
+            _: usize,
+        ) -> Result<GraphPage<code2graph::Symbol, SymbolId>, Self::Error> {
+            GraphRead::symbols_named(&self.0, name, after, 1)
+        }
+        fn symbols_with_scip(
+            &self,
+            scip: &str,
+            after: Option<&SymbolId>,
+            _: usize,
+        ) -> Result<GraphPage<code2graph::Symbol, SymbolId>, Self::Error> {
+            GraphRead::symbols_with_scip(&self.0, scip, after, 1)
+        }
+        fn ids_with_scip(
+            &self,
+            scip: &str,
+            after: Option<&SymbolId>,
+            _: usize,
+        ) -> Result<GraphPage<SymbolId, SymbolId>, Self::Error> {
+            GraphRead::ids_with_scip(&self.0, scip, after, 1)
+        }
+        fn symbols_in_file(
+            &self,
+            file: &str,
+            after: Option<&SymbolId>,
+            _: usize,
+        ) -> Result<GraphPage<code2graph::Symbol, SymbolId>, Self::Error> {
+            GraphRead::symbols_in_file(&self.0, file, after, 1)
+        }
+        fn symbol_at_byte(
+            &self,
+            file: &str,
+            byte: usize,
+        ) -> Result<Option<code2graph::Symbol>, Self::Error> {
+            GraphRead::symbol_at_byte(&self.0, file, byte)
+        }
+        fn edges(
+            &self,
+            filter: EdgeFilter,
+            after: Option<&code2graph::EdgeKey>,
+            _: usize,
+        ) -> Result<GraphPage<Edge, code2graph::EdgeKey>, Self::Error> {
+            GraphRead::edges(&self.0, filter, after, 1)
+        }
+        fn edges_in_file(
+            &self,
+            file: &str,
+            filter: EdgeFilter,
+            after: Option<&code2graph::EdgeKey>,
+            _: usize,
+        ) -> Result<GraphPage<Edge, code2graph::EdgeKey>, Self::Error> {
+            GraphRead::edges_in_file(&self.0, file, filter, after, 1)
+        }
+        fn incoming(
+            &self,
+            id: &SymbolId,
+            filter: EdgeFilter,
+            after: Option<&code2graph::EdgeKey>,
+            _: usize,
+        ) -> Result<GraphPage<Edge, code2graph::EdgeKey>, Self::Error> {
+            GraphRead::incoming(&self.0, id, filter, after, 1)
+        }
+        fn outgoing(
+            &self,
+            id: &SymbolId,
+            filter: EdgeFilter,
+            after: Option<&code2graph::EdgeKey>,
+            _: usize,
+        ) -> Result<GraphPage<Edge, code2graph::EdgeKey>, Self::Error> {
+            GraphRead::outgoing(&self.0, id, filter, after, 1)
+        }
+    }
+
+    #[test]
+    fn generic_impact_propagates_reader_failure() {
+        assert!(matches!(
+            impact(&FailingReader, &id("seed"), options(1, 1)),
+            Err(ReadFailure)
+        ));
+    }
+
+    #[test]
+    fn generic_impact_matches_in_memory_across_reader_pages() {
+        let seed = id("seed");
+        let graph = index(vec![
+            edge(&id("a"), &seed, Confidence::Exact, 1),
+            edge(&id("b"), &seed, Confidence::Exact, 2),
+            edge(&id("c"), &seed, Confidence::Exact, 3),
+        ]);
+        let expected = graph.impact(&seed, options(4, 10));
+        let paged = impact(&OneEdgePages(graph), &seed, options(4, 10)).expect("infallible");
+        assert_eq!(
+            expected
+                .steps
+                .iter()
+                .map(|step| &step.symbol)
+                .collect::<Vec<_>>(),
+            paged
+                .steps
+                .iter()
+                .map(|step| &step.symbol)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(expected.truncated, paged.truncated);
     }
 
     #[test]

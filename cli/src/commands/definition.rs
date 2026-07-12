@@ -13,10 +13,14 @@ use crate::{
 };
 
 /// Executes the definition-only `def` selector query.
-pub(crate) fn execute_definition(
-    context: &QueryCommandContext<'_>,
+pub(crate) fn execute_definition<R>(
+    context: &QueryCommandContext<'_, R>,
     request: DefinitionCommandRequest<'_>,
-) -> Result<OutputEnvelope<Vec<SymbolOutput>>> {
+) -> Result<OutputEnvelope<Vec<SymbolOutput>>>
+where
+    R: code2graph_query::GraphRead,
+    R::Error: Into<crate::CliError>,
+{
     context.deadline.check(context.cancellation)?;
     let options = SelectorOptions {
         file: request
@@ -27,9 +31,8 @@ pub(crate) fn execute_definition(
         require_unique: request.require_unique,
     };
     let selector_context = SelectorContext {
-        index: context.index,
+        graph: context.index,
         selection: &context.loaded.selection,
-        snapshot: &context.loaded.snapshot,
         candidate_hashes: &context.candidate_hashes,
         max_file_bytes: context.max_file_bytes,
         deadline: context.deadline,

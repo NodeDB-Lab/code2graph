@@ -42,7 +42,7 @@ impl EdgeFilter {
         self
     }
 
-    fn matches(&self, edge: &Edge) -> bool {
+    pub(crate) fn matches(&self, edge: &Edge) -> bool {
         edge.confidence >= self.min_confidence
             && self.role.is_none_or(|role| edge.role == role)
             && self

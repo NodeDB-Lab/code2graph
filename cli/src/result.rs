@@ -906,7 +906,7 @@ mod tests {
                 }],
                 "max_files": 10000,
                 "max_file_bytes": 1048576,
-                "max_total_bytes": 26214400,
+                "max_total_bytes": 268435456,
                 "max_depth": 32,
                 "result_limit": 50,
                 "impact_depth": 2,

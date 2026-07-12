@@ -4,8 +4,12 @@
 
 use std::collections::BTreeMap;
 
-use code2graph::{CodeGraph, Confidence, Edge, RefRole, SymbolId};
+#[cfg(test)]
+use code2graph::CodeGraph;
+use code2graph::{Confidence, Edge, RefRole, SymbolId};
+#[cfg(test)]
 use code2graph_query::GraphIndex;
+use code2graph_query::{EdgeFilter, GraphRead};
 
 use crate::Result;
 use crate::commands::QueryCommandContext;
@@ -32,13 +36,16 @@ struct AggregateKey {
 }
 
 /// Aggregates complete, exact edge evidence before applying the global row limit.
-pub(crate) fn execute_module_deps(
-    context: &QueryCommandContext<'_>,
+pub(crate) fn execute_module_deps<R>(
+    context: &QueryCommandContext<'_, R>,
     request: ModuleDepsCommandRequest,
-) -> Result<OutputEnvelope<Vec<ModuleDependencyOutput>>> {
+) -> Result<OutputEnvelope<Vec<ModuleDependencyOutput>>>
+where
+    R: GraphRead,
+    R::Error: Into<crate::CliError>,
+{
     context.deadline.check(context.cancellation)?;
-    let mut results =
-        aggregate_module_deps(&context.loaded.graph, context.index, request.min_confidence);
+    let mut results = aggregate_module_deps_read(context.index, request.min_confidence)?;
     context.deadline.check(context.cancellation)?;
     if results.is_empty() {
         return Err(crate::CliError::NoMatch);
@@ -51,6 +58,67 @@ pub(crate) fn execute_module_deps(
     Ok(envelope)
 }
 
+fn aggregate_module_deps_read<R>(
+    graph: &R,
+    min_confidence: Confidence,
+) -> crate::Result<Vec<ModuleDependencyOutput>>
+where
+    R: GraphRead,
+    R::Error: Into<crate::CliError>,
+{
+    let mut after = None;
+    let mut groups = BTreeMap::<AggregateKey, Vec<Edge>>::new();
+    let filter = EdgeFilter {
+        role: None,
+        min_confidence,
+        provenance: None,
+    };
+    loop {
+        let page = graph
+            .edges(filter, after.as_ref(), 256)
+            .map_err(Into::into)?;
+        for edge in page.items {
+            if !matches!(edge.role, RefRole::Import | RefRole::ModuleRef) {
+                continue;
+            }
+            let target = match graph.symbol(&edge.to).map_err(Into::into)? {
+                Some(symbol) => TargetKey::File(normalized_project_path(&symbol.file)),
+                None => TargetKey::External(edge.to.clone()),
+            };
+            let key = AggregateKey {
+                source_file: normalized_project_path(&edge.occ.file),
+                target,
+                role: edge.role,
+            };
+            groups.entry(key).or_default().push(edge);
+        }
+        let Some(next) = page.next else { break };
+        after = Some(next);
+    }
+    Ok(groups
+        .into_iter()
+        .map(|(key, mut edges)| {
+            edges.sort_by_key(|edge| edge.key());
+            let evidence = edges.iter().map(relation_output).collect::<Vec<_>>();
+            let target = match key.target {
+                TargetKey::File(file) => ModuleDependencyTargetOutput::File { file },
+                TargetKey::External(id) => ModuleDependencyTargetOutput::External {
+                    id_display: id.to_scip_string(),
+                    id,
+                },
+            };
+            ModuleDependencyOutput {
+                source_file: key.source_file,
+                target,
+                role: key.role.into(),
+                count: evidence.len(),
+                evidence,
+            }
+        })
+        .collect())
+}
+
+#[cfg(test)]
 fn aggregate_module_deps(
     graph: &CodeGraph,
     index: &GraphIndex,
@@ -106,7 +174,7 @@ mod tests {
     };
     use code2graph_query::GraphIndex;
 
-    use super::aggregate_module_deps;
+    use super::{aggregate_module_deps, aggregate_module_deps_read};
     use crate::{ModuleDependencyTargetOutput, RefRoleOutput};
 
     fn id(name: &str) -> SymbolId {
@@ -157,6 +225,11 @@ mod tests {
         };
         let index = GraphIndex::from_graph(graph.clone()).unwrap();
         let rows = aggregate_module_deps(&graph, &index, Confidence::Scoped);
+        assert_eq!(
+            aggregate_module_deps_read(&index, Confidence::Scoped).unwrap(),
+            rows,
+            "paged GraphRead aggregation preserves in-memory module dependencies"
+        );
 
         assert_eq!(rows.len(), 3);
         assert!(aggregate_module_deps(&graph, &index, Confidence::Exact).is_empty());

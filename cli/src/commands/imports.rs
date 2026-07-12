@@ -4,7 +4,10 @@
 
 use std::path::Path;
 
-use code2graph::{CodeGraph, Confidence, Edge, RefRole};
+#[cfg(test)]
+use code2graph::CodeGraph;
+use code2graph::{Confidence, Edge, EdgeKey, RefRole};
+use code2graph_query::{EdgeFilter, GraphRead};
 
 use crate::commands::QueryCommandContext;
 use crate::commands::relation_output;
@@ -20,25 +23,27 @@ pub(crate) struct ImportsCommandRequest<'a> {
 
 /// Returns every resolved import/module-reference edge whose occurrence is in
 /// the requested snapshot file.  Structural edge keys retain parallel evidence.
-pub(crate) fn execute_imports(
-    context: &QueryCommandContext<'_>,
+pub(crate) fn execute_imports<R>(
+    context: &QueryCommandContext<'_, R>,
     request: ImportsCommandRequest<'_>,
-) -> Result<OutputEnvelope<Vec<RelationOutput>>> {
+) -> Result<OutputEnvelope<Vec<RelationOutput>>>
+where
+    R: GraphRead,
+    R::Error: Into<CliError>,
+{
     context.deadline.check(context.cancellation)?;
     let file = ProjectPath::new(Path::new(request.file))?;
     if !context
-        .loaded
-        .snapshot
-        .files
-        .iter()
-        .any(|entry| normalized_project_path(&entry.path) == file.as_str())
+        .candidate_hashes
+        .keys()
+        .any(|path| normalized_project_path(path) == file.as_str())
     {
         return Err(CliError::NoMatch);
     }
 
-    let mut results = collect_imports(&context.loaded.graph, file.as_str(), request.min_confidence)
+    let mut results = collect_imports_read(context.index, file.as_str(), request.min_confidence)?
         .into_iter()
-        .map(relation_output)
+        .map(|edge| relation_output(&edge))
         .collect::<Vec<_>>();
     context.deadline.check(context.cancellation)?;
     if results.is_empty() {
@@ -52,6 +57,37 @@ pub(crate) fn execute_imports(
     Ok(envelope)
 }
 
+fn collect_imports_read<R>(
+    graph: &R,
+    normalized_file: &str,
+    min_confidence: Confidence,
+) -> Result<Vec<Edge>>
+where
+    R: GraphRead,
+    R::Error: Into<CliError>,
+{
+    let filter = EdgeFilter {
+        role: None,
+        min_confidence,
+        provenance: None,
+    };
+    let mut after: Option<EdgeKey> = None;
+    let mut evidence = Vec::new();
+    loop {
+        let page = graph
+            .edges(filter, after.as_ref(), 256)
+            .map_err(Into::into)?;
+        evidence.extend(page.items.into_iter().filter(|edge| {
+            normalized_project_path(&edge.occ.file) == normalized_file
+                && matches!(edge.role, RefRole::Import | RefRole::ModuleRef)
+        }));
+        let Some(next) = page.next else { break };
+        after = Some(next);
+    }
+    Ok(evidence)
+}
+
+#[cfg(test)]
 fn collect_imports<'a>(
     graph: &'a CodeGraph,
     normalized_file: &str,
@@ -76,7 +112,7 @@ mod tests {
         CodeGraph, Confidence, Descriptor, Edge, Occurrence, Provenance, RefRole, SymbolId,
     };
 
-    use super::collect_imports;
+    use super::{collect_imports, collect_imports_read};
 
     fn edge(role: RefRole, confidence: Confidence, byte: usize, provenance: Provenance) -> Edge {
         Edge {
@@ -123,6 +159,13 @@ mod tests {
         };
 
         let evidence = collect_imports(&graph, "src/main.rs", Confidence::Scoped);
+        let index = code2graph_query::GraphIndex::from_graph(graph.clone()).unwrap();
+        let paged = collect_imports_read(&index, "src/main.rs", Confidence::Scoped).unwrap();
+        assert_eq!(
+            evidence.iter().map(|edge| edge.key()).collect::<Vec<_>>(),
+            paged.iter().map(|edge| edge.key()).collect::<Vec<_>>(),
+            "paged GraphRead path preserves in-memory import evidence"
+        );
         assert_eq!(evidence.len(), 3);
         assert!(
             evidence

@@ -18,8 +18,11 @@ pub use fingerprint::{
     PackageFingerprint, ProjectInputDigest,
 };
 pub use location::{CacheLocation, ProjectKey};
-pub use store::CacheStore;
+pub use store::{CacheGraphRead, CacheStore};
+#[cfg(test)]
+pub(crate) use store::{reset_whole_graph_loads, whole_graph_loads};
 pub use types::{
-    CacheCompleteness, CacheOmission, CandidateCompleteness, CandidateFileRecord,
-    CandidateSnapshot, CompatibilityRecord, LoadedSnapshot, ResolverCacheTier,
+    ActiveSnapshotMetadata, CacheCompleteness, CacheOmission, CachedFileMetadata,
+    CandidateCompleteness, CandidateFileRecord, CandidateSnapshot, CompatibilityRecord,
+    LoadedSnapshot, ResolverCacheTier,
 };

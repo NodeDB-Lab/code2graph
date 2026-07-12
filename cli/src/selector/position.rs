@@ -6,6 +6,8 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
+use code2graph_query::GraphRead;
+
 use crate::{
     Cancellation, CliError, Deadline, ProjectPath, ProjectSelection, Result, SourcePosition,
 };
@@ -14,15 +16,21 @@ use super::SelectorContext;
 
 /// Resolves a human position through current source bytes proven to match the
 /// loaded snapshot from which the queried spans were produced.
-pub(super) fn resolve_position(
-    context: &SelectorContext<'_>,
+pub(super) fn resolve_position<G>(
+    context: &SelectorContext<'_, G>,
     position: &SourcePosition,
-) -> Result<code2graph::SymbolId> {
+) -> Result<code2graph::SymbolId>
+where
+    G: GraphRead + ?Sized,
+    G::Error: Into<CliError>,
+{
     context.deadline.check(context.cancellation)?;
     let project_path = ProjectPath::new(Path::new(&position.file))?;
     if context
-        .index
-        .symbols_in_file(project_path.as_str())
+        .graph
+        .symbols_in_file(project_path.as_str(), None, 1)
+        .map_err(Into::into)?
+        .items
         .is_empty()
     {
         return Err(CliError::NoMatch);
@@ -54,9 +62,10 @@ pub(super) fn resolve_position(
     let byte = source_byte(&source, position, context.deadline, context.cancellation)?;
     context.deadline.check(context.cancellation)?;
     context
-        .index
+        .graph
         .symbol_at_byte(project_path.as_str(), byte)
-        .map(|symbol| symbol.id.clone())
+        .map_err(Into::into)?
+        .map(|symbol| symbol.id)
         .ok_or(CliError::NoMatch)
 }
 
@@ -380,9 +389,8 @@ mod tests {
         };
         let deadline = Deadline::new(None);
         let context = SelectorContext {
-            index: &index,
+            graph: &index,
             selection: &selection,
-            snapshot: &snapshot,
             candidate_hashes: &candidate_hashes,
             max_file_bytes: 64,
             deadline: &deadline,
@@ -428,9 +436,8 @@ mod tests {
         };
         let deadline = Deadline::new(None);
         let context = SelectorContext {
-            index: &index,
+            graph: &index,
             selection: &selection,
-            snapshot: &snapshot,
             candidate_hashes: &candidate_hashes,
             max_file_bytes: 64,
             deadline: &deadline,
@@ -487,9 +494,8 @@ mod tests {
         };
         let deadline = Deadline::new(None);
         let context = SelectorContext {
-            index: &index,
+            graph: &index,
             selection: &selection,
-            snapshot: &snapshot,
             candidate_hashes: &candidate_hashes,
             max_file_bytes: 64,
             deadline: &deadline,

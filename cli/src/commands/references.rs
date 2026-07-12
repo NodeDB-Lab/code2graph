@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use code2graph::{RefRole, Reference};
+use code2graph::{FileFacts, RefRole, Reference};
 
 use crate::commands::QueryCommandContext;
 use crate::commands::shared::{limit, normalized_project_path, query_envelope};
@@ -20,25 +20,50 @@ pub(crate) struct ReferencesCommandRequest<'a> {
 
 /// Lists extracted facts directly; it deliberately does not consult resolution.
 pub(crate) fn execute_references(
-    context: &QueryCommandContext<'_>,
+    context: &QueryCommandContext<'_, impl code2graph_query::GraphRead>,
     request: ReferencesCommandRequest<'_>,
 ) -> Result<OutputEnvelope<Vec<ReferenceOutput>>> {
     context.deadline.check(context.cancellation)?;
     let file = ProjectPath::new(Path::new(request.file))?;
-    let record = context
-        .loaded
-        .snapshot
-        .files
-        .iter()
-        .find(|entry| normalized_project_path(&entry.path) == file.as_str())
+    let facts = context
+        .reference_facts
+        .as_ref()
+        .or_else(|| {
+            context
+                .loaded
+                .snapshot
+                .files
+                .iter()
+                .find(|entry| normalized_project_path(&entry.path) == file.as_str())
+                .map(|entry| &entry.facts)
+        })
         .ok_or(CliError::NoMatch)?;
-    let mut results = record
-        .facts
+    let mut results = collect_references(facts, request.name, request.role);
+    context.deadline.check(context.cancellation)?;
+    if results.is_empty() {
+        return Err(CliError::NoMatch);
+    }
+    let (total, truncated) = limit(&mut results, request.result_limit);
+    let mut envelope = query_envelope(context.loaded, results);
+    envelope.total = total;
+    envelope.returned = envelope.results.len();
+    envelope.truncated = truncated;
+    Ok(envelope)
+}
+
+/// Applies the raw-reference query to one independently loaded file-facts record.
+/// Cache-backed routing uses `CacheStore::file_facts` so it never loads a candidate.
+fn collect_references(
+    facts: &FileFacts,
+    name: Option<&str>,
+    role: Option<RefRole>,
+) -> Vec<ReferenceOutput> {
+    let mut results = facts
         .references
         .iter()
         .filter(|reference| {
-            request.name.is_none_or(|name| reference.name == name)
-                && request.role.is_none_or(|role| reference.role == role)
+            name.is_none_or(|name| reference.name == name)
+                && role.is_none_or(|role| reference.role == role)
         })
         .map(reference_output)
         .collect::<Vec<_>>();
@@ -56,16 +81,7 @@ pub(crate) fn execute_references(
                 right.qualifier.as_deref().unwrap_or(""),
             ))
     });
-    context.deadline.check(context.cancellation)?;
-    if results.is_empty() {
-        return Err(CliError::NoMatch);
-    }
-    let (total, truncated) = limit(&mut results, request.result_limit);
-    let mut envelope = query_envelope(context.loaded, results);
-    envelope.total = total;
-    envelope.returned = envelope.results.len();
-    envelope.truncated = truncated;
-    Ok(envelope)
+    results
 }
 
 fn reference_output(reference: &Reference) -> ReferenceOutput {

@@ -46,13 +46,27 @@ const TABLES: &[(&str, &str)] = &[
     ),
     (
         "graph_snapshots",
-        "CREATE TABLE graph_snapshots (snapshot_id INTEGER PRIMARY KEY, candidate_id BLOB NOT NULL REFERENCES candidates(candidate_id) ON DELETE CASCADE, resolver_tier TEXT NOT NULL CHECK (resolver_tier IN ('name', 'scope', 'dense')), graph BLOB NOT NULL CHECK (length(graph) <= 16777216), created_at_ns INTEGER NOT NULL CHECK (created_at_ns >= 0), UNIQUE (candidate_id, resolver_tier))",
+        "CREATE TABLE graph_snapshots (snapshot_id INTEGER PRIMARY KEY, candidate_id BLOB NOT NULL REFERENCES candidates(candidate_id) ON DELETE CASCADE, resolver_tier TEXT NOT NULL CHECK (resolver_tier IN ('name', 'scope', 'dense')), created_at_ns INTEGER NOT NULL CHECK (created_at_ns >= 0), UNIQUE (candidate_id, resolver_tier))",
+    ),
+    (
+        "graph_symbols",
+        "CREATE TABLE graph_symbols (snapshot_id INTEGER NOT NULL REFERENCES graph_snapshots(snapshot_id) ON DELETE CASCADE, ordinal INTEGER NOT NULL CHECK (ordinal >= 0), id BLOB NOT NULL, scip TEXT NOT NULL, name TEXT NOT NULL, file TEXT NOT NULL, span_start INTEGER NOT NULL CHECK (span_start >= 0), span_end INTEGER NOT NULL CHECK (span_end >= span_start), kind TEXT NOT NULL, symbol BLOB NOT NULL CHECK (length(symbol) <= 16777216), PRIMARY KEY (snapshot_id, ordinal), UNIQUE (snapshot_id, id))",
+    ),
+    (
+        "graph_edges",
+        "CREATE TABLE graph_edges (snapshot_id INTEGER NOT NULL REFERENCES graph_snapshots(snapshot_id) ON DELETE CASCADE, ordinal INTEGER NOT NULL CHECK (ordinal >= 0), edge_key BLOB NOT NULL, from_id BLOB NOT NULL, to_id BLOB NOT NULL, role TEXT NOT NULL, confidence TEXT NOT NULL, confidence_rank INTEGER NOT NULL CHECK (confidence_rank BETWEEN 0 AND 3), provenance TEXT NOT NULL, occurrence_file TEXT NOT NULL, occurrence_byte INTEGER NOT NULL CHECK (occurrence_byte >= 0), edge BLOB NOT NULL CHECK (length(edge) <= 16777216), PRIMARY KEY (snapshot_id, ordinal), UNIQUE (snapshot_id, edge_key))",
+    ),
+    (
+        "graph_ids",
+        "CREATE TABLE graph_ids (snapshot_id INTEGER NOT NULL REFERENCES graph_snapshots(snapshot_id) ON DELETE CASCADE, ordinal INTEGER NOT NULL CHECK (ordinal >= 0), id BLOB NOT NULL, scip TEXT NOT NULL, PRIMARY KEY (snapshot_id, ordinal), UNIQUE (snapshot_id, id))",
     ),
     (
         "active_snapshots",
         "CREATE TABLE active_snapshots (resolver_tier TEXT NOT NULL CHECK (resolver_tier IN ('name', 'scope', 'dense')), completeness INTEGER NOT NULL CHECK (completeness IN (0, 1)), snapshot_id INTEGER NOT NULL REFERENCES graph_snapshots(snapshot_id) ON DELETE CASCADE, PRIMARY KEY (resolver_tier, completeness))",
     ),
 ];
+
+pub(super) const LEGACY_GRAPH_SNAPSHOTS: &str = "CREATE TABLE graph_snapshots (snapshot_id INTEGER PRIMARY KEY, candidate_id BLOB NOT NULL REFERENCES candidates(candidate_id) ON DELETE CASCADE, resolver_tier TEXT NOT NULL CHECK (resolver_tier IN ('name', 'scope', 'dense')), graph BLOB NOT NULL CHECK (length(graph) <= 16777216), created_at_ns INTEGER NOT NULL CHECK (created_at_ns >= 0), UNIQUE (candidate_id, resolver_tier))";
 
 const INDEXES: &[(&str, &str)] = &[
     (
@@ -66,6 +80,46 @@ const INDEXES: &[(&str, &str)] = &[
     (
         "graph_snapshots_candidate_idx",
         "CREATE INDEX graph_snapshots_candidate_idx ON graph_snapshots (candidate_id)",
+    ),
+    (
+        "graph_symbols_snapshot_idx",
+        "CREATE INDEX graph_symbols_snapshot_idx ON graph_symbols (snapshot_id, ordinal)",
+    ),
+    (
+        "graph_symbols_name_idx",
+        "CREATE INDEX graph_symbols_name_idx ON graph_symbols (snapshot_id, name, ordinal)",
+    ),
+    (
+        "graph_symbols_scip_idx",
+        "CREATE INDEX graph_symbols_scip_idx ON graph_symbols (snapshot_id, scip, ordinal)",
+    ),
+    (
+        "graph_symbols_file_idx",
+        "CREATE INDEX graph_symbols_file_idx ON graph_symbols (snapshot_id, file, ordinal)",
+    ),
+    (
+        "graph_edges_snapshot_idx",
+        "CREATE INDEX graph_edges_snapshot_idx ON graph_edges (snapshot_id, ordinal)",
+    ),
+    (
+        "graph_edges_file_idx",
+        "CREATE INDEX graph_edges_file_idx ON graph_edges (snapshot_id, occurrence_file, role, confidence_rank, provenance, ordinal)",
+    ),
+    (
+        "graph_edges_filter_idx",
+        "CREATE INDEX graph_edges_filter_idx ON graph_edges (snapshot_id, role, confidence_rank, provenance, ordinal)",
+    ),
+    (
+        "graph_ids_scip_idx",
+        "CREATE INDEX graph_ids_scip_idx ON graph_ids (snapshot_id, scip, ordinal)",
+    ),
+    (
+        "graph_edges_from_idx",
+        "CREATE INDEX graph_edges_from_idx ON graph_edges (snapshot_id, from_id, role, confidence, provenance, ordinal)",
+    ),
+    (
+        "graph_edges_to_idx",
+        "CREATE INDEX graph_edges_to_idx ON graph_edges (snapshot_id, to_id, role, confidence, provenance, ordinal)",
     ),
 ];
 
@@ -100,6 +154,45 @@ pub(super) fn create_v1(
     connection
         .pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(|_| CacheError::Access)
+}
+
+/// Transactionally replaces only the exact unreleased monolithic-graph layout.
+/// The caller owns `BEGIN IMMEDIATE`/commit so readers observe either layout.
+pub(super) fn reset_legacy_graph_layout(connection: &Connection) -> Result<bool, CacheError> {
+    let graph_sql: Option<String> = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'graph_snapshots'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(map_validation_error)?;
+    if graph_sql.as_deref() != Some(LEGACY_GRAPH_SNAPSHOTS) {
+        return Ok(false);
+    }
+    connection
+        .execute_batch(
+            "DROP TABLE active_snapshots; DROP TABLE graph_snapshots; \
+             DROP INDEX IF EXISTS graph_snapshots_candidate_idx;",
+        )
+        .map_err(map_validation_error)?;
+    for (name, sql) in TABLES.iter().filter(|(name, _)| {
+        matches!(
+            *name,
+            "graph_snapshots" | "graph_symbols" | "graph_edges" | "graph_ids" | "active_snapshots"
+        )
+    }) {
+        let _ = name;
+        connection.execute(sql, []).map_err(map_validation_error)?;
+    }
+    for (name, sql) in INDEXES
+        .iter()
+        .filter(|(name, _)| name.starts_with("graph_"))
+    {
+        let _ = name;
+        connection.execute(sql, []).map_err(map_validation_error)?;
+    }
+    Ok(true)
 }
 
 pub(super) fn validate_v1(

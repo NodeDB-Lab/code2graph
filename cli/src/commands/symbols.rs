@@ -7,31 +7,28 @@ use std::path::Path;
 use crate::commands::shared::{limit, query_envelope, symbol_output};
 use crate::commands::{QueryCommandContext, SymbolsCommandRequest};
 use crate::result::{OutputEnvelope, SymbolOutput};
+use code2graph_query::GraphRead;
+
 use crate::{CliError, ProjectPath, Result};
 
+const GRAPH_PAGE_SIZE: usize = 256;
+
 /// Executes the definition-only `symbols` substring query.
-pub(crate) fn execute_symbols(
-    context: &QueryCommandContext<'_>,
+pub(crate) fn execute_symbols<R>(
+    context: &QueryCommandContext<'_, R>,
     request: SymbolsCommandRequest<'_>,
-) -> Result<OutputEnvelope<Vec<SymbolOutput>>> {
+) -> Result<OutputEnvelope<Vec<SymbolOutput>>>
+where
+    R: GraphRead,
+    R::Error: Into<CliError>,
+{
     context.deadline.check(context.cancellation)?;
     let file = request
         .file
         .map(|value| ProjectPath::new(Path::new(value)))
         .transpose()?;
     let needle = (!request.case_sensitive).then(|| request.text.to_lowercase());
-    let mut results = context
-        .index
-        .symbols()
-        .filter(|symbol| {
-            substring_matches(symbol, request.text, needle.as_deref())
-                && file
-                    .as_ref()
-                    .is_none_or(|file| normalized_file(symbol) == file.as_str())
-                && request.kind.is_none_or(|kind| symbol.kind == kind)
-        })
-        .map(symbol_output)
-        .collect::<Vec<_>>();
+    let mut results = collect_symbols(context.index, &request, file.as_ref(), needle.as_deref())?;
     // Structural IDs are the ordering contract, independent of graph input order.
     results.sort_by(|left, right| left.id.cmp(&right.id));
     context.deadline.check(context.cancellation)?;
@@ -44,6 +41,38 @@ pub(crate) fn execute_symbols(
     envelope.returned = envelope.results.len();
     envelope.truncated = truncated;
     Ok(envelope)
+}
+
+fn collect_symbols<R>(
+    graph: &R,
+    request: &SymbolsCommandRequest<'_>,
+    file: Option<&ProjectPath>,
+    folded_needle: Option<&str>,
+) -> Result<Vec<SymbolOutput>>
+where
+    R: GraphRead,
+    R::Error: Into<CliError>,
+{
+    let mut after = None;
+    let mut results = Vec::new();
+    loop {
+        let page = graph
+            .symbols(after.as_ref(), GRAPH_PAGE_SIZE)
+            .map_err(Into::into)?;
+        results.extend(
+            page.items
+                .into_iter()
+                .filter(|symbol| {
+                    substring_matches(symbol, request.text, folded_needle)
+                        && file.is_none_or(|file| normalized_file(symbol) == file.as_str())
+                        && request.kind.is_none_or(|kind| symbol.kind == kind)
+                })
+                .map(|symbol| symbol_output(&symbol)),
+        );
+        let Some(next) = page.next else { break };
+        after = Some(next);
+    }
+    Ok(results)
 }
 
 fn substring_matches(symbol: &code2graph::Symbol, text: &str, folded_needle: Option<&str>) -> bool {

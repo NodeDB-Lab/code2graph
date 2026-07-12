@@ -6,7 +6,9 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use code2graph::{Edge, EdgeKey, RefRole, SymbolId};
-use code2graph_query::{EdgeFilter, GraphIndex};
+#[cfg(test)]
+use code2graph_query::GraphIndex;
+use code2graph_query::{EdgeFilter, GraphRead};
 
 use crate::commands::QueryCommandContext;
 use crate::commands::shared::{limit, query_envelope, symbol_output};
@@ -35,10 +37,14 @@ pub(crate) struct RelationCommandRequest<'a> {
 }
 
 /// Executes callers, callees, and usages over the complete selector result.
-pub(crate) fn execute_relations(
-    context: &QueryCommandContext<'_>,
+pub(crate) fn execute_relations<R>(
+    context: &QueryCommandContext<'_, R>,
     request: RelationCommandRequest<'_>,
-) -> Result<OutputEnvelope<Vec<RelationOutput>>> {
+) -> Result<OutputEnvelope<Vec<RelationOutput>>>
+where
+    R: GraphRead,
+    R::Error: Into<crate::CliError>,
+{
     context.deadline.check(context.cancellation)?;
     let options = SelectorOptions {
         file: request
@@ -49,9 +55,8 @@ pub(crate) fn execute_relations(
         require_unique: request.require_unique,
     };
     let selector_context = SelectorContext {
-        index: context.index,
+        graph: context.index,
         selection: &context.loaded.selection,
-        snapshot: &context.loaded.snapshot,
         candidate_hashes: &context.candidate_hashes,
         max_file_bytes: context.max_file_bytes,
         deadline: context.deadline,
@@ -71,9 +76,9 @@ pub(crate) fn execute_relations(
         provenance: None,
     };
     let complete =
-        collect_relation_evidence(context.index, &resolution.ids, request.direction, filter)
+        collect_relation_evidence_read(context.index, &resolution.ids, request.direction, filter)?
             .into_iter()
-            .map(relation_output)
+            .map(|edge| relation_output(&edge))
             .collect::<Vec<_>>();
     context.deadline.check(context.cancellation)?;
     let mut results = complete.clone();
@@ -97,6 +102,7 @@ pub(crate) fn execute_relations(
     Ok(envelope)
 }
 
+#[cfg(test)]
 fn collect_relation_evidence<'a>(
     index: &'a GraphIndex,
     ids: &[SymbolId],
@@ -118,6 +124,35 @@ fn collect_relation_evidence<'a>(
         }
     }
     evidence.into_values().collect()
+}
+
+fn collect_relation_evidence_read<R>(
+    graph: &R,
+    ids: &[SymbolId],
+    direction: RelationDirection,
+    filter: EdgeFilter,
+) -> Result<Vec<Edge>>
+where
+    R: GraphRead,
+    R::Error: Into<crate::CliError>,
+{
+    let mut evidence = BTreeMap::<EdgeKey, Edge>::new();
+    for id in ids {
+        let mut after = None;
+        loop {
+            let page = match direction {
+                RelationDirection::Incoming => graph.incoming(id, filter, after.as_ref(), 256),
+                RelationDirection::Outgoing => graph.outgoing(id, filter, after.as_ref(), 256),
+            }
+            .map_err(Into::into)?;
+            for edge in page.items {
+                evidence.insert(edge.key(), edge);
+            }
+            let Some(next) = page.next else { break };
+            after = Some(next);
+        }
+    }
+    Ok(evidence.into_values().collect())
 }
 
 pub(crate) fn relation_output(edge: &Edge) -> RelationOutput {
@@ -144,7 +179,10 @@ mod tests {
     };
     use code2graph_query::{EdgeFilter, GraphIndex};
 
-    use super::{RelationDirection, collect_relation_evidence, relation_output};
+    use super::{
+        RelationDirection, collect_relation_evidence, collect_relation_evidence_read,
+        relation_output,
+    };
 
     #[test]
     fn relation_output_preserves_lossless_ids_and_zero_based_json_coordinates() {
@@ -205,9 +243,21 @@ mod tests {
 
         let evidence = collect_relation_evidence(
             &index,
+            &[endpoint.clone(), endpoint.clone()],
+            RelationDirection::Incoming,
+            EdgeFilter::new(Confidence::Scoped).with_role(RefRole::Call),
+        );
+        let paged = collect_relation_evidence_read(
+            &index,
             &[endpoint.clone(), endpoint],
             RelationDirection::Incoming,
             EdgeFilter::new(Confidence::Scoped).with_role(RefRole::Call),
+        )
+        .unwrap();
+        assert_eq!(
+            evidence.iter().map(|edge| edge.key()).collect::<Vec<_>>(),
+            paged.iter().map(|edge| edge.key()).collect::<Vec<_>>(),
+            "paged GraphRead evidence preserves in-memory relation ordering"
         );
         assert_eq!(
             evidence.len(),
