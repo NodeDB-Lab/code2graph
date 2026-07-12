@@ -13,16 +13,22 @@ use crate::cache::{
 };
 use crate::config::{ResolverTier, ResourceLimits, load_query_binding_rules};
 use crate::deadline::{Cancellation, Deadline};
+use crate::inventory::InventoryFile;
 use crate::inventory::{
     MaterializedCandidate, OmissionImpact, OmissionReason, OmittedFile, SourceCandidate,
     SourceDiscovery, discover_sources_checked, materialize_candidate_checked,
 };
 use crate::package_assignment::assign_packages_checked;
 use crate::project::{ProjectPath, ProjectSelection};
-use crate::worker::{RequestId, WorkerErrorCode, WorkerFailure, extract_inventory_file};
+use crate::worker::{KillHandle, PersistentWorker, RequestId, WorkerErrorCode, WorkerFailure};
 use crate::{CliError, Result};
 use code2graph::{FileFacts, QueryBindingRule, validate_file_facts};
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 pub struct PrepareCandidateInputs<'a> {
     pub selection: &'a ProjectSelection,
@@ -44,35 +50,253 @@ pub struct PreparedRefreshCandidate {
     pub ignored_omissions: Vec<CacheOmission>,
     pub attempts: u8,
 }
+/// Produces a reusable extraction session for one pool thread. A session owns a
+/// long-lived worker and survives across files, so the expensive worker spawn is
+/// paid once per thread — not once per file, which dominated a cold index.
 pub trait FactsExtractor: Sync {
+    /// A reusable per-thread extraction context.
+    type Session: ExtractSession;
+    /// Creates a session, publishing its worker's kill handle into `slot` so the
+    /// run's deadline monitor can terminate a worker whose owning thread is
+    /// blocked in [`ExtractSession::extract`].
+    fn session(&self, slot: WorkerSlot) -> Result<Self::Session>;
+}
+
+/// A per-thread extraction session. Each `extract` services exactly one file and
+/// owns its own crash recovery: a repeatable single-file crash degrades to a
+/// per-file omission, while genuine infrastructure failures stay fatal.
+pub trait ExtractSession {
     fn extract(
-        &self,
-        file: &crate::inventory::InventoryFile,
+        &mut self,
+        file: &InventoryFile,
         request_id: RequestId,
         deadline: &Deadline,
         cancellation: &dyn Cancellation,
     ) -> Result<FileFacts>;
 }
-/// Extracts one file in an isolated worker subprocess, carrying the project's
+
+/// One pool thread's slot in the deadline monitor's registry of live workers. A
+/// session publishes its current worker's kill handle here on every (re)spawn
+/// and clears it when the thread finishes, all under the registry lock, so the
+/// monitor never signals a worker whose process has already been reaped.
+#[derive(Clone)]
+pub struct WorkerSlot {
+    registry: Arc<Mutex<Vec<Option<KillHandle>>>>,
+    index: usize,
+}
+
+impl WorkerSlot {
+    /// Publishes the current worker's kill handle for the monitor to use.
+    pub fn set(&self, handle: KillHandle) {
+        let mut slots = self
+            .registry
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(slot) = slots.get_mut(self.index) {
+            *slot = Some(handle);
+        }
+    }
+
+    /// Clears the slot; the monitor will no longer target this thread's worker.
+    pub fn clear(&self) {
+        let mut slots = self
+            .registry
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(slot) = slots.get_mut(self.index) {
+            *slot = None;
+        }
+    }
+}
+
+/// The single deadline/cancellation monitor for one extraction run. Because a
+/// session's response read blocks, a hung file would otherwise pin a pool thread
+/// forever; the monitor kills every registered worker once the deadline or a
+/// cancellation trips, unblocking those reads (a killed worker's stdout closes).
+struct ExtractMonitor {
+    registry: Arc<Mutex<Vec<Option<KillHandle>>>>,
+    shutdown: AtomicBool,
+}
+
+impl ExtractMonitor {
+    fn new(registry: Arc<Mutex<Vec<Option<KillHandle>>>>) -> Self {
+        Self {
+            registry,
+            shutdown: AtomicBool::new(false),
+        }
+    }
+
+    fn kill_all(&self) {
+        let slots = self
+            .registry
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        for handle in slots.iter().flatten() {
+            handle.kill();
+        }
+    }
+}
+
+/// Signals the monitor to stop when it drops, so the monitor thread is joined
+/// promptly on every exit path — including an unwinding panic in a pool thread —
+/// and `thread::scope` can never hang waiting on a still-looping monitor.
+struct MonitorStop<'a>(&'a ExtractMonitor);
+
+impl Drop for MonitorStop<'_> {
+    fn drop(&mut self) {
+        self.0.shutdown.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Polls the deadline/cancellation in small increments; on breach it kills all
+/// registered workers (repeatedly, to catch any still finishing) and keeps
+/// polling until the pool signals shutdown after its threads have joined.
+fn run_monitor(monitor: &ExtractMonitor, deadline: &Deadline, cancellation: &dyn Cancellation) {
+    while !monitor.shutdown.load(Ordering::SeqCst) {
+        if deadline.check(cancellation).is_err() {
+            monitor.kill_all();
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Whether a failure means the worker process died or its stream desynced (so
+/// the connection is unusable and a fresh worker is required), as opposed to a
+/// surviving worker's typed error or a fatal deadline/cancellation.
+fn is_worker_death(failure: &WorkerFailure) -> bool {
+    matches!(
+        failure,
+        WorkerFailure::Transport | WorkerFailure::Exit | WorkerFailure::Protocol
+    )
+}
+
+/// A one-file worker with respawn, abstracting the persistent subprocess so the
+/// crash-recovery policy in [`extract_with_recovery`] can be driven
+/// deterministically without a real subprocess.
+trait RecoverableWorker {
+    /// Attempts one file; a worker-death failure signals the process must be
+    /// replaced (via [`respawn`](Self::respawn)) before the next attempt.
+    fn attempt(
+        &mut self,
+        file: &InventoryFile,
+        request_id: RequestId,
+    ) -> std::result::Result<FileFacts, WorkerFailure>;
+    /// Replaces the underlying worker with a fresh one; a spawn failure is fatal.
+    fn respawn(&mut self) -> Result<()>;
+}
+
+/// The crash-recovery policy for one file. Deadline/cancellation breaches stay
+/// fatal; a first worker death triggers one respawn-and-retry; a retry that also
+/// dies marks the file as poison — reclassified as the existing per-file
+/// extraction omission — and spawns a fresh worker for subsequent files.
+fn extract_with_recovery<W: RecoverableWorker>(
+    worker: &mut W,
+    file: &InventoryFile,
+    request_id: RequestId,
+    deadline: &Deadline,
+    cancellation: &dyn Cancellation,
+) -> Result<FileFacts> {
+    deadline.check(cancellation)?;
+    let failure = match worker.attempt(file, request_id) {
+        Ok(facts) => return Ok(facts),
+        Err(failure) => failure,
+    };
+    // A surviving worker's typed error (e.g. an unparseable file) is not a crash;
+    // surface it unchanged for pass 3's per-file handling.
+    if !is_worker_death(&failure) {
+        return Err(failure.into());
+    }
+    // The worker died. If a deadline or cancellation caused it, that is fatal for
+    // the whole run — never a recoverable crash.
+    deadline.check(cancellation)?;
+    // A genuine crash: respawn and retry this one file once, in isolation.
+    worker.respawn()?;
+    match worker.attempt(file, request_id) {
+        Ok(facts) => Ok(facts),
+        Err(retry) if is_worker_death(&retry) => {
+            // Distinguish a fresh deadline breach during the retry from poison.
+            deadline.check(cancellation)?;
+            // The file crashed a second, fresh worker: it is poison. Spawn once
+            // more so subsequent files still have a live worker, and reclassify
+            // this file as the per-file extraction omission handled by pass 3.
+            worker.respawn()?;
+            Err(CliError::Worker(WorkerFailure::Remote(
+                WorkerErrorCode::Extraction,
+            )))
+        }
+        Err(retry) => Err(retry.into()),
+    }
+}
+
+/// Extracts files in persistent worker subprocesses, carrying the project's
 /// custom query-binding rules (loaded from `code2graph.toml`) alongside the
-/// worker's built-in defaults.
+/// worker's built-in defaults. Each pool thread gets one reusable worker.
 pub struct ProcessFactsExtractor {
-    custom_rules: Vec<QueryBindingRule>,
+    custom_rules: Arc<Vec<QueryBindingRule>>,
 }
 impl ProcessFactsExtractor {
     pub fn new(custom_rules: Vec<QueryBindingRule>) -> Self {
-        Self { custom_rules }
+        Self {
+            custom_rules: Arc::new(custom_rules),
+        }
     }
 }
 impl FactsExtractor for ProcessFactsExtractor {
+    type Session = ProcessSession;
+    fn session(&self, slot: WorkerSlot) -> Result<ProcessSession> {
+        let executable =
+            std::env::current_exe().map_err(|_| CliError::from(WorkerFailure::Spawn))?;
+        let worker = PersistentWorker::spawn(&executable).map_err(CliError::from)?;
+        slot.set(worker.kill_handle());
+        Ok(ProcessSession {
+            worker,
+            executable,
+            rules: Arc::clone(&self.custom_rules),
+            slot,
+        })
+    }
+}
+
+/// A live persistent worker plus what it needs to respawn after a crash.
+pub struct ProcessSession {
+    worker: PersistentWorker,
+    executable: PathBuf,
+    rules: Arc<Vec<QueryBindingRule>>,
+    slot: WorkerSlot,
+}
+
+impl RecoverableWorker for ProcessSession {
+    fn attempt(
+        &mut self,
+        file: &InventoryFile,
+        request_id: RequestId,
+    ) -> std::result::Result<FileFacts, WorkerFailure> {
+        self.worker.extract_one(file, request_id, &self.rules)
+    }
+
+    fn respawn(&mut self) -> Result<()> {
+        let worker = PersistentWorker::spawn(&self.executable).map_err(CliError::from)?;
+        let handle = worker.kill_handle();
+        // Clear the slot before dropping the old worker (which closes its stdin,
+        // terminates its group, reaps it, and — on Windows — closes its Job
+        // Object handle). Otherwise the registry would briefly hold a stale
+        // handle the monitor could signal after it closes.
+        self.slot.clear();
+        drop(std::mem::replace(&mut self.worker, worker));
+        self.slot.set(handle);
+        Ok(())
+    }
+}
+
+impl ExtractSession for ProcessSession {
     fn extract(
-        &self,
-        file: &crate::inventory::InventoryFile,
+        &mut self,
+        file: &InventoryFile,
         request_id: RequestId,
         deadline: &Deadline,
         cancellation: &dyn Cancellation,
     ) -> Result<FileFacts> {
-        extract_inventory_file(file, request_id, deadline, cancellation, &self.custom_rules)
+        extract_with_recovery(self, file, request_id, deadline, cancellation)
     }
 }
 
@@ -80,73 +304,155 @@ impl FactsExtractor for ProcessFactsExtractor {
 /// materialized source, and its pre-assigned worker request id.
 struct ExtractWorkItem<'a> {
     index: usize,
-    file: &'a crate::inventory::InventoryFile,
+    file: &'a InventoryFile,
     request_id: RequestId,
 }
 
-/// Run the per-file extractions concurrently across a bounded thread pool
-/// (`available_parallelism`, capped by the work count). Each extraction is an
-/// independent, isolated worker subprocess, so they compose without shared state.
-/// Results are returned keyed by plan-entry index; the caller merges them in that
-/// order, keeping the outcome identical to a serial run.
-fn parallel_extract(
-    extractor: &dyn FactsExtractor,
+/// Runs the per-file extractions across a bounded pool of persistent workers
+/// (`available_parallelism`, capped by the work count). Each pool thread keeps
+/// one worker alive across the files it pulls; a single-file crash is contained
+/// and recovered per [`extract_with_recovery`]. A shared cursor guarantees no
+/// file is lost — a thread only ever holds one in-flight file. Results come back
+/// keyed by plan-entry index and are sorted, so the outcome and its ordering are
+/// identical to a serial run.
+fn parallel_extract<E: FactsExtractor>(
+    extractor: &E,
     work: &[ExtractWorkItem<'_>],
     deadline: &Deadline,
     cancellation: &dyn Cancellation,
 ) -> Vec<(usize, Result<FileFacts>)> {
-    use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
     if work.is_empty() {
         return Vec::new();
     }
     let workers = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
-        .min(work.len());
-    // Single-threaded fallback avoids all threading overhead for tiny inputs.
-    if workers <= 1 {
-        return work
-            .iter()
-            .map(|item| {
-                (
-                    item.index,
-                    extractor.extract(item.file, item.request_id, deadline, cancellation),
-                )
-            })
-            .collect();
-    }
-
+        .min(work.len())
+        .max(1);
     let cursor = AtomicUsize::new(0);
     let results: Mutex<Vec<(usize, Result<FileFacts>)>> =
         Mutex::new(Vec::with_capacity(work.len()));
-    std::thread::scope(|scope| {
-        for _ in 0..workers {
-            scope.spawn(|| {
-                loop {
-                    let next = cursor.fetch_add(1, Ordering::Relaxed);
-                    let Some(item) = work.get(next) else {
-                        break;
-                    };
-                    // `extract` performs its own deadline/cancellation check and
-                    // returns a typed error, which the caller treats as fatal.
-                    let outcome =
-                        extractor.extract(item.file, item.request_id, deadline, cancellation);
-                    results
-                        .lock()
-                        .expect("extraction result mutex poisoned")
-                        .push((item.index, outcome));
-                }
-            });
+    let registry: Arc<Mutex<Vec<Option<KillHandle>>>> = Arc::new(Mutex::new(vec![None; workers]));
+    let monitor = ExtractMonitor::new(Arc::clone(&registry));
+
+    thread::scope(|scope| {
+        // Dropping this guard (on normal return or an unwinding panic below) sets
+        // the monitor's shutdown flag before `thread::scope` joins the monitor.
+        let _stop = MonitorStop(&monitor);
+        scope.spawn(|| run_monitor(&monitor, deadline, cancellation));
+        let mut handles = Vec::with_capacity(workers);
+        for index in 0..workers {
+            let slot = WorkerSlot {
+                registry: Arc::clone(&registry),
+                index,
+            };
+            let cursor = &cursor;
+            let results = &results;
+            handles.push(scope.spawn(move || {
+                run_pool_thread(
+                    extractor,
+                    work,
+                    deadline,
+                    cancellation,
+                    slot,
+                    cursor,
+                    results,
+                );
+            }));
+        }
+        // The monitor keeps running (killing any stuck worker) until every pool
+        // thread has finished; only then does `_stop` drop and stop it.
+        for handle in handles {
+            let _ = handle.join();
         }
     });
 
     let mut results = results
         .into_inner()
-        .expect("extraction result mutex poisoned");
+        .unwrap_or_else(|error| error.into_inner());
     results.sort_by_key(|(index, _)| *index);
     results
+}
+
+/// One pool thread: lazily create a session (one persistent worker), then pull
+/// files off the shared cursor and extract each. A session that cannot even be
+/// created is a fatal infrastructure failure attributed to the claimed file.
+fn run_pool_thread<E: FactsExtractor>(
+    extractor: &E,
+    work: &[ExtractWorkItem<'_>],
+    deadline: &Deadline,
+    cancellation: &dyn Cancellation,
+    slot: WorkerSlot,
+    cursor: &AtomicUsize,
+    results: &Mutex<Vec<(usize, Result<FileFacts>)>>,
+) {
+    let mut session: Option<E::Session> = None;
+    loop {
+        let next = cursor.fetch_add(1, Ordering::Relaxed);
+        let Some(item) = work.get(next) else {
+            break;
+        };
+        if session.is_none() {
+            match extractor.session(slot.clone()) {
+                Ok(created) => session = Some(created),
+                Err(error) => {
+                    push_result(results, item.index, Err(error));
+                    continue;
+                }
+            }
+        }
+        let Some(active) = session.as_mut() else {
+            continue;
+        };
+        let outcome = active.extract(item.file, item.request_id, deadline, cancellation);
+        push_result(results, item.index, outcome);
+    }
+    // Clear the registry slot before dropping the worker so the monitor cannot
+    // target a worker whose process is being reaped.
+    slot.clear();
+    drop(session);
+}
+
+fn push_result(
+    results: &Mutex<Vec<(usize, Result<FileFacts>)>>,
+    index: usize,
+    outcome: Result<FileFacts>,
+) {
+    results
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .push((index, outcome));
+}
+
+/// Runs a single-file extraction under its own deadline monitor, so a hung
+/// worker cannot pin the caller. Used by revalidation, which re-extracts a few
+/// omitted files outside the main pool.
+pub(super) fn monitored_extract<E: FactsExtractor>(
+    extractor: &E,
+    file: &InventoryFile,
+    request_id: RequestId,
+    deadline: &Deadline,
+    cancellation: &dyn Cancellation,
+) -> Result<FileFacts> {
+    let registry: Arc<Mutex<Vec<Option<KillHandle>>>> = Arc::new(Mutex::new(vec![None]));
+    let monitor = ExtractMonitor::new(Arc::clone(&registry));
+    thread::scope(|scope| {
+        // Dropping this guard stops the monitor before `thread::scope` joins it,
+        // on the normal path and on an unwinding panic in `extract`.
+        let _stop = MonitorStop(&monitor);
+        scope.spawn(|| run_monitor(&monitor, deadline, cancellation));
+        let slot = WorkerSlot {
+            registry: Arc::clone(&registry),
+            index: 0,
+        };
+        (|| {
+            let mut session = extractor.session(slot.clone())?;
+            let facts = session.extract(file, request_id, deadline, cancellation);
+            slot.clear();
+            drop(session);
+            facts
+        })()
+    })
 }
 pub fn prepare_refresh_candidate(
     inputs: PrepareCandidateInputs<'_>,
@@ -154,8 +460,8 @@ pub fn prepare_refresh_candidate(
     let rules = load_query_binding_rules(&inputs.selection.canonical_root)?;
     prepare_refresh_candidate_with(&ProcessFactsExtractor::new(rules), inputs)
 }
-pub fn prepare_refresh_candidate_with(
-    extractor: &dyn FactsExtractor,
+pub fn prepare_refresh_candidate_with<E: FactsExtractor>(
+    extractor: &E,
     inputs: PrepareCandidateInputs<'_>,
 ) -> Result<PreparedRefreshCandidate> {
     retry_drift(inputs.deadline, inputs.cancellation, |attempt| {
@@ -190,8 +496,8 @@ impl From<CliError> for AttemptError {
     }
 }
 
-fn prepare(
-    extractor: &dyn FactsExtractor,
+fn prepare<E: FactsExtractor>(
+    extractor: &E,
     inputs: &PrepareCandidateInputs<'_>,
     attempts: u8,
 ) -> std::result::Result<PreparedRefreshCandidate, AttemptError> {
@@ -699,6 +1005,7 @@ pub(crate) fn apply_metadata_budgets(discovery: &mut SourceDiscovery, limits: &R
 mod tests {
     use std::cell::Cell;
     use std::fs;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
@@ -719,22 +1026,41 @@ mod tests {
     }
 
     struct FakeExtractor {
-        calls: AtomicUsize,
+        calls: Arc<AtomicUsize>,
         behavior: ExtractBehavior,
     }
 
     impl FakeExtractor {
         fn normal() -> Self {
+            Self::with_behavior(ExtractBehavior::Normal)
+        }
+
+        fn with_behavior(behavior: ExtractBehavior) -> Self {
             Self {
-                calls: AtomicUsize::new(0),
-                behavior: ExtractBehavior::Normal,
+                calls: Arc::new(AtomicUsize::new(0)),
+                behavior,
             }
         }
     }
 
+    struct FakeSession {
+        calls: Arc<AtomicUsize>,
+        behavior: ExtractBehavior,
+    }
+
     impl FactsExtractor for FakeExtractor {
+        type Session = FakeSession;
+        fn session(&self, _slot: WorkerSlot) -> Result<FakeSession> {
+            Ok(FakeSession {
+                calls: Arc::clone(&self.calls),
+                behavior: self.behavior,
+            })
+        }
+    }
+
+    impl ExtractSession for FakeSession {
         fn extract(
-            &self,
+            &mut self,
             file: &crate::inventory::InventoryFile,
             _request_id: RequestId,
             _deadline: &Deadline,
@@ -757,6 +1083,81 @@ mod tests {
                     Err(CliError::Worker(WorkerFailure::Protocol))
                 }
             }
+        }
+    }
+
+    /// A deterministic [`RecoverableWorker`] for driving the crash-recovery
+    /// policy without a real subprocess.
+    #[derive(Clone)]
+    enum CrashKind {
+        /// The worker dies (a fresh process every attempt) for this exact path,
+        /// and extracts every other file normally.
+        PoisonPath(String),
+        /// The worker dies on its first attempt, then succeeds after a respawn.
+        DieOnceThenRecover,
+    }
+
+    struct FakeRecoverableWorker {
+        behavior: CrashKind,
+        respawned: bool,
+        respawns: Arc<AtomicUsize>,
+    }
+
+    impl RecoverableWorker for FakeRecoverableWorker {
+        fn attempt(
+            &mut self,
+            file: &InventoryFile,
+            _request_id: RequestId,
+        ) -> std::result::Result<FileFacts, WorkerFailure> {
+            let dies = match &self.behavior {
+                CrashKind::PoisonPath(path) => file.path.as_str() == path,
+                CrashKind::DieOnceThenRecover => !self.respawned,
+            };
+            if dies {
+                return Err(WorkerFailure::Transport);
+            }
+            code2graph::extract_path(file.path.as_str(), &file.text)
+                .map_err(|_| WorkerFailure::Remote(WorkerErrorCode::Extraction))
+        }
+
+        fn respawn(&mut self) -> Result<()> {
+            self.respawned = true;
+            self.respawns.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    struct CrashExtractor {
+        behavior: CrashKind,
+        respawns: Arc<AtomicUsize>,
+    }
+
+    struct CrashSession {
+        worker: FakeRecoverableWorker,
+    }
+
+    impl FactsExtractor for CrashExtractor {
+        type Session = CrashSession;
+        fn session(&self, _slot: WorkerSlot) -> Result<CrashSession> {
+            Ok(CrashSession {
+                worker: FakeRecoverableWorker {
+                    behavior: self.behavior.clone(),
+                    respawned: false,
+                    respawns: Arc::clone(&self.respawns),
+                },
+            })
+        }
+    }
+
+    impl ExtractSession for CrashSession {
+        fn extract(
+            &mut self,
+            file: &InventoryFile,
+            request_id: RequestId,
+            deadline: &Deadline,
+            cancellation: &dyn Cancellation,
+        ) -> Result<FileFacts> {
+            extract_with_recovery(&mut self.worker, file, request_id, deadline, cancellation)
         }
     }
 
@@ -801,8 +1202,8 @@ mod tests {
         }
     }
 
-    fn prepare<'a>(
-        extractor: &dyn FactsExtractor,
+    fn prepare<'a, E: FactsExtractor>(
+        extractor: &E,
         selection: &'a ProjectSelection,
         limits: &'a ResourceLimits,
         options: PrepareTestOptions<'a>,
@@ -1074,10 +1475,7 @@ mod tests {
         assert_eq!(budgeted.snapshot.omissions.len(), 1);
         assert_eq!(budgeted.snapshot.omissions[0].reason, "file-count-limit");
 
-        let failure = FakeExtractor {
-            calls: AtomicUsize::new(0),
-            behavior: ExtractBehavior::RemoteExtractionError,
-        };
+        let failure = FakeExtractor::with_behavior(ExtractBehavior::RemoteExtractionError);
         let omitted = prepare(
             &failure,
             &selection,
@@ -1097,10 +1495,7 @@ mod tests {
                 .all(|o| o.reason == "extraction-error")
         );
 
-        let invalid = FakeExtractor {
-            calls: AtomicUsize::new(0),
-            behavior: ExtractBehavior::InvalidFacts,
-        };
+        let invalid = FakeExtractor::with_behavior(ExtractBehavior::InvalidFacts);
         let omitted = prepare(
             &invalid,
             &selection,
@@ -1120,10 +1515,7 @@ mod tests {
                 .all(|o| o.reason == "extraction-error")
         );
 
-        let infrastructure = FakeExtractor {
-            calls: AtomicUsize::new(0),
-            behavior: ExtractBehavior::InfrastructureError,
-        };
+        let infrastructure = FakeExtractor::with_behavior(ExtractBehavior::InfrastructureError);
         assert!(matches!(
             prepare(
                 &infrastructure,
@@ -1242,6 +1634,162 @@ mod tests {
             Err(CliError::Cancelled)
         ));
         assert_eq!(extractor.calls.load(Ordering::Relaxed), 0);
+    }
+
+    fn inventory_file(name: &str) -> crate::inventory::InventoryFile {
+        let bytes = b"fn helper() {}".to_vec();
+        crate::inventory::InventoryFile {
+            path: ProjectPath::new(std::path::Path::new(name)).unwrap(),
+            language: code2graph::Language::Rust,
+            text: String::from_utf8(bytes.clone()).unwrap(),
+            blake3: blake3::hash(&bytes).to_hex().to_string(),
+            bytes,
+            mtime: None,
+        }
+    }
+
+    #[test]
+    fn recovery_returns_facts_omits_poison_and_stays_fatal_on_deadline() {
+        // A healthy worker extracts without any respawn.
+        let respawns = Arc::new(AtomicUsize::new(0));
+        let mut healthy = FakeRecoverableWorker {
+            behavior: CrashKind::DieOnceThenRecover,
+            respawned: true,
+            respawns: Arc::clone(&respawns),
+        };
+        assert!(
+            extract_with_recovery(
+                &mut healthy,
+                &inventory_file("a.rs"),
+                1,
+                &Deadline::new(None),
+                &NeverCancelled,
+            )
+            .is_ok()
+        );
+        assert_eq!(respawns.load(Ordering::Relaxed), 0);
+
+        // A transient crash recovers after exactly one respawn.
+        let respawns = Arc::new(AtomicUsize::new(0));
+        let mut transient = FakeRecoverableWorker {
+            behavior: CrashKind::DieOnceThenRecover,
+            respawned: false,
+            respawns: Arc::clone(&respawns),
+        };
+        assert!(
+            extract_with_recovery(
+                &mut transient,
+                &inventory_file("a.rs"),
+                1,
+                &Deadline::new(None),
+                &NeverCancelled,
+            )
+            .is_ok()
+        );
+        assert_eq!(respawns.load(Ordering::Relaxed), 1);
+
+        // A file that crashes a second, fresh worker is poison: it degrades to an
+        // extraction omission and a fresh worker is spawned for the next file
+        // (retry respawn + poison respawn == 2).
+        let respawns = Arc::new(AtomicUsize::new(0));
+        let mut poison = FakeRecoverableWorker {
+            behavior: CrashKind::PoisonPath("a.rs".into()),
+            respawned: false,
+            respawns: Arc::clone(&respawns),
+        };
+        assert!(matches!(
+            extract_with_recovery(
+                &mut poison,
+                &inventory_file("a.rs"),
+                1,
+                &Deadline::new(None),
+                &NeverCancelled,
+            ),
+            Err(CliError::Worker(WorkerFailure::Remote(
+                WorkerErrorCode::Extraction
+            )))
+        ));
+        assert_eq!(respawns.load(Ordering::Relaxed), 2);
+
+        // An already-expired deadline is fatal, never a recoverable crash.
+        let respawns = Arc::new(AtomicUsize::new(0));
+        let mut expired = FakeRecoverableWorker {
+            behavior: CrashKind::PoisonPath("a.rs".into()),
+            respawned: false,
+            respawns: Arc::clone(&respawns),
+        };
+        assert!(matches!(
+            extract_with_recovery(
+                &mut expired,
+                &inventory_file("a.rs"),
+                1,
+                &Deadline::new(Some(Duration::ZERO)),
+                &NeverCancelled,
+            ),
+            Err(CliError::Timeout)
+        ));
+        assert_eq!(respawns.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn a_poison_file_omits_itself_while_other_files_still_extract() {
+        let (_temp, selection) = project(&[
+            ("good_one.rs", "fn good_one() {}\n"),
+            ("poison.rs", "fn poison() {}\n"),
+            ("good_two.rs", "fn good_two() {}\n"),
+        ]);
+        let extractor = CrashExtractor {
+            behavior: CrashKind::PoisonPath("poison.rs".into()),
+            respawns: Arc::new(AtomicUsize::new(0)),
+        };
+        let prepared = prepare(
+            &extractor,
+            &selection,
+            &ResourceLimits::default(),
+            PrepareTestOptions::default(),
+            &Deadline::new(None),
+            &NeverCancelled,
+        )
+        .expect("a single poison file must not abort the whole run");
+        let files: Vec<_> = prepared
+            .snapshot
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect();
+        assert_eq!(files, ["good_one.rs", "good_two.rs"]);
+        assert_eq!(prepared.snapshot.completeness, CacheCompleteness::Partial);
+        assert!(
+            prepared
+                .snapshot
+                .omissions
+                .iter()
+                .any(|omission| omission.path == "poison.rs"
+                    && omission.reason == "extraction-error")
+        );
+    }
+
+    #[test]
+    fn a_transient_crash_recovers_and_the_file_is_kept() {
+        let (_temp, selection) = project(&[("a.rs", "fn a() {}\n")]);
+        let respawns = Arc::new(AtomicUsize::new(0));
+        let extractor = CrashExtractor {
+            behavior: CrashKind::DieOnceThenRecover,
+            respawns: Arc::clone(&respawns),
+        };
+        let prepared = prepare(
+            &extractor,
+            &selection,
+            &ResourceLimits::default(),
+            PrepareTestOptions::default(),
+            &Deadline::new(None),
+            &NeverCancelled,
+        )
+        .expect("a transient crash must recover on retry");
+        assert_eq!(prepared.snapshot.completeness, CacheCompleteness::Complete);
+        assert_eq!(prepared.snapshot.files.len(), 1);
+        assert_eq!(prepared.snapshot.files[0].path, "a.rs");
+        assert_eq!(respawns.load(Ordering::Relaxed), 1);
     }
 
     // `prepare_refresh_candidate` (the production, non-`_with` entry point) is

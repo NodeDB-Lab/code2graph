@@ -45,11 +45,11 @@ pub use package_assignment::{
 };
 pub use project::{ProjectPath, ProjectSelection, SelectionProvenance, select_project};
 pub use refresh::{
-    ExtractionError, FactsExtractor, MAX_REFRESH_ATTEMPTS, PrepareCandidateInputs,
+    ExtractSession, ExtractionError, FactsExtractor, MAX_REFRESH_ATTEMPTS, PrepareCandidateInputs,
     PreparedRefreshCandidate, PriorFileRecord, PriorScopeState, ProcessFactsExtractor,
-    RefreshDecision, RefreshEntry, RefreshInputs, RefreshPlan, ResolveCandidateInputs,
-    ResolvedCandidate, prepare_refresh_candidate, prepare_refresh_candidate_with,
-    resolve_candidate,
+    ProcessSession, RefreshDecision, RefreshEntry, RefreshInputs, RefreshPlan,
+    ResolveCandidateInputs, ResolvedCandidate, WorkerSlot, prepare_refresh_candidate,
+    prepare_refresh_candidate_with, resolve_candidate,
 };
 pub use request::{CliRequest, CommandRequest, Selector, SourcePosition};
 pub use result::{

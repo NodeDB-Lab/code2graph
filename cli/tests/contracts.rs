@@ -750,3 +750,70 @@ fn same_binary_hidden_worker_succeeds_before_clap_and_stays_out_of_help() {
     let help = String::from_utf8(help.stdout).unwrap();
     assert!(!help.contains(WORKER_SENTINEL));
 }
+
+#[test]
+fn one_worker_process_services_many_requests_then_exits_cleanly_on_stdin_eof() {
+    // The pooled parent streams many files through one long-lived worker. Prove
+    // the real binary services several request frames on a single process and
+    // exits cleanly once its stdin closes.
+    let sources: &[(&str, &[u8])] = &[
+        ("src/a.rs", b"fn a() {}"),
+        ("src/b.rs", b"pub fn b() {}"),
+        ("src/c.rs", b"fn c() { a(); }"),
+    ];
+    let requests: Vec<WorkerRequest> = sources
+        .iter()
+        .enumerate()
+        .map(|(index, (path, source))| WorkerRequest {
+            version: PROTOCOL_VERSION,
+            kind: 1,
+            request_id: (index as u64) + 1,
+            path: (*path).into(),
+            language: 0,
+            source: source.to_vec(),
+            custom_rules: Vec::new(),
+        })
+        .collect();
+
+    let mut stream = Vec::new();
+    for request in &requests {
+        let payload = zerompk::to_msgpack_vec(request).unwrap();
+        stream.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_be_bytes());
+        stream.extend_from_slice(&payload);
+    }
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_code2graph"))
+        .arg(WORKER_SENTINEL)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Writing every frame then closing stdin lets the worker service each in
+    // turn and then observe EOF and exit.
+    child.stdin.take().unwrap().write_all(&stream).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+
+    // Walk the concatenated response frames back out, one per request, in order.
+    let mut cursor = 0usize;
+    for request in &requests {
+        let length =
+            u32::from_be_bytes(output.stdout[cursor..cursor + 4].try_into().unwrap()) as usize;
+        cursor += 4;
+        let response: WorkerResponse =
+            zerompk::from_msgpack(&output.stdout[cursor..cursor + length]).unwrap();
+        cursor += length;
+        assert!(
+            validate_response(&response, request).unwrap().is_ok(),
+            "worker failed request {}",
+            request.request_id
+        );
+    }
+    assert_eq!(
+        cursor,
+        output.stdout.len(),
+        "unexpected trailing worker output"
+    );
+}

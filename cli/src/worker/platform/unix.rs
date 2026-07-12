@@ -33,6 +33,25 @@ pub fn terminate(containment: &mut Containment, child: &mut Child) {
     let _ = child.kill();
 }
 
+/// A cheap, `Send` capability to terminate a contained worker's whole process
+/// group without owning its `Child`. Killing is idempotent: signalling a group
+/// that has already exited is a harmless no-op (`ESRCH`).
+#[derive(Clone, Copy)]
+pub struct KillHandle(libc::pid_t);
+
+impl KillHandle {
+    /// Requests immediate termination of the worker's process group.
+    pub fn kill(&self) {
+        // SAFETY: a negative pid addresses the worker's dedicated process group.
+        unsafe { libc::kill(-self.0, libc::SIGKILL) };
+    }
+}
+
+/// Derives a `Send` kill handle for a live containment's process group.
+pub fn kill_handle(containment: &Containment) -> KillHandle {
+    KillHandle(containment.0)
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

@@ -1,13 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Isolated one-shot extraction worker protocol and process boundary.
+//! Isolated extraction worker protocol and process boundary. A worker services
+//! one request per frame with full process isolation; the parent may run it
+//! one-shot ([`extract_inventory_file`]) or keep it alive across many files
+//! ([`PersistentWorker`]) to amortize the subprocess spawn.
 
 mod frame;
+mod persistent;
 mod platform;
 mod process;
 mod protocol;
 mod runtime;
 
+pub use persistent::PersistentWorker;
+pub use platform::KillHandle;
 pub use process::{WorkerFailure, extract_inventory_file};
 pub use protocol::{
     BindingWire, EntryPointWire, FfiExportWire, FileFactsWire, OccurrenceWire, PROTOCOL_VERSION,

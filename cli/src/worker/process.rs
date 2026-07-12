@@ -22,7 +22,7 @@ use super::protocol::{
     WorkerRequest, validate_response,
 };
 
-const STDERR_TAIL_MAX: usize = 64 * 1024;
+pub(super) const STDERR_TAIL_MAX: usize = 64 * 1024;
 
 /// Source-free failures at the worker process boundary.
 #[derive(Debug, thiserror::Error)]
@@ -196,7 +196,7 @@ fn extract_with_executable(
         .map_err(|remote| WorkerFailure::Remote(remote.code))
 }
 
-fn classify_response_error(error: WorkerProtocolError) -> WorkerFailure {
+pub(super) fn classify_response_error(error: WorkerProtocolError) -> WorkerFailure {
     match error {
         WorkerProtocolError::Facts(_) => WorkerFailure::Remote(WorkerErrorCode::Extraction),
         _ => WorkerFailure::Protocol,
@@ -224,7 +224,7 @@ fn drain_bounded<R: Read>(mut reader: R, max: usize) -> std::io::Result<Vec<u8>>
     }
 }
 
-fn drain_tail<R: Read>(mut reader: R, max: usize) -> std::io::Result<Vec<u8>> {
+pub(super) fn drain_tail<R: Read>(mut reader: R, max: usize) -> std::io::Result<Vec<u8>> {
     let mut tail = Vec::new();
     let mut buffer = [0_u8; 8192];
     loop {

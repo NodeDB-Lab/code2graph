@@ -8,6 +8,6 @@ mod unix;
 mod windows;
 
 #[cfg(unix)]
-pub use unix::{configure_command, contain, terminate};
+pub use unix::{Containment, KillHandle, configure_command, contain, kill_handle, terminate};
 #[cfg(windows)]
-pub use windows::{configure_command, contain, terminate};
+pub use windows::{Containment, KillHandle, configure_command, contain, kill_handle, terminate};

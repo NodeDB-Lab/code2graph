@@ -16,7 +16,7 @@ use crate::inventory::{
 use crate::package_assignment::{PackageDiagnosticKind, assign_packages_checked};
 use crate::{CliError, Result};
 
-use super::prepare::apply_metadata_budgets;
+use super::prepare::{apply_metadata_budgets, monitored_extract};
 use super::{
     FactsExtractor, MAX_REFRESH_ATTEMPTS, PrepareCandidateInputs, PreparedRefreshCandidate,
     ProcessFactsExtractor, prepare_refresh_candidate_with,
@@ -54,8 +54,8 @@ pub fn prepare_and_publish(
 
 /// Equivalent to [`prepare_and_publish`], with an injectable extractor for
 /// deterministic callers and unit tests.
-pub fn prepare_and_publish_with(
-    extractor: &dyn FactsExtractor,
+pub fn prepare_and_publish_with<E: FactsExtractor>(
+    extractor: &E,
     store: &CacheStore,
     inputs: PrepareCandidateInputs<'_>,
     allow_partial: bool,
@@ -76,8 +76,8 @@ trait PublicationHook {
 struct NoPublicationHook;
 impl PublicationHook for NoPublicationHook {}
 
-fn prepare_and_publish_inner(
-    extractor: &dyn FactsExtractor,
+fn prepare_and_publish_inner<E: FactsExtractor>(
+    extractor: &E,
     store: &CacheStore,
     inputs: PrepareCandidateInputs<'_>,
     allow_partial: bool,
@@ -127,8 +127,8 @@ fn prepare_and_publish_inner(
     ))
 }
 
-fn revalidate_candidate(
-    extractor: &dyn FactsExtractor,
+fn revalidate_candidate<E: FactsExtractor>(
+    extractor: &E,
     prepared: &PreparedRefreshCandidate,
     inputs: &PrepareCandidateInputs<'_>,
 ) -> Result<bool> {
@@ -216,7 +216,8 @@ fn revalidate_candidate(
         )? {
             MaterializedCandidate::Omitted(current) if cache_omission(&current) == *omission => {}
             MaterializedCandidate::File(file) if omission.reason == "extraction-error" => {
-                match extractor.extract(
+                match monitored_extract(
+                    extractor,
                     &file,
                     revalidation_request_id,
                     inputs.deadline,
@@ -314,8 +315,8 @@ fn cache_omission(omission: &crate::inventory::OmittedFile) -> CacheOmission {
 }
 
 #[cfg(test)]
-fn prepare_and_publish_with_hook(
-    extractor: &dyn FactsExtractor,
+fn prepare_and_publish_with_hook<E: FactsExtractor>(
+    extractor: &E,
     store: &CacheStore,
     inputs: PrepareCandidateInputs<'_>,
     allow_partial: bool,
@@ -333,6 +334,7 @@ mod tests {
 
     use tempfile::{TempDir, tempdir};
 
+    use super::super::{ExtractSession, WorkerSlot};
     use super::*;
     use crate::cache::{CacheError, CacheLocation};
     use crate::config::{ResolverTier, ResourceLimits};
@@ -342,8 +344,15 @@ mod tests {
 
     struct Extractor;
     impl FactsExtractor for Extractor {
+        type Session = ExtractorSession;
+        fn session(&self, _slot: WorkerSlot) -> Result<ExtractorSession> {
+            Ok(ExtractorSession)
+        }
+    }
+    struct ExtractorSession;
+    impl ExtractSession for ExtractorSession {
         fn extract(
-            &self,
+            &mut self,
             file: &crate::inventory::InventoryFile,
             _request_id: RequestId,
             _deadline: &Deadline,
@@ -493,8 +502,15 @@ mod tests {
 
     struct ContentSensitiveExtractor;
     impl FactsExtractor for ContentSensitiveExtractor {
+        type Session = ContentSensitiveSession;
+        fn session(&self, _slot: WorkerSlot) -> Result<ContentSensitiveSession> {
+            Ok(ContentSensitiveSession)
+        }
+    }
+    struct ContentSensitiveSession;
+    impl ExtractSession for ContentSensitiveSession {
         fn extract(
-            &self,
+            &mut self,
             file: &crate::inventory::InventoryFile,
             request_id: RequestId,
             deadline: &Deadline,
@@ -505,7 +521,7 @@ mod tests {
                     crate::worker::WorkerErrorCode::Extraction,
                 )))
             } else {
-                Extractor.extract(file, request_id, deadline, cancellation)
+                ExtractorSession.extract(file, request_id, deadline, cancellation)
             }
         }
     }
@@ -661,18 +677,29 @@ mod tests {
     }
 
     struct CountingExtractor {
-        calls: AtomicU8,
+        calls: std::sync::Arc<AtomicU8>,
     }
     impl FactsExtractor for CountingExtractor {
+        type Session = CountingSession;
+        fn session(&self, _slot: WorkerSlot) -> Result<CountingSession> {
+            Ok(CountingSession {
+                calls: std::sync::Arc::clone(&self.calls),
+            })
+        }
+    }
+    struct CountingSession {
+        calls: std::sync::Arc<AtomicU8>,
+    }
+    impl ExtractSession for CountingSession {
         fn extract(
-            &self,
+            &mut self,
             file: &crate::inventory::InventoryFile,
             request_id: RequestId,
             deadline: &Deadline,
             cancellation: &dyn Cancellation,
         ) -> Result<code2graph::FileFacts> {
             self.calls.fetch_add(1, Ordering::Relaxed);
-            Extractor.extract(file, request_id, deadline, cancellation)
+            ExtractorSession.extract(file, request_id, deadline, cancellation)
         }
     }
 
@@ -682,7 +709,7 @@ mod tests {
         let limits = ResourceLimits::default();
         let deadline = Deadline::new(None);
         let extractor = CountingExtractor {
-            calls: AtomicU8::new(0),
+            calls: std::sync::Arc::new(AtomicU8::new(0)),
         };
         let hook = DriftEveryTime {
             path: selection.canonical_root.join("a.rs"),

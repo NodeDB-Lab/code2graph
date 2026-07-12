@@ -9,7 +9,7 @@ use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-    SetInformationJobObject,
+    SetInformationJobObject, TerminateJobObject,
 };
 
 pub struct Containment(HANDLE);
@@ -69,6 +69,35 @@ pub fn terminate(containment: &mut Containment, child: &mut Child) {
         containment.0 = std::ptr::null_mut();
     }
     let _ = child.kill();
+}
+
+/// A cheap, `Send` capability to terminate a contained worker's whole Job Object
+/// (every assigned process) without owning its `Child`. Unlike [`terminate`],
+/// this does not close the handle, so the owning [`Containment`] remains the sole
+/// owner and closes it exactly once on drop.
+#[derive(Clone, Copy)]
+pub struct KillHandle(HANDLE);
+
+// SAFETY: the wrapped handle is a Job Object handle owned by a live `Containment`.
+// Callers remove a `KillHandle` from any shared registry, under the registry's
+// lock, before the owning `Containment` (and its handle) is dropped — so
+// `TerminateJobObject` is never issued against a closed handle from another
+// thread.
+unsafe impl Send for KillHandle {}
+
+impl KillHandle {
+    /// Requests immediate termination of every process still in the worker's job.
+    pub fn kill(&self) {
+        if !self.0.is_null() {
+            // SAFETY: terminates every process still assigned to the live job.
+            unsafe { TerminateJobObject(self.0, 1) };
+        }
+    }
+}
+
+/// Derives a `Send` kill handle for a live containment's Job Object.
+pub fn kill_handle(containment: &Containment) -> KillHandle {
+    KillHandle(containment.0)
 }
 
 #[cfg(test)]
