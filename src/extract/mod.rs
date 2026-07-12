@@ -9,6 +9,7 @@
 //!
 //! [`FileFacts`]: crate::graph::FileFacts
 
+pub mod binding;
 mod dispatch;
 #[cfg(feature = "_extractors")]
 mod support;
@@ -60,6 +61,7 @@ pub mod swift;
 #[cfg(feature = "typescript")]
 pub mod typescript;
 
+pub use binding::{BindingRules, QueryBindingRule};
 pub use dispatch::{Extractor, extract_file, extract_path};
 
 #[cfg(feature = "c")]
