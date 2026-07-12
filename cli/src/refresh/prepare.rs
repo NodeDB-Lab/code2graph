@@ -44,7 +44,7 @@ pub struct PreparedRefreshCandidate {
     pub ignored_omissions: Vec<CacheOmission>,
     pub attempts: u8,
 }
-pub trait FactsExtractor {
+pub trait FactsExtractor: Sync {
     fn extract(
         &self,
         file: &crate::inventory::InventoryFile,
@@ -64,6 +64,78 @@ impl FactsExtractor for ProcessFactsExtractor {
     ) -> Result<FileFacts> {
         extract_inventory_file(file, request_id, deadline, cancellation)
     }
+}
+
+/// One file to extract: its plan-entry index (for order-preserving merge), the
+/// materialized source, and its pre-assigned worker request id.
+struct ExtractWorkItem<'a> {
+    index: usize,
+    file: &'a crate::inventory::InventoryFile,
+    request_id: RequestId,
+}
+
+/// Run the per-file extractions concurrently across a bounded thread pool
+/// (`available_parallelism`, capped by the work count). Each extraction is an
+/// independent, isolated worker subprocess, so they compose without shared state.
+/// Results are returned keyed by plan-entry index; the caller merges them in that
+/// order, keeping the outcome identical to a serial run.
+fn parallel_extract(
+    extractor: &dyn FactsExtractor,
+    work: &[ExtractWorkItem<'_>],
+    deadline: &Deadline,
+    cancellation: &dyn Cancellation,
+) -> Vec<(usize, Result<FileFacts>)> {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    if work.is_empty() {
+        return Vec::new();
+    }
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(work.len());
+    // Single-threaded fallback avoids all threading overhead for tiny inputs.
+    if workers <= 1 {
+        return work
+            .iter()
+            .map(|item| {
+                (
+                    item.index,
+                    extractor.extract(item.file, item.request_id, deadline, cancellation),
+                )
+            })
+            .collect();
+    }
+
+    let cursor = AtomicUsize::new(0);
+    let results: Mutex<Vec<(usize, Result<FileFacts>)>> = Mutex::new(Vec::with_capacity(work.len()));
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                loop {
+                    let next = cursor.fetch_add(1, Ordering::Relaxed);
+                    let Some(item) = work.get(next) else {
+                        break;
+                    };
+                    // `extract` performs its own deadline/cancellation check and
+                    // returns a typed error, which the caller treats as fatal.
+                    let outcome =
+                        extractor.extract(item.file, item.request_id, deadline, cancellation);
+                    results
+                        .lock()
+                        .expect("extraction result mutex poisoned")
+                        .push((item.index, outcome));
+                }
+            });
+        }
+    });
+
+    let mut results = results
+        .into_inner()
+        .expect("extraction result mutex poisoned");
+    results.sort_by_key(|(index, _)| *index);
+    results
 }
 pub fn prepare_refresh_candidate(
     inputs: PrepareCandidateInputs<'_>,
@@ -216,8 +288,14 @@ fn prepare(
     }
     let mut facts = BTreeMap::new();
     let mut changed = BTreeSet::new();
+
+    // Pass 1 (sequential): apply the cheap `ReuseFacts` decisions in place and
+    // gather the `Extract` decisions — each a fresh worker subprocess — into a
+    // work list. Request ids are assigned here, in plan order, so the outcome is
+    // independent of the concurrent execution order below.
+    let mut extract_work: Vec<ExtractWorkItem<'_>> = Vec::new();
     let mut request_id: RequestId = 1;
-    for entry in &mut plan.entries {
+    for (index, entry) in plan.entries.iter().enumerate() {
         inputs.deadline.check(inputs.cancellation)?;
         match entry.decision {
             RefreshDecision::ReuseFacts => {
@@ -235,40 +313,53 @@ fn prepare(
                 let file = materialized.get(&entry.path).ok_or_else(|| {
                     CliError::Index("extract action lacks materialized source".into())
                 })?;
-                match extractor.extract(file, request_id, inputs.deadline, inputs.cancellation) {
-                    Ok(mut value) => {
-                        packages.enrich_file_facts(&mut value);
-                        if validate_file_facts(std::slice::from_ref(&value)).is_err() {
-                            let omission = OmittedFile::new(
-                                entry.path.clone(),
-                                OmissionReason::ExtractionError,
-                            );
-                            entry.decision = RefreshDecision::Omit {
-                                reason: omission.reason.clone(),
-                                impact: omission.impact,
-                            };
-                            extra_omissions.push(omission);
-                        } else {
-                            facts.insert(entry.path.clone(), value);
-                            changed.insert(entry.path.as_str().to_owned());
-                        }
-                    }
-                    Err(CliError::Worker(WorkerFailure::Remote(WorkerErrorCode::Extraction))) => {
-                        let omission =
-                            OmittedFile::new(entry.path.clone(), OmissionReason::ExtractionError);
-                        entry.decision = RefreshDecision::Omit {
-                            reason: omission.reason.clone(),
-                            impact: omission.impact,
-                        };
-                        extra_omissions.push(omission);
-                    }
-                    Err(error) => return Err(AttemptError::Fatal(error)),
-                }
+                extract_work.push(ExtractWorkItem {
+                    index,
+                    file,
+                    request_id,
+                });
                 request_id = request_id
                     .checked_add(1)
                     .ok_or_else(|| CliError::Index("worker request id exhausted".into()))?;
             }
             _ => {}
+        }
+    }
+
+    // Pass 2 (parallel): run the independent per-file extractions across a bounded
+    // pool. Results come back keyed by plan index and are merged in that order, so
+    // `facts`, `changed`, and `extra_omissions` are identical to a serial run.
+    let extracted =
+        parallel_extract(extractor, &extract_work, inputs.deadline, inputs.cancellation);
+
+    // Pass 3 (sequential, in plan order): apply each extraction outcome.
+    for (index, result) in extracted {
+        inputs.deadline.check(inputs.cancellation)?;
+        let path = plan.entries[index].path.clone();
+        match result {
+            Ok(mut value) => {
+                packages.enrich_file_facts(&mut value);
+                if validate_file_facts(std::slice::from_ref(&value)).is_err() {
+                    let omission = OmittedFile::new(path, OmissionReason::ExtractionError);
+                    plan.entries[index].decision = RefreshDecision::Omit {
+                        reason: omission.reason.clone(),
+                        impact: omission.impact,
+                    };
+                    extra_omissions.push(omission);
+                } else {
+                    changed.insert(path.as_str().to_owned());
+                    facts.insert(path, value);
+                }
+            }
+            Err(CliError::Worker(WorkerFailure::Remote(WorkerErrorCode::Extraction))) => {
+                let omission = OmittedFile::new(path, OmissionReason::ExtractionError);
+                plan.entries[index].decision = RefreshDecision::Omit {
+                    reason: omission.reason.clone(),
+                    impact: omission.impact,
+                };
+                extra_omissions.push(omission);
+            }
+            Err(error) => return Err(AttemptError::Fatal(error)),
         }
     }
     finish(
@@ -592,6 +683,7 @@ pub(crate) fn apply_metadata_budgets(discovery: &mut SourceDiscovery, limits: &R
 mod tests {
     use std::cell::Cell;
     use std::fs;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use code2graph::{Resolver, ScopeGraphResolver};
@@ -611,14 +703,14 @@ mod tests {
     }
 
     struct FakeExtractor {
-        calls: Cell<usize>,
+        calls: AtomicUsize,
         behavior: ExtractBehavior,
     }
 
     impl FakeExtractor {
         fn normal() -> Self {
             Self {
-                calls: Cell::new(0),
+                calls: AtomicUsize::new(0),
                 behavior: ExtractBehavior::Normal,
             }
         }
@@ -632,7 +724,7 @@ mod tests {
             _deadline: &Deadline,
             _cancellation: &dyn Cancellation,
         ) -> Result<FileFacts> {
-            self.calls.set(self.calls.get() + 1);
+            self.calls.fetch_add(1, Ordering::Relaxed);
             match self.behavior {
                 ExtractBehavior::Normal => code2graph::extract_path(file.path.as_str(), &file.text)
                     .map_err(|error| CliError::Index(error.to_string())),
@@ -734,7 +826,7 @@ mod tests {
             &NeverCancelled,
         )
         .expect("prepare");
-        assert_eq!(extractor.calls.get(), 1);
+        assert_eq!(extractor.calls.load(Ordering::Relaxed), 1);
         assert_eq!(prepared.snapshot.created_at_ns, 42);
         assert_eq!(prepared.snapshot.compatibility.created_at_ns, 42);
         assert_eq!(prepared.snapshot.inventory_file_count, 1);
@@ -789,7 +881,7 @@ mod tests {
             &NeverCancelled,
         )
         .expect("hash reuse");
-        assert_eq!(default_extractor.calls.get(), 0);
+        assert_eq!(default_extractor.calls.load(Ordering::Relaxed), 0);
         assert!(matches!(
             default.plan.entries[0].decision,
             RefreshDecision::ReuseFacts
@@ -809,7 +901,7 @@ mod tests {
             &NeverCancelled,
         )
         .expect("mtime reuse");
-        assert_eq!(trust_extractor.calls.get(), 0);
+        assert_eq!(trust_extractor.calls.load(Ordering::Relaxed), 0);
 
         let force_extractor = FakeExtractor::normal();
         prepare(
@@ -826,7 +918,7 @@ mod tests {
             &NeverCancelled,
         )
         .expect("forced extraction");
-        assert_eq!(force_extractor.calls.get(), 1);
+        assert_eq!(force_extractor.calls.load(Ordering::Relaxed), 1);
     }
 
     fn loaded(snapshot: CandidateSnapshot) -> LoadedSnapshot {
@@ -878,7 +970,7 @@ mod tests {
             &NeverCancelled,
         )
         .expect("incompatible refresh");
-        assert_eq!(extractor.calls.get(), 1);
+        assert_eq!(extractor.calls.load(Ordering::Relaxed), 1);
         assert_eq!(prepared.changed_paths, ["a.rs"]);
         assert!(prepared.deleted_paths.is_empty());
     }
@@ -967,7 +1059,7 @@ mod tests {
         assert_eq!(budgeted.snapshot.omissions[0].reason, "file-count-limit");
 
         let failure = FakeExtractor {
-            calls: Cell::new(0),
+            calls: AtomicUsize::new(0),
             behavior: ExtractBehavior::RemoteExtractionError,
         };
         let omitted = prepare(
@@ -990,7 +1082,7 @@ mod tests {
         );
 
         let invalid = FakeExtractor {
-            calls: Cell::new(0),
+            calls: AtomicUsize::new(0),
             behavior: ExtractBehavior::InvalidFacts,
         };
         let omitted = prepare(
@@ -1013,7 +1105,7 @@ mod tests {
         );
 
         let infrastructure = FakeExtractor {
-            calls: Cell::new(0),
+            calls: AtomicUsize::new(0),
             behavior: ExtractBehavior::InfrastructureError,
         };
         assert!(matches!(
@@ -1133,6 +1225,6 @@ mod tests {
             ),
             Err(CliError::Cancelled)
         ));
-        assert_eq!(extractor.calls.get(), 0);
+        assert_eq!(extractor.calls.load(Ordering::Relaxed), 0);
     }
 }

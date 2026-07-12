@@ -321,7 +321,7 @@ fn prepare_and_publish_with_hook(
 mod tests {
     use std::cell::Cell;
     use std::fs;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
     use std::time::Duration;
 
     use tempfile::{TempDir, tempdir};
@@ -654,7 +654,7 @@ mod tests {
     }
 
     struct CountingExtractor {
-        calls: Cell<u8>,
+        calls: AtomicU8,
     }
     impl FactsExtractor for CountingExtractor {
         fn extract(
@@ -664,7 +664,7 @@ mod tests {
             deadline: &Deadline,
             cancellation: &dyn Cancellation,
         ) -> Result<code2graph::FileFacts> {
-            self.calls.set(self.calls.get().saturating_add(1));
+            self.calls.fetch_add(1, Ordering::Relaxed);
             Extractor.extract(file, request_id, deadline, cancellation)
         }
     }
@@ -675,7 +675,7 @@ mod tests {
         let limits = ResourceLimits::default();
         let deadline = Deadline::new(None);
         let extractor = CountingExtractor {
-            calls: Cell::new(0),
+            calls: AtomicU8::new(0),
         };
         let hook = DriftEveryTime {
             path: selection.canonical_root.join("a.rs"),
@@ -693,7 +693,7 @@ mod tests {
             Err(CliError::Index(message)) if message.contains("continued to drift")
         ));
         assert_eq!(hook.generation.get(), MAX_REFRESH_ATTEMPTS);
-        assert_eq!(extractor.calls.get(), MAX_REFRESH_ATTEMPTS);
+        assert_eq!(extractor.calls.load(Ordering::Relaxed), MAX_REFRESH_ATTEMPTS);
     }
 
     #[test]
