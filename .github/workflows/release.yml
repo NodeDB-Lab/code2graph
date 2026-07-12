@@ -67,10 +67,15 @@ jobs:
           PUBLISH_PYPI: ${{ inputs.pypi }}
           PUBLISH_NPM: ${{ inputs.npm }}
           PUBLISH_GITHUB: ${{ inputs.github }}
+          IS_PRERELEASE: ${{ needs.validate.outputs.is_prerelease }}
         run: |
           set -euo pipefail
           [[ "$RUN" =~ ^[0-9]+$ ]] || { echo "invalid prepare run ID" >&2; exit 1; }
           [[ "$PUBLISH_CRATES$PUBLISH_PYPI$PUBLISH_NPM$PUBLISH_GITHUB" == *true* ]] || { echo "enable at least one distribution target" >&2; exit 1; }
+          if [[ "$IS_PRERELEASE" = true && "$PUBLISH_CRATES$PUBLISH_PYPI$PUBLISH_NPM" != *true* ]]; then
+            echo "GitHub Releases are created only for stable versions; enable a registry target" >&2
+            exit 1
+          fi
           RUN_JSON="$(gh api "/repos/$GITHUB_REPOSITORY/actions/runs/$RUN")"
           test "$(jq -r .event <<<"$RUN_JSON")" = push
           test "$(jq -r .conclusion <<<"$RUN_JSON")" = success
@@ -274,9 +279,8 @@ jobs:
           publish "${roots[0]}"
   github-release:
     needs: [validate, provenance]
-    if: inputs.github
+    if: inputs.github && needs.validate.outputs.is_prerelease != 'true'
     runs-on: ubuntu-latest
-    environment: github
     permissions:
       contents: write
       actions: read
@@ -290,40 +294,38 @@ jobs:
           run-id: ${{ inputs.prepare_run_id }}
           github-token: ${{ github.token }}
           path: bundle
-      - name: Create or update exact GitHub release
+      - name: Verify exact GitHub release input set
+        id: release-files
         shell: bash
-        env:
-          # Organization policy may cap GITHUB_TOKEN at read-only even when this
-          # job requests contents: write. A fine-grained token scoped to this
-          # repository provides the protected-environment fallback.
-          GH_TOKEN: ${{ secrets.GH_RELEASE_TOKEN || github.token }}
-          TAG: ${{ inputs.tag }}
-          VERSION: ${{ needs.validate.outputs.version }}
-          PRERELEASE: ${{ needs.validate.outputs.is_prerelease }}
-          SHA: ${{ needs.validate.outputs.source_sha }}
         run: |
           set -euo pipefail
           mapfile -t files < <(find bundle -type f | sort)
           test "${#files[@]}" -eq 16
-          prerelease_flag=()
-          test "$PRERELEASE" = true && prerelease_flag=(--prerelease)
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            edit_flags=(--title "code2graph $VERSION" --target "$SHA" "--prerelease=$PRERELEASE")
-            test "$PRERELEASE" = false && edit_flags+=(--latest)
-            gh release edit "$TAG" "${edit_flags[@]}"
-          else
-            gh release create "$TAG" "${files[@]}" --verify-tag --target "$SHA" --title "code2graph $VERSION" --generate-notes "${prerelease_flag[@]}"
-          fi
-          mapfile -t expected < <(printf '%s\n' "${files[@]##*/}" | sort)
-          while IFS=$'\t' read -r id name; do
-            if ! printf '%s\n' "${expected[@]}" | grep -Fxq "$name"; then
-              gh api --method DELETE "/repos/$GITHUB_REPOSITORY/releases/assets/$id"
-            fi
-          done < <(gh api "/repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq '.assets[] | [.id,.name] | @tsv')
-          gh release upload "$TAG" "${files[@]}" --clobber
+      # It consumes the job-scoped contents:write GITHUB_TOKEN directly.
+      - name: Create or update GitHub release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ inputs.tag }}
+          name: code2graph ${{ needs.validate.outputs.version }}
+          target_commitish: ${{ needs.validate.outputs.source_sha }}
+          generate_release_notes: true
+          prerelease: false
+          make_latest: true
+          files: bundle/**
+          fail_on_unmatched_files: true
+          overwrite_files: true
+      - name: Verify exact GitHub release output
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          SHA: ${{ needs.validate.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          mapfile -t expected < <(find bundle -type f -printf '%f\n' | sort)
           release_json="$(gh api "/repos/$GITHUB_REPOSITORY/releases/tags/$TAG")"
           test "$(jq -r .tag_name <<<"$release_json")" = "$TAG"
           test "$(jq -r .target_commitish <<<"$release_json")" = "$SHA"
-          test "$(jq -r .prerelease <<<"$release_json")" = "$PRERELEASE"
+          test "$(jq -r .prerelease <<<"$release_json")" = false
           mapfile -t actual < <(jq -r '.assets[].name' <<<"$release_json" | sort)
           test "${actual[*]}" = "${expected[*]}" || { echo "GitHub release attachment set mismatch" >&2; exit 1; }
