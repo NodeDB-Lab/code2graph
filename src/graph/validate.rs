@@ -2,6 +2,8 @@
 
 //! Structural validation for untrusted [`FileFacts`](super::FileFacts).
 
+use std::collections::HashSet;
+
 use super::{BindingTarget, ByteSpan, FileFacts};
 use crate::error::{CodegraphError, Result};
 use crate::lang::Language;
@@ -106,11 +108,11 @@ pub fn validate_file_facts_with_context(
         if reference.qualifier.is_some()
             && !matches!(
                 reference.role,
-                super::RefRole::Call | super::RefRole::TypeRef
+                super::RefRole::Call | super::RefRole::TypeRef | super::RefRole::IsImplementation
             )
         {
             return Err(malformed(format!(
-                "reference {index} has qualifier outside call or type-ref role"
+                "reference {index} has qualifier outside call, type-ref, or implementation role"
             )));
         }
         if let Some(scope) = reference.scope {
@@ -189,6 +191,15 @@ fn validate_structure(file: &FileFacts) -> Result<()> {
         file: file.file.clone(),
         reason,
     };
+    let mut symbol_ids = HashSet::with_capacity(file.symbols.len());
+    for (index, symbol) in file.symbols.iter().enumerate() {
+        if !symbol_ids.insert(&symbol.id) {
+            return Err(malformed(format!(
+                "symbol {index} duplicates structural identity `{}`",
+                symbol.id
+            )));
+        }
+    }
     for (index, scope) in file.scopes.iter().enumerate() {
         if let Some(parent) = scope.parent {
             if parent >= file.scopes.len() {
@@ -428,6 +439,16 @@ mod tests {
     }
 
     #[test]
+    fn structure_rejects_duplicate_symbol_identities() {
+        let mut value = facts();
+        value.symbols.push(value.symbols[0].clone());
+        assert_malformed(
+            validate_file_facts(std::slice::from_ref(&value)),
+            "symbol 1 duplicates structural identity `codegraph . . . run.`",
+        );
+    }
+
+    #[test]
     fn context_enforces_half_open_scope_relationships() {
         let mut value = facts();
         value.references[0].occ.byte = 4;
@@ -484,7 +505,7 @@ mod tests {
         value.references[0].qualifier = Some("module".into());
         assert_malformed(
             validate_file_facts_with_context(&value, context()),
-            "reference 0 has qualifier outside call or type-ref role",
+            "reference 0 has qualifier outside call, type-ref, or implementation role",
         );
 
         let mut value = facts();

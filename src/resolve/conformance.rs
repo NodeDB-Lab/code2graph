@@ -105,19 +105,26 @@ impl Resolver for ConformanceResolver {
         // ── 3. type name → [supertype bare names] (insertion order preserved) ─
         let mut supertypes: HashMap<String, Vec<String>> = HashMap::new();
         for f in files.iter().copied() {
-            let file_syms = by_file.get(f.file.as_str());
             for r in &f.references {
                 if r.role != RefRole::IsImplementation {
                     continue;
                 }
-                // The implementing type is the symbol enclosing this ref.
-                let Some(from_idx) =
-                    file_syms.and_then(|idxs| enclosing_symbol_index(&symbols, idxs, r.occ.byte))
-                else {
-                    continue;
-                };
-                let Some(impl_type) = symbols[from_idx].id.leaf_name().map(|s| s.to_owned()) else {
-                    continue;
+                // Relationship references may carry their written subject
+                // explicitly. Extractors whose class/type symbol encloses the
+                // relationship retain span attribution as a compatibility path.
+                let impl_type = if let Some(subject) = r.qualifier.as_deref() {
+                    subject.to_owned()
+                } else {
+                    let file_syms = by_file.get(f.file.as_str());
+                    let Some(from_idx) = file_syms
+                        .and_then(|idxs| enclosing_symbol_index(&symbols, idxs, r.occ.byte))
+                    else {
+                        continue;
+                    };
+                    let Some(subject) = symbols[from_idx].id.leaf_name() else {
+                        continue;
+                    };
+                    subject.to_owned()
                 };
                 supertypes
                     .entry(impl_type)
@@ -446,11 +453,10 @@ mod tests {
     ///
     /// Static-reasoning check:
     /// - `src/greet.rs`  → symbols: `Greet` (Trait) + `Greet#hello().` (Method)
-    /// - `src/person.rs` → symbols: `Person` (Struct) + `Person` (Impl); references:
-    ///   `IsImplementation("Greet")` inside the impl span.
-    ///   `enclosing_symbol_index` picks the smallest span containing the `Greet`
-    ///   node byte; the impl block (`Person` Impl) is smaller than the file root,
-    ///   so `impl_type` = `"Person"` → `supertypes["Person"] = ["Greet"]`.
+    /// - `src/person.rs` → symbol: `Person` (Struct); reference:
+    ///   `IsImplementation("Greet")` with `qualifier=Some("Person")`.
+    ///   The explicit relationship subject yields
+    ///   `supertypes["Person"] = ["Greet"]` without minting an impl symbol.
     /// - `src/main.rs`   → Call ref `name="hello"`, `qualifier=Some("Person")`
     ///   `type_name = "Person"`, no direct `hello` member, ancestor `"Greet"` has
     ///   `hello` → conformance emits `Call` edge to `Greet#hello().`,

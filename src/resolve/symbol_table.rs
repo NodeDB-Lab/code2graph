@@ -71,11 +71,35 @@ impl Resolver for SymbolTableResolver {
         for f in files.iter().copied() {
             let file_syms = by_file.get(f.file.as_str());
             for r in &f.references {
-                // The caller: innermost symbol in this file whose span holds the ref.
-                let Some(from_idx) =
-                    file_syms.and_then(|idxs| enclosing_symbol_index(&symbols, idxs, r.occ.byte))
-                else {
-                    continue; // reference not inside any extracted symbol — unattributable
+                // Relationship references name their subject explicitly because
+                // identity-less containers (such as Rust impl blocks) are not
+                // symbols. Ordinary references retain span-based caller attribution.
+                let explicit_subject = r
+                    .qualifier
+                    .as_deref()
+                    .filter(|_| r.role == RefRole::IsImplementation)
+                    .and_then(|subject| type_by_name.get(subject))
+                    .and_then(|candidates| {
+                        let local: Vec<_> = candidates
+                            .iter()
+                            .copied()
+                            .filter(|&index| symbols[index].file == f.file)
+                            .collect();
+                        match local.as_slice() {
+                            [candidate] => Some(*candidate),
+                            [] if candidates.len() == 1 => candidates.first().copied(),
+                            _ => None,
+                        }
+                    });
+                let from_idx = if let Some(candidate) = explicit_subject {
+                    candidate
+                } else {
+                    let Some(candidate) = file_syms
+                        .and_then(|idxs| enclosing_symbol_index(&symbols, idxs, r.occ.byte))
+                    else {
+                        continue; // reference not inside any extracted symbol — unattributable
+                    };
+                    candidate
                 };
 
                 let targets = match r.role {
@@ -293,6 +317,30 @@ mod tests {
         );
         assert_eq!(e.confidence, Confidence::Scoped);
         assert_eq!(e.occ.file, "src/p.rs");
+    }
+
+    #[cfg(feature = "rust")]
+    #[test]
+    fn rust_trait_impl_subject_prefers_the_definition_in_its_file() {
+        let trait_facts = RustExtractor
+            .extract("pub trait Draw {}", "src/draw.rs")
+            .unwrap();
+        let implemented = RustExtractor
+            .extract("pub struct Point; impl Draw for Point {}", "src/a.rs")
+            .unwrap();
+        let same_named = RustExtractor
+            .extract("pub struct Point;", "src/b.rs")
+            .unwrap();
+
+        let graph = SymbolTableResolver
+            .resolve(&[trait_facts, implemented, same_named])
+            .unwrap();
+        let implementation = graph
+            .edges
+            .iter()
+            .find(|edge| edge.role == RefRole::IsImplementation)
+            .expect("implementation edge");
+        assert!(implementation.from.to_scip_string().ends_with("a/Point#"));
     }
 
     #[cfg(feature = "python")]

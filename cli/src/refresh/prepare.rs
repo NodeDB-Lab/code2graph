@@ -21,7 +21,7 @@ use crate::package_assignment::assign_packages_checked;
 use crate::project::{ProjectPath, ProjectSelection};
 use crate::worker::{RequestId, WorkerErrorCode, WorkerFailure, extract_inventory_file};
 use crate::{CliError, Result};
-use code2graph::FileFacts;
+use code2graph::{FileFacts, validate_file_facts};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub struct PrepareCandidateInputs<'a> {
@@ -238,8 +238,20 @@ fn prepare(
                 match extractor.extract(file, request_id, inputs.deadline, inputs.cancellation) {
                     Ok(mut value) => {
                         packages.enrich_file_facts(&mut value);
-                        facts.insert(entry.path.clone(), value);
-                        changed.insert(entry.path.as_str().to_owned());
+                        if validate_file_facts(std::slice::from_ref(&value)).is_err() {
+                            let omission = OmittedFile::new(
+                                entry.path.clone(),
+                                OmissionReason::ExtractionError,
+                            );
+                            entry.decision = RefreshDecision::Omit {
+                                reason: omission.reason.clone(),
+                                impact: omission.impact,
+                            };
+                            extra_omissions.push(omission);
+                        } else {
+                            facts.insert(entry.path.clone(), value);
+                            changed.insert(entry.path.as_str().to_owned());
+                        }
                     }
                     Err(CliError::Worker(WorkerFailure::Remote(WorkerErrorCode::Extraction))) => {
                         let omission =
@@ -593,6 +605,7 @@ mod tests {
     #[derive(Clone, Copy)]
     enum ExtractBehavior {
         Normal,
+        InvalidFacts,
         RemoteExtractionError,
         InfrastructureError,
     }
@@ -623,6 +636,12 @@ mod tests {
             match self.behavior {
                 ExtractBehavior::Normal => code2graph::extract_path(file.path.as_str(), &file.text)
                     .map_err(|error| CliError::Index(error.to_string())),
+                ExtractBehavior::InvalidFacts => {
+                    let mut facts = code2graph::extract_path(file.path.as_str(), &file.text)
+                        .map_err(|error| CliError::Index(error.to_string()))?;
+                    facts.symbols.push(facts.symbols[0].clone());
+                    Ok(facts)
+                }
                 ExtractBehavior::RemoteExtractionError => Err(CliError::Worker(
                     WorkerFailure::Remote(WorkerErrorCode::Extraction),
                 )),
@@ -960,6 +979,29 @@ mod tests {
             &NeverCancelled,
         )
         .expect("remote extraction omission");
+        assert!(omitted.snapshot.files.is_empty());
+        assert_eq!(omitted.snapshot.completeness, CacheCompleteness::Partial);
+        assert!(
+            omitted
+                .snapshot
+                .omissions
+                .iter()
+                .all(|o| o.reason == "extraction-error")
+        );
+
+        let invalid = FakeExtractor {
+            calls: Cell::new(0),
+            behavior: ExtractBehavior::InvalidFacts,
+        };
+        let omitted = prepare(
+            &invalid,
+            &selection,
+            &ResourceLimits::default(),
+            PrepareTestOptions::default(),
+            &Deadline::new(None),
+            &NeverCancelled,
+        )
+        .expect("invalid facts omission");
         assert!(omitted.snapshot.files.is_empty());
         assert_eq!(omitted.snapshot.completeness, CacheCompleteness::Partial);
         assert!(

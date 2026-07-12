@@ -3,7 +3,8 @@
 //! Rust extractor — one tree-sitter pass yielding definitions and references.
 //!
 //! Definitions: ALL top-level items (`fn/struct/enum/trait/type/const/static/mod`)
-//! plus `impl` blocks, each tagged with its real [`Visibility`]. `pub` items get
+//! plus inherent-impl members. Impl blocks are identity-less containers. Every
+//! definition is tagged with its real [`Visibility`]. `pub` items get
 //! `Visibility::Public`; `pub(crate)` / `pub(super)` / `pub(in …)` get
 //! `Visibility::Internal`; items with no visibility modifier get `Visibility::Private`.
 //! Qualified identity follows the module path derived from the file path
@@ -202,19 +203,19 @@ fn collect_symbols(root: &Node, ctx: &ExtractCtx, namespaces: &[String]) -> Vec<
                 };
                 (SymbolKind::Module, Descriptor::Namespace(name))
             }
+            // An impl block is a lexical container, not a SCIP definition. Its
+            // members are emitted below under the existing self-type identity.
             "impl_item" => {
-                let name = impl_type_name(&child, bytes);
-                (SymbolKind::Impl, Descriptor::Type(name))
+                let type_name = impl_type_name(&child, bytes);
+                if child.child_by_field_name("trait").is_none() {
+                    collect_impl_members(&child, ctx, namespaces, &type_name, &mut out);
+                }
+                continue;
             }
             _ => continue,
         };
 
-        // `impl` blocks carry no visibility modifier in Rust; they are always Public.
-        let visibility = if kind == SymbolKind::Impl {
-            Visibility::Public
-        } else {
-            read_visibility(&child, bytes)
-        };
+        let visibility = read_visibility(&child, bytes);
 
         // Extract the name before moving `leaf` into `descriptors` so no clone is needed.
         let sym_name = leaf.name().to_owned();
@@ -242,14 +243,6 @@ fn collect_symbols(root: &Node, ctx: &ExtractCtx, namespaces: &[String]) -> Vec<
             if let Some(sym) = out.last_mut() {
                 sym.entry_points = entry_points_for_rust(&sym_name, &child, bytes);
             }
-        }
-
-        // For inherent impl blocks, also emit symbols for their members (all
-        // visibilities). Trait-impl members are deferred: the call qualifier is
-        // `self`, not the type, and method extraction risks collisions with
-        // inherent methods.
-        if kind == SymbolKind::Impl && child.child_by_field_name("trait").is_none() {
-            collect_impl_members(&child, ctx, namespaces, &sym_name, &mut out);
         }
 
         // For trait definitions, emit symbols for their member methods and
@@ -594,19 +587,11 @@ fn fn_ffi_exports(func: &Node, bytes: &[u8], fn_name: &str) -> Vec<(FfiAbi, Stri
     crate::ffi::rust_exports(&attr_texts, fn_name)
 }
 
-/// Display name for an `impl` block: the last type identifier before the body.
+/// Bare self-type name for an impl block.
 fn impl_type_name(node: &Node, bytes: &[u8]) -> String {
-    let mut name: Option<String> = None;
-    for child in node.children(&mut node.walk()) {
-        match child.kind() {
-            "type_identifier" | "generic_type" | "scoped_type_identifier" => {
-                name = Some(node_text(&child, bytes).to_owned());
-            }
-            "declaration_list" => break,
-            _ => {}
-        }
-    }
-    name.unwrap_or_else(|| "impl".to_owned())
+    node.child_by_field_name("type")
+        .map(|self_type| super::simple_type_name(node_text(&self_type, bytes), "::").to_owned())
+        .unwrap_or_else(|| "impl".to_owned())
 }
 
 /// Recursively walk `node` collecting `Inherit` references for every
@@ -624,10 +609,14 @@ fn collect_inheritance(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Refe
                     file,
                     RefRole::IsImplementation,
                 );
+                if let Some(reference) = out.last_mut() {
+                    reference.qualifier = Some(impl_type_name(node, bytes));
+                }
             }
         }
         "trait_item" => {
             // `bounds` field is a `trait_bounds` node listing supertraits.
+            let subject = child_text(node, "type_identifier", bytes);
             if let Some(bounds) = node.child_by_field_name("bounds") {
                 for child in bounds.children(&mut bounds.walk()) {
                     match child.kind() {
@@ -639,6 +628,9 @@ fn collect_inheritance(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Refe
                                 file,
                                 RefRole::IsImplementation,
                             );
+                            if let (Some(reference), Some(subject)) = (out.last_mut(), &subject) {
+                                reference.qualifier = Some(subject.clone());
+                            }
                         }
                         _ => {}
                     }
@@ -1325,6 +1317,78 @@ pub struct Config { pub value: u32 }
         let names: Vec<&str> = facts.references.iter().map(|r| r.name.as_str()).collect();
         assert!(names.contains(&"validate_token"));
         assert!(names.contains(&"helper"));
+    }
+
+    #[test]
+    fn impl_block_does_not_duplicate_its_type_definition() {
+        let facts = RustExtractor
+            .extract("pub struct Point; impl Point {}", "src/point.rs")
+            .unwrap();
+
+        let point_ids: Vec<_> = facts
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.id.leaf_name() == Some("Point"))
+            .map(|symbol| symbol.id.clone())
+            .collect();
+        assert_eq!(point_ids.len(), 1, "impl containers must not mint symbols");
+    }
+
+    #[test]
+    fn multiple_impl_blocks_share_one_type_definition() {
+        let facts = RustExtractor
+            .extract(
+                "pub struct Point; impl Point { pub fn x(&self) {} } impl Point { pub fn y(&self) {} }",
+                "src/point.rs",
+            )
+            .unwrap();
+
+        let point_ids: Vec<_> = facts
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.id.leaf_name() == Some("Point"))
+            .map(|symbol| symbol.id.clone())
+            .collect();
+        assert_eq!(point_ids.len(), 1, "impl containers must not mint symbols");
+    }
+
+    #[test]
+    fn generic_impl_members_use_the_declared_type_identity() {
+        let facts = RustExtractor
+            .extract(
+                "pub struct Wrapper<T>(T); impl<T> Wrapper<T> { pub fn get(&self) -> &T { &self.0 } }",
+                "src/wrapper.rs",
+            )
+            .unwrap();
+
+        let get = facts
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "get")
+            .expect("impl member");
+        assert!(get.id.to_scip_string().contains("Wrapper#get()."));
+        assert!(!get.id.to_scip_string().contains("Wrapper<T>"));
+    }
+
+    #[test]
+    fn trait_and_inherent_impls_share_one_type_definition() {
+        let facts = RustExtractor
+            .extract(
+                "pub trait Draw {} pub struct Point; impl Draw for Point {} impl Point {}",
+                "src/point.rs",
+            )
+            .unwrap();
+
+        let point_ids: Vec<_> = facts
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.id.leaf_name() == Some("Point"))
+            .map(|symbol| symbol.id.clone())
+            .collect();
+        assert_eq!(point_ids.len(), 1, "impl containers must not mint symbols");
+        assert!(facts.references.iter().any(|reference| {
+            reference.role == RefRole::IsImplementation && reference.name == "Draw"
+        }));
     }
 
     #[test]
@@ -2632,23 +2696,18 @@ impl std::fmt::Display for Point {
     }
 
     #[test]
-    fn trait_impl_members_excluded() {
-        // `impl std::fmt::Display for Point { fn fmt(...) }` →
-        // NO symbol named "fmt" under `Point#`; the `Impl` block symbol for
-        // `Point` is still emitted.
+    fn trait_impl_members_and_container_are_excluded() {
+        // `impl std::fmt::Display for Point { fn fmt(...) }` emits neither a
+        // member definition under `Point#` nor a symbol for the impl container.
         let src = r#"pub struct Point;
 impl std::fmt::Display for Point {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { Ok(()) }
 }"#;
         let facts = RustExtractor.extract(src, "src/foo.rs").unwrap();
 
-        // The Impl block symbol for Point is still emitted.
         assert!(
-            facts
-                .symbols
-                .iter()
-                .any(|s| s.name == "Point" && s.kind == SymbolKind::Impl),
-            "Impl block symbol for 'Point' should still be emitted"
+            !facts.symbols.iter().any(|s| s.kind == SymbolKind::Impl),
+            "impl containers must not mint symbols"
         );
         // No symbol named "fmt" under Point# should be emitted.
         let fmt_under_point: Vec<_> = facts

@@ -6,7 +6,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 /// Default maximum number of files considered by one invocation.
-pub const DEFAULT_MAX_FILES: usize = 1_000;
+pub const DEFAULT_MAX_FILES: usize = 10_000;
 /// Default maximum bytes read from any one source file.
 pub const DEFAULT_MAX_FILE_BYTES: usize = 1_024 * 1_024;
 /// Default maximum aggregate source bytes read by one invocation.

@@ -4,7 +4,7 @@
 
 use std::io::{Read, Write};
 
-use code2graph::extract_file;
+use code2graph::{extract_file, validate_file_facts};
 
 use super::frame::{decode_request_frame, read_frame, reject_trailing_bytes, write_frame};
 use super::protocol::{
@@ -36,6 +36,7 @@ pub fn run_worker<R: Read, W: Write>(
         Ok(language) => match std::str::from_utf8(&request.source)
             .ok()
             .and_then(|source| extract_file(language, source, &request.path).ok())
+            .filter(|facts| validate_file_facts(std::slice::from_ref(facts)).is_ok())
         {
             Some(facts) => WorkerResponse {
                 version: PROTOCOL_VERSION,
