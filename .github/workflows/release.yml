@@ -195,8 +195,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for _ in {1..30}; do
-            if json="$(curl -fsSL "https://pypi.org/pypi/code2graph-rs/${{ needs.validate.outputs.python_version }}/json" 2>/dev/null)"; then
+          for attempt in {1..90}; do
+            if json="$(curl -fsSL -H 'Cache-Control: no-cache' "https://pypi.org/pypi/code2graph-rs/${{ needs.validate.outputs.python_version }}/json?attempt=$attempt" 2>/dev/null)"; then
               mapfile -t local_names < <(find bundle/python -maxdepth 1 -type f -printf '%f\n' | sort)
               mapfile -t remote_names < <(jq -r '.urls[].filename' <<<"$json" | sort)
               complete=true
@@ -207,7 +207,7 @@ jobs:
               done
               "$complete" && exit 0
             fi
-            sleep 2
+            sleep 5
           done
           exit 1
   publish-npm:
@@ -235,6 +235,10 @@ jobs:
           path: bundle
       - name: Publish prepared platform packages before the root package
         shell: bash
+        env:
+          # A token is required to bootstrap previously unpublished platform packages;
+          # provenance remains attached and subsequent releases stay idempotent.
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
           publish() {
@@ -276,6 +280,9 @@ jobs:
       contents: write
       actions: read
     steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag }}
       - uses: actions/download-artifact@v8
         with:
           name: ${{ needs.provenance.outputs.artifact }}

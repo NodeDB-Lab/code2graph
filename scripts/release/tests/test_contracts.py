@@ -227,10 +227,29 @@ class WorkflowContractTests(unittest.TestCase):
         text = (ROOT / ".github/workflows/release.yml").read_text()
         for required in (".repository.full_name", ".head_repository.full_name", ".head_sha", ".path", "tagged-source", "cmp --silent", "unexpected PyPI artifact", "GitHub release attachment set mismatch"):
             self.assertIn(required, text)
+        pypi = release["jobs"]["publish-pypi"]
+        self.assertEqual(pypi["permissions"]["id-token"], "write")
+        pypi_publish = next(step for step in pypi["steps"] if step.get("uses") == "pypa/gh-action-pypi-publish@release/v1")
+        self.assertEqual(pypi_publish["with"]["skip-existing"], "true")
+        self.assertIn("for attempt in {1..90}", text)
+        self.assertIn("Cache-Control: no-cache", text)
+        self.assertIn("?attempt=$attempt", text)
+        self.assertIn("sleep 5", text)
+        npm = release["jobs"]["publish-npm"]
+        self.assertEqual(npm["permissions"]["id-token"], "write")
+        node_setup = next(step for step in npm["steps"] if step.get("uses") == "actions/setup-node@v5")
+        self.assertEqual(node_setup["with"]["registry-url"], "https://registry.npmjs.org")
+        publish_step = next(step for step in npm["steps"] if step.get("name") == "Publish prepared platform packages before the root package")
+        self.assertEqual(publish_step["env"]["NODE_AUTH_TOKEN"], "${{ secrets.NPM_TOKEN }}")
+        self.assertIn("npm publish \"$tarball\" --access public --provenance", publish_step["run"])
+        self.assertLess(text.index('for file in "${platform_tarballs[@]}"'), text.index('publish "${roots[0]}"'))
+        self.assertEqual(release["jobs"]["github-release"]["steps"][0]["uses"], "actions/checkout@v6")
+        self.assertEqual(release["jobs"]["github-release"]["steps"][0]["with"]["ref"], "${{ inputs.tag }}")
+        self.assertIn('gh release create "$TAG" "${files[@]}" --verify-tag --target "$SHA"', text)
+        self.assertIn('test "$(jq -r .target_commitish <<<"$release_json")" = "$SHA"', text)
         self.assertNotIn(".head_branch", text)
         for forbidden in ("maturin build", "maturin-action", "napi build", "cargo test", "npm test", "cargo build"):
             self.assertNotIn(forbidden, text)
-        self.assertLess(text.index('for file in "${platform_tarballs[@]}"'), text.index('publish "${roots[0]}"'))
 
     def test_action_versions_and_actionlint_invocation_match_repository(self):
         test_text = (ROOT / ".github/workflows/test.yml").read_text()
