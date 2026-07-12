@@ -101,14 +101,26 @@ impl IncrementalGraph {
         }
     }
 
-    /// Build a store from a file set by [`upsert`]ing each in turn. Ergonomic
-    /// constructor equivalent to `new()` followed by an upsert per file.
+    /// Build a store from a file set, applying the whole set as ONE batch so the
+    /// cross-file stitch runs a single time. Produces the identical graph to a
+    /// `new()` followed by an upsert per file — the stitch is order-independent
+    /// for a complete set — but avoids the quadratic cost of sequential upserts:
+    /// each upsert that changes a re-export re-resolves *every* pending reference
+    /// ([`commit_prepared_bounded`]), so a per-file cold build of a project whose
+    /// files carry `pub use` re-exports is O(N²). Batching keeps it linear.
     ///
     /// [`upsert`]: IncrementalGraph::upsert
     pub fn from_files(files: &[FileFacts]) -> Self {
         let mut store = Self::new();
-        for f in files {
-            store.upsert(f);
+        let changes: Vec<FileChange<'_>> = files.iter().map(FileChange::Upsert).collect();
+        if store.try_apply_changes(&changes).is_err() {
+            // A batch is atomic: one malformed file rejects the whole set. Fall
+            // back to the historical upsert-each-in-turn path, which skips only
+            // the invalid facts and preserves the rest.
+            store = Self::new();
+            for f in files {
+                store.upsert(f);
+            }
         }
         store
     }

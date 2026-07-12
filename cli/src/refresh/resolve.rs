@@ -163,11 +163,10 @@ fn resolve_scope(inputs: ResolveCandidateInputs<'_>) -> Result<ResolvedCandidate
 
 fn fresh_scope(inputs: ResolveCandidateInputs<'_>) -> Result<ResolvedCandidate> {
     check(inputs.deadline, inputs.cancellation)?;
-    let mut store = IncrementalGraph::new();
-    for facts in inputs.files {
-        check(inputs.deadline, inputs.cancellation)?;
-        store.upsert(facts);
-    }
+    // Apply the whole file set as one batch: the cross-file stitch (and its
+    // re-export re-resolution) runs once, keeping the cold build linear instead
+    // of the O(N²) that per-file upserts incur on any project with `pub use`.
+    let store = IncrementalGraph::from_files(inputs.files);
     check(inputs.deadline, inputs.cancellation)?;
     let file_subgraphs = collect_subgraphs(
         inputs.files,
