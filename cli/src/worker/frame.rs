@@ -81,18 +81,6 @@ pub fn write_frame<W: IoWrite, T: ToMessagePack>(
     Ok(())
 }
 
-/// Require EOF after one frame, rejecting trailing bytes or a second frame.
-pub fn reject_trailing_bytes<R: IoRead>(reader: &mut R) -> Result<(), WorkerProtocolError> {
-    let mut byte = [0_u8; 1];
-    if reader.read(&mut byte)? == 0 {
-        Ok(())
-    } else {
-        Err(WorkerProtocolError::Malformed(
-            "trailing bytes or second frame",
-        ))
-    }
-}
-
 pub fn decode_request_frame(frame: &[u8]) -> Result<WorkerRequest, WorkerProtocolError> {
     decode_frame(frame, REQUEST_FRAME_MAX)
 }
@@ -420,7 +408,6 @@ mod tests {
         write_frame(&mut output, &request, REQUEST_FRAME_MAX).unwrap();
         let mut input = std::io::Cursor::new(output.clone());
         assert!(read_frame(&mut input, REQUEST_FRAME_MAX).unwrap().is_some());
-        assert!(reject_trailing_bytes(&mut input).is_ok());
 
         assert!(
             read_frame(
@@ -439,6 +426,8 @@ mod tests {
             read_frame(&mut std::io::Cursor::new(oversized), REQUEST_FRAME_MAX),
             Err(WorkerProtocolError::FrameTooLarge)
         ));
+        // A frame followed by trailing bytes still reads the leading frame cleanly;
+        // the pooled worker simply reads the next frame from the remaining bytes.
         output.push(0);
         let mut trailing = std::io::Cursor::new(output);
         assert!(
@@ -446,7 +435,6 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
-        assert!(reject_trailing_bytes(&mut trailing).is_err());
     }
 
     #[test]
