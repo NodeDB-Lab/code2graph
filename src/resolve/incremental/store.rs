@@ -106,7 +106,7 @@ impl IncrementalGraph {
     /// `new()` followed by an upsert per file — the stitch is order-independent
     /// for a complete set — but avoids the quadratic cost of sequential upserts:
     /// each upsert that changes a re-export re-resolves *every* pending reference
-    /// ([`commit_prepared_bounded`]), so a per-file cold build of a project whose
+    /// (`commit_prepared_bounded`), so a per-file cold build of a project whose
     /// files carry `pub use` re-exports is O(N²). Batching keeps it linear.
     ///
     /// [`upsert`]: IncrementalGraph::upsert
