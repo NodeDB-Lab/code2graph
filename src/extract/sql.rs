@@ -19,8 +19,8 @@ use tree_sitter::{Node, Parser};
 
 use crate::error::{CodegraphError, Result};
 use crate::graph::types::{
-    Binding, BindingKind, BindingTarget, ByteSpan, FileFacts, RefRole, Reference, Scope, ScopeId,
-    ScopeKind, Symbol, SymbolKind, Visibility,
+    Binding, BindingKind, BindingTarget, ByteSpan, FileFacts, Occurrence, RefRole, Reference,
+    Scope, ScopeId, ScopeKind, Symbol, SymbolKind, Visibility,
 };
 use crate::lang::Language;
 use crate::symbol::Descriptor;
@@ -249,12 +249,58 @@ fn build_descriptors(schema: Option<&str>, table: &str, column: Option<&str>) ->
 /// nothing (no matching symbol) — a harmless no-op until those symbol kinds are
 /// added.
 fn collect_references(root: &Node, bytes: &[u8], file: &str) -> Vec<Reference> {
+    let entity_refs = collect_entity_refs(root, bytes);
+    entity_refs
+        .into_iter()
+        .map(|e| Reference {
+            name: e.name,
+            occ: Occurrence {
+                file: file.to_owned(),
+                line: (e.rel_row + 1) as u32,
+                col: e.rel_col as u32,
+                byte: e.rel_byte,
+            },
+            role: RefRole::TypeRef,
+            source_module: None,
+            from_path: None,
+            is_reexport: false,
+            imported_name: None,
+            qualifier: e.qualifier,
+            scope: None,
+            type_ref_ctx: None,
+        })
+        .collect()
+}
+
+/// A SQL entity use-site (table/view/object reference), with coordinates
+/// relative to the SQL string that was parsed — NOT tied to any file.
+///
+/// This is the reusable unit an embedded-SQL extractor (SQL inside another
+/// language's source) can rebase onto its own byte offsets.
+pub(crate) struct SqlEntityRef {
+    /// The unquoted table/object name.
+    pub name: String,
+    /// The unquoted schema qualifier, if any (e.g. `app` in `app.users`).
+    pub qualifier: Option<String>,
+    /// `object_reference` node's start byte, relative to the parsed SQL string.
+    pub rel_byte: usize,
+    /// `object_reference` node's start row, relative to the parsed SQL string.
+    pub rel_row: usize,
+    /// `object_reference` node's start column, relative to the parsed SQL string.
+    pub rel_col: usize,
+}
+
+/// Walk the tree and collect [`SqlEntityRef`]s for every `object_reference`
+/// node that is NOT the definition name of a `create_table` / `create_view` /
+/// `create_materialized_view` statement. See [`collect_references`] for the
+/// full rule and its v1 boundary notes.
+fn collect_entity_refs(root: &Node, bytes: &[u8]) -> Vec<SqlEntityRef> {
     let mut out = Vec::new();
-    collect_references_recursive(root, bytes, file, &mut out);
+    collect_entity_refs_recursive(root, bytes, &mut out);
     out
 }
 
-fn collect_references_recursive(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+fn collect_entity_refs_recursive(node: &Node, bytes: &[u8], out: &mut Vec<SqlEntityRef>) {
     if node.kind() == "object_reference" {
         // Determine whether this is the definition name: a direct child of
         // create_table / create_view / create_materialized_view.
@@ -269,24 +315,19 @@ fn collect_references_recursive(node: &Node, bytes: &[u8], file: &str, out: &mut
             .unwrap_or(false);
 
         if !is_definition_name {
-            // Emit a TypeRef reference for this use-site.
+            // Emit an entity ref for this use-site.
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = super::unquote(super::node_text(&name_node, bytes)).to_owned();
                 if !name.is_empty() {
                     let qualifier = node
                         .child_by_field_name("schema")
                         .map(|n| super::unquote(super::node_text(&n, bytes)).to_owned());
-                    out.push(Reference {
+                    out.push(SqlEntityRef {
                         name,
-                        occ: super::node_occurrence(node, file),
-                        role: RefRole::TypeRef,
-                        source_module: None,
-                        from_path: None,
-                        is_reexport: false,
-                        imported_name: None,
                         qualifier,
-                        scope: None,
-                        type_ref_ctx: None,
+                        rel_byte: node.start_byte(),
+                        rel_row: node.start_position().row,
+                        rel_col: node.start_position().column,
                     });
                 }
             }
@@ -295,7 +336,7 @@ fn collect_references_recursive(node: &Node, bytes: &[u8], file: &str, out: &mut
         // object_references can appear in subqueries).
     }
     for child in node.children(&mut node.walk()) {
-        collect_references_recursive(&child, bytes, file, out);
+        collect_entity_refs_recursive(&child, bytes, out);
     }
 }
 
