@@ -73,8 +73,11 @@ pub fn terminate(containment: &mut Containment, child: &mut Child) {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::thread;
     use std::time::{Duration, Instant};
+
+    use tempfile::tempdir;
 
     use super::*;
 
@@ -92,24 +95,51 @@ mod tests {
     }
 
     #[test]
+    fn job_object_child_process() {
+        if let Some(ready) = std::env::var_os("CODE2GRAPH_JOB_OBJECT_READY") {
+            fs::write(ready, b"ready").expect("signal ready");
+            thread::sleep(Duration::from_secs(30));
+        }
+    }
+
+    #[test]
     fn closing_job_object_terminates_an_assigned_process() {
-        let mut child = std::process::Command::new("cmd")
-            .args(["/C", "ping -n 30 127.0.0.1 > NUL"])
+        let directory = tempdir().expect("temporary directory");
+        let ready = directory.path().join("ready");
+        let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args(["job_object_child_process", "--nocapture"])
+            .env("CODE2GRAPH_JOB_OBJECT_READY", &ready)
             .spawn()
             .expect("long-running child");
-        let containment = contain(&mut child).expect("Job Object containment");
-        drop(containment);
+        let containment = match contain(&mut child) {
+            Ok(containment) => containment,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("Job Object containment failed: {error}");
+            }
+        };
 
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let ready_deadline = Instant::now() + Duration::from_secs(5);
+        while !ready.is_file() {
+            if child.try_wait().expect("poll child").is_some() {
+                panic!("Job Object child exited before reporting ready");
+            }
+            if Instant::now() >= ready_deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("Job Object child did not report ready");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        drop(containment);
+        let termination_deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            if let Some(status) = child.try_wait().expect("poll child") {
-                assert!(
-                    !status.success(),
-                    "closing the Job Object must kill the child"
-                );
+            if child.try_wait().expect("poll child").is_some() {
                 return;
             }
-            if Instant::now() >= deadline {
+            if Instant::now() >= termination_deadline {
                 let _ = child.kill();
                 let _ = child.wait();
                 panic!("closing the Job Object did not terminate the child");

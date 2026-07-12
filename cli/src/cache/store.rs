@@ -2099,6 +2099,9 @@ mod tests {
                 .expect("read cache directory")
                 .map(|entry| {
                     let entry = entry.expect("directory entry");
+                    // Reading through the filesystem handle first makes buffered WAL
+                    // growth visible before Windows reports file metadata.
+                    fs::read(entry.path()).expect("read cache file");
                     let metadata = entry.metadata().expect("metadata");
                     (
                         entry.file_name(),

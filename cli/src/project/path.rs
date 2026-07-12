@@ -190,15 +190,18 @@ mod tests {
 
     #[test]
     fn requires_canonical_containment() {
-        let root = Path::new("/project");
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let root = directory.path().join("project");
+        let source = root.join("src/lib.rs");
+        let outside = directory.path().join("other/lib.rs");
         assert_eq!(
-            ProjectPath::from_canonical_source(root, Path::new("/project/src/lib.rs"))
+            ProjectPath::from_canonical_source(&root, &source)
                 .unwrap()
                 .as_str(),
             "src/lib.rs"
         );
         assert!(matches!(
-            ProjectPath::from_canonical_source(root, Path::new("/other/lib.rs")),
+            ProjectPath::from_canonical_source(&root, &outside),
             Err(CliError::ProjectPathOutsideRoot { .. })
         ));
     }

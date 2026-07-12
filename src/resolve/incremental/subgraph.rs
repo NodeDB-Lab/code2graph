@@ -343,10 +343,7 @@ fn scope_walk<'b>(
                 return Some(b);
             }
         }
-        match scopes.get(current).and_then(|s| s.parent) {
-            Some(p) => current = p,
-            None => return None, // reached root with no match
-        }
+        current = scopes.get(current).and_then(|scope| scope.parent)?;
     }
     // More parent hops than scopes proves a cycle or malformed index chain.
     None

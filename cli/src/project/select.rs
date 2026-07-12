@@ -44,18 +44,13 @@ pub fn select_project(request: &CliRequest, cwd: &Path) -> Result<ProjectSelecti
     } = &request.command
     {
         let path = absolute_path(path, &cwd.canonical);
-        validate_no_symlinks(&path, &cwd.lexical)?;
+        validate_no_symlinks(&path)?;
         let metadata = fs::metadata(&path).map_err(|error| CliError::ProjectPath {
             path: path.clone(),
             reason: error.to_string(),
         })?;
         if metadata.is_dir() {
-            return selection(
-                path,
-                None,
-                SelectionProvenance::IndexDirectory,
-                &cwd.lexical,
-            );
+            return selection(path, None, SelectionProvenance::IndexDirectory);
         }
         if metadata.is_file() {
             let source = canonicalize(&path)?;
@@ -65,7 +60,7 @@ pub fn select_project(request: &CliRequest, cwd: &Path) -> Result<ProjectSelecti
             })?;
             let (root, provenance) = nearest_marker(parent)
                 .unwrap_or((parent.to_path_buf(), SelectionProvenance::IndexFileParent));
-            return selection(root, Some(source), provenance, &cwd.lexical);
+            return selection(root, Some(source), provenance);
         }
         return Err(CliError::ProjectPath {
             path,
@@ -77,8 +72,6 @@ pub fn select_project(request: &CliRequest, cwd: &Path) -> Result<ProjectSelecti
 }
 
 struct ValidatedCwd {
-    /// The caller-provided spelling establishes which strict ancestors are trusted aliases.
-    lexical: PathBuf,
     canonical: PathBuf,
 }
 
@@ -88,7 +81,7 @@ fn select_directory(
     provenance: SelectionProvenance,
 ) -> Result<ProjectSelection> {
     let path = absolute_path(path, &cwd.canonical);
-    validate_no_symlinks(&path, &cwd.lexical)?;
+    validate_no_symlinks(&path)?;
     let metadata = fs::metadata(&path).map_err(|error| CliError::ProjectPath {
         path: path.clone(),
         reason: error.to_string(),
@@ -99,7 +92,7 @@ fn select_directory(
             reason: "project root must be an existing directory".into(),
         });
     }
-    selection(path, None, provenance, &cwd.lexical)
+    selection(path, None, provenance)
 }
 
 fn validated_cwd(cwd: &Path) -> Result<ValidatedCwd> {
@@ -119,9 +112,8 @@ fn validated_cwd(cwd: &Path) -> Result<ValidatedCwd> {
             reason: "cwd must be an existing directory".into(),
         });
     }
-    validate_no_symlinks(cwd, cwd)?;
+    validate_no_symlinks(cwd)?;
     Ok(ValidatedCwd {
-        lexical: cwd.to_path_buf(),
         canonical: canonicalize(cwd)?,
     })
 }
@@ -138,9 +130,8 @@ fn selection(
     root: PathBuf,
     canonical_source: Option<PathBuf>,
     provenance: SelectionProvenance,
-    trusted_cwd: &Path,
 ) -> Result<ProjectSelection> {
-    validate_no_symlinks(&root, trusted_cwd)?;
+    validate_no_symlinks(&root)?;
     let canonical_root = canonicalize(&root)?;
     if let Some(source) = &canonical_source
         && !source.starts_with(&canonical_root)
@@ -178,7 +169,7 @@ fn canonicalize(path: &Path) -> Result<PathBuf> {
     })
 }
 
-fn validate_no_symlinks(path: &Path, trusted_cwd: &Path) -> Result<()> {
+fn validate_no_symlinks(path: &Path) -> Result<()> {
     if !path.is_absolute() {
         return Err(CliError::ProjectPath {
             path: path.to_path_buf(),
@@ -196,9 +187,7 @@ fn validate_no_symlinks(path: &Path, trusted_cwd: &Path) -> Result<()> {
                 path: component_path.clone(),
                 reason: error.to_string(),
             })?;
-        if metadata.file_type().is_symlink()
-            && (component_path == path || !is_trusted_cwd_ancestor(&component_path, trusted_cwd))
-        {
+        if metadata.file_type().is_symlink() && !is_trusted_system_ancestor(&component_path, path) {
             return Err(CliError::ProjectSymlink {
                 path: component_path,
             });
@@ -208,19 +197,18 @@ fn validate_no_symlinks(path: &Path, trusted_cwd: &Path) -> Result<()> {
 }
 
 /// macOS exposes `/var` as a platform-owned alias for `/private/var`.
-/// It is trusted only when it is a strict lexical ancestor of the caller's cwd;
-/// every user-controlled alias, the cwd itself, and selected descendants remain
-/// subject to the no-symlink policy.
-fn is_trusted_cwd_ancestor(component_path: &Path, trusted_cwd: &Path) -> bool {
+/// It is trusted only as a strict ancestor of the path being validated; selecting
+/// the alias itself and every user-controlled alias remain prohibited.
+fn is_trusted_system_ancestor(component_path: &Path, selected_path: &Path) -> bool {
     #[cfg(target_os = "macos")]
     {
         component_path == Path::new("/var")
-            && component_path != trusted_cwd
-            && trusted_cwd.starts_with(component_path)
+            && component_path != selected_path
+            && selected_path.starts_with(component_path)
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (component_path, trusted_cwd);
+        let _ = (component_path, selected_path);
         false
     }
 }
@@ -233,7 +221,7 @@ mod tests {
     use tempfile::tempdir;
 
     #[cfg(target_os = "macos")]
-    use super::is_trusted_cwd_ancestor;
+    use super::is_trusted_system_ancestor;
     use super::{SelectionProvenance, select_project};
     use crate::config::GlobalOptions;
     use crate::error::CliError;
@@ -389,16 +377,19 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn trusts_only_var_as_a_strict_cwd_ancestor() {
-        let cwd = Path::new("/var/folders/example/project");
-        assert!(is_trusted_cwd_ancestor(Path::new("/var"), cwd));
-        assert!(!is_trusted_cwd_ancestor(Path::new("/var/folders"), cwd));
-        assert!(!is_trusted_cwd_ancestor(cwd, cwd));
-        assert!(!is_trusted_cwd_ancestor(
-            Path::new("/var/folders/example/project/child-link"),
-            cwd
+    fn trusts_only_var_as_a_strict_selected_path_ancestor() {
+        let selected = Path::new("/var/folders/example/project");
+        assert!(is_trusted_system_ancestor(Path::new("/var"), selected));
+        assert!(!is_trusted_system_ancestor(
+            Path::new("/var/folders"),
+            selected
         ));
-        assert!(!is_trusted_cwd_ancestor(Path::new("/outside"), cwd));
+        assert!(!is_trusted_system_ancestor(selected, selected));
+        assert!(!is_trusted_system_ancestor(
+            Path::new("/var/folders/example/project/child-link"),
+            selected
+        ));
+        assert!(!is_trusted_system_ancestor(Path::new("/outside"), selected));
     }
 
     #[cfg(unix)]
