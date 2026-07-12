@@ -62,7 +62,9 @@ pub mod swift;
 pub mod typescript;
 
 pub use binding::{BindingRules, QueryBindingRule};
-pub use dispatch::{Extractor, extract_file, extract_path};
+pub use dispatch::{
+    Extractor, extract_file, extract_file_with_bindings, extract_path, extract_path_with_bindings,
+};
 
 #[cfg(feature = "c")]
 pub use c::CExtractor;
@@ -104,6 +106,8 @@ pub use shell::ShellExtractor;
 pub use solidity::SolidityExtractor;
 #[cfg(feature = "sql")]
 pub use sql::SqlExtractor;
+#[cfg(feature = "sql")]
+pub(crate) use sql::collect_sql_entity_references;
 #[cfg(feature = "svelte")]
 pub use svelte::SvelteExtractor;
 #[cfg(feature = "swift")]

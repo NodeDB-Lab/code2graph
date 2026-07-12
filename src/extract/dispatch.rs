@@ -62,63 +62,96 @@ pub trait Extractor {
     /// Parse `source` (the contents of `file`, a project-relative path) and
     /// return its definitions and references.
     fn extract(&self, source: &str, file: &str) -> Result<FileFacts>;
+
+    /// Like [`Extractor::extract`], but given a [`crate::extract::BindingRules`]
+    /// registry describing which language constructs carry embedded secondary
+    /// artifacts (e.g. SQL strings). Extractors that don't recognize any such
+    /// construct can ignore `rules` and behave exactly like [`Extractor::extract`]
+    /// — which is what the default implementation does.
+    fn extract_with_bindings(
+        &self,
+        source: &str,
+        file: &str,
+        rules: &crate::extract::BindingRules,
+    ) -> Result<FileFacts> {
+        let _ = rules;
+        self.extract(source, file)
+    }
 }
 
-/// Extract facts from a single file, dispatching on its language.
+/// Extract facts from a single file, dispatching on its language, with no
+/// query-binding rules applied (equivalent to
+/// `extract_file_with_bindings(lang, source, file, &BindingRules::empty())`).
+///
+/// Each language arm is compiled only when the corresponding Cargo feature is
+/// enabled (e.g. `rust`, `python`, `typescript`, …). Disabled languages return
+/// [`CodegraphError::UnsupportedLanguage`] at runtime.
+pub fn extract_file(lang: Language, source: &str, file: &str) -> Result<FileFacts> {
+    extract_file_with_bindings(lang, source, file, &super::BindingRules::empty())
+}
+
+/// Extract facts from a single file, dispatching on its language, applying
+/// `rules` to recognize embedded secondary-artifact constructs (e.g. SQL
+/// strings passed to a query-binding function).
 ///
 /// Each language arm is compiled only when the corresponding Cargo feature is
 /// enabled (e.g. `rust`, `python`, `typescript`, …). Disabled languages return
 /// [`CodegraphError::UnsupportedLanguage`] at runtime.
 #[cfg_attr(not(feature = "_extractors"), allow(unused_variables))]
-pub fn extract_file(lang: Language, source: &str, file: &str) -> Result<FileFacts> {
+pub fn extract_file_with_bindings(
+    lang: Language,
+    source: &str,
+    file: &str,
+    rules: &super::BindingRules,
+) -> Result<FileFacts> {
     #[allow(unreachable_patterns)]
     match lang {
         #[cfg(feature = "c")]
-        Language::C => CExtractor.extract(source, file),
+        Language::C => CExtractor.extract_with_bindings(source, file, rules),
         #[cfg(feature = "csharp")]
-        Language::CSharp => CSharpExtractor.extract(source, file),
+        Language::CSharp => CSharpExtractor.extract_with_bindings(source, file, rules),
         #[cfg(feature = "cpp")]
-        Language::Cpp => CppExtractor.extract(source, file),
+        Language::Cpp => CppExtractor.extract_with_bindings(source, file, rules),
         #[cfg(feature = "go")]
-        Language::Go => GoExtractor.extract(source, file),
+        Language::Go => GoExtractor.extract_with_bindings(source, file, rules),
         #[cfg(feature = "java")]
-        Language::Java => JavaExtractor.extract(source, file),
+        Language::Java => JavaExtractor.extract_with_bindings(source, file, rules),
         #[cfg(feature = "typescript")]
-        Language::JavaScript => JavaScriptExtractor.extract(source, file),
+        Language::JavaScript => JavaScriptExtractor.extract_with_bindings(source, file, rules),
         #[cfg(feature = "php")]
-        Language::Php => PhpExtractor.extract(source, file),
+        Language::Php => PhpExtractor.extract_with_bindings(source, file, rules),
         #[cfg(feature = "python")]
-        Language::Python => PythonExtractor.extract(source, file),
+        Language::Python => PythonExtractor.extract_with_bindings(source, file, rules),
         #[cfg(feature = "ruby")]
-        Language::Ruby => RubyExtractor.extract(source, file),
+        Language::Ruby => RubyExtractor.extract_with_bindings(source, file, rules),
         #[cfg(feature = "rust")]
-        Language::Rust => RustExtractor.extract(source, file),
+        Language::Rust => RustExtractor.extract_with_bindings(source, file, rules),
         #[cfg(feature = "shell")]
-        Language::Shell => ShellExtractor.extract(source, file),
+        Language::Shell => ShellExtractor.extract_with_bindings(source, file, rules),
         #[cfg(feature = "swift")]
-        Language::Swift => SwiftExtractor.extract(source, file),
+        Language::Swift => SwiftExtractor.extract_with_bindings(source, file, rules),
         #[cfg(feature = "kotlin")]
-        Language::Kotlin => KotlinExtractor.extract(source, file),
+        Language::Kotlin => KotlinExtractor.extract_with_bindings(source, file, rules),
         #[cfg(feature = "solidity")]
-        Language::Solidity => SolidityExtractor.extract(source, file),
+        Language::Solidity => SolidityExtractor.extract_with_bindings(source, file, rules),
         #[cfg(feature = "sql")]
-        Language::Sql => SqlExtractor.extract(source, file),
+        Language::Sql => SqlExtractor.extract_with_bindings(source, file, rules),
         #[cfg(feature = "hcl")]
-        Language::Hcl => HclExtractor.extract(source, file),
+        Language::Hcl => HclExtractor.extract_with_bindings(source, file, rules),
         #[cfg(feature = "typescript")]
-        Language::TypeScript => TypeScriptExtractor.extract(source, file),
+        Language::TypeScript => TypeScriptExtractor.extract_with_bindings(source, file, rules),
         #[cfg(feature = "scala")]
-        Language::Scala => ScalaExtractor.extract(source, file),
+        Language::Scala => ScalaExtractor.extract_with_bindings(source, file, rules),
         #[cfg(feature = "dart")]
-        Language::Dart => DartExtractor.extract(source, file),
+        Language::Dart => DartExtractor.extract_with_bindings(source, file, rules),
         #[cfg(feature = "lua")]
-        Language::Lua => LuaExtractor.extract(source, file),
+        Language::Lua => LuaExtractor.extract_with_bindings(source, file, rules),
         #[cfg(feature = "luau")]
-        Language::Luau => LuauExtractor.extract(source, file),
+        Language::Luau => LuauExtractor.extract_with_bindings(source, file, rules),
         #[cfg(feature = "pascal")]
-        Language::Pascal => PascalExtractor.extract(source, file),
+        Language::Pascal => PascalExtractor.extract_with_bindings(source, file, rules),
         #[cfg(feature = "svelte")]
-        Language::Svelte => SvelteExtractor.extract(source, file),
+        Language::Svelte => SvelteExtractor.extract_with_bindings(source, file, rules),
         _ => Err(CodegraphError::UnsupportedLanguage(format!(
             "{} (grammar feature disabled)",
             lang.as_str()
@@ -126,9 +159,20 @@ pub fn extract_file(lang: Language, source: &str, file: &str) -> Result<FileFact
     }
 }
 
-/// Extract facts from a file, inferring the language from its path extension.
+/// Extract facts from a file, inferring the language from its path extension,
+/// with no query-binding rules applied.
 pub fn extract_path(file: &str, source: &str) -> Result<FileFacts> {
+    extract_path_with_bindings(file, source, &super::BindingRules::empty())
+}
+
+/// Extract facts from a file, inferring the language from its path extension,
+/// applying `rules` to recognize embedded secondary-artifact constructs.
+pub fn extract_path_with_bindings(
+    file: &str,
+    source: &str,
+    rules: &super::BindingRules,
+) -> Result<FileFacts> {
     let lang = Language::from_path(file)
         .ok_or_else(|| CodegraphError::UnsupportedLanguage(file.to_owned()))?;
-    extract_file(lang, source, file)
+    extract_file_with_bindings(lang, source, file, rules)
 }

@@ -24,10 +24,12 @@ use crate::lang::Language;
 use crate::symbol::Descriptor;
 
 use super::{
-    ExtractCtx, Extractor, MIN_REF_LEN, attach_reference_scopes, child_text,
+    BindingRules, ExtractCtx, Extractor, MIN_REF_LEN, attach_reference_scopes, child_text,
     collect_call_references, definition_bindings, import_bindings, make_symbol, node_occurrence,
     node_span, node_text, one_line_signature, push_binding, push_ref, push_scope,
 };
+#[cfg(feature = "sql")]
+use super::{byte_to_line_col, collect_sql_entity_references};
 
 /// Tree-sitter query capturing call-callee identifiers (and optional qualifier).
 const CALL_QUERY: &str = r#"
@@ -69,6 +71,26 @@ impl Extractor for RustExtractor {
     }
 
     fn extract(&self, source: &str, file: &str) -> Result<FileFacts> {
+        self.extract_impl(source, file, None)
+    }
+
+    fn extract_with_bindings(
+        &self,
+        source: &str,
+        file: &str,
+        rules: &BindingRules,
+    ) -> Result<FileFacts> {
+        self.extract_impl(source, file, Some(rules))
+    }
+}
+
+impl RustExtractor {
+    fn extract_impl(
+        &self,
+        source: &str,
+        file: &str,
+        rules: Option<&BindingRules>,
+    ) -> Result<FileFacts> {
         let ts_language = crate::grammar::rust();
         let mut parser = Parser::new();
         parser
@@ -107,6 +129,12 @@ impl Extractor for RustExtractor {
         collect_associated_call_type_references(&root, &ts_language, bytes, file, &mut references)?;
         collect_read_references(&root, bytes, file, &mut references);
         collect_write_references(&root, bytes, file, &mut references);
+        #[cfg(feature = "sql")]
+        if let Some(rules) = rules {
+            collect_query_bindings(&root, bytes, file, rules, &mut references);
+        }
+        #[cfg(not(feature = "sql"))]
+        let _ = rules;
 
         let scopes = collect_scopes(&root, source.len());
         attach_reference_scopes(&mut references, &scopes);
@@ -1179,6 +1207,134 @@ fn collect_write_references(node: &Node, bytes: &[u8], file: &str, out: &mut Vec
     }
     for child in node.children(&mut node.walk()) {
         collect_write_references(&child, bytes, file, out);
+    }
+}
+
+// ── Query-binding scan (cross-artifact code→SQL edges) ───────────────────────
+
+/// Recursively walk `node` looking for call/macro sites matching one of
+/// `rules`'s Rust constructs (e.g. `sqlx::query`, `sqlx::query!`), and emit a
+/// [`RefRole::TypeRef`] reference (`cross_artifact: true`) for every SQL
+/// entity (table/view) named in the embedded SQL argument.
+///
+/// Never fails extraction: a construct that doesn't match the expected shape
+/// (unexpected argument kind, no string literal, malformed SQL, …) is simply
+/// skipped.
+#[cfg(feature = "sql")]
+fn collect_query_bindings(
+    node: &Node,
+    bytes: &[u8],
+    file: &str,
+    rules: &BindingRules,
+    out: &mut Vec<Reference>,
+) {
+    match node.kind() {
+        "call_expression" => {
+            if let Some(func) = node.child_by_field_name("function") {
+                if func.kind() == "scoped_identifier" {
+                    let callee = node_text(&func, bytes);
+                    for rule in rules.for_language(Language::Rust) {
+                        if rule.construct != callee {
+                            continue;
+                        }
+                        let Some(arguments) = node.child_by_field_name("arguments") else {
+                            continue;
+                        };
+                        let Some(arg) = arguments
+                            .named_children(&mut arguments.walk())
+                            .nth(rule.sql_arg)
+                        else {
+                            continue;
+                        };
+                        emit_bound_sql_refs(&arg, bytes, file, out);
+                    }
+                }
+            }
+        }
+        "macro_invocation" => {
+            if let Some(mac) = node.child_by_field_name("macro") {
+                let callee = node_text(&mac, bytes);
+                for rule in rules.for_language(Language::Rust) {
+                    if rule.construct != callee {
+                        continue;
+                    }
+                    let Some(token_tree) = node
+                        .children(&mut node.walk())
+                        .find(|c| c.kind() == "token_tree")
+                    else {
+                        continue;
+                    };
+                    let Some(arg) = nth_macro_string_arg(&token_tree, rule.sql_arg) else {
+                        continue;
+                    };
+                    emit_bound_sql_refs(&arg, bytes, file, out);
+                }
+            }
+        }
+        _ => {}
+    }
+    for child in node.children(&mut node.walk()) {
+        collect_query_bindings(&child, bytes, file, rules, out);
+    }
+}
+
+/// Find the `index`-th (0-based) comma-separated group's string-literal token
+/// inside a macro `token_tree`, e.g. `("SELECT …", a, b)` at index 0 yields
+/// the first string literal, index 1 the group after the first top-level `,`.
+#[cfg(feature = "sql")]
+fn nth_macro_string_arg<'a>(token_tree: &Node<'a>, index: usize) -> Option<Node<'a>> {
+    let mut group = 0usize;
+    for child in token_tree.children(&mut token_tree.walk()) {
+        if child.kind() == "," {
+            group += 1;
+            continue;
+        }
+        if group == index && matches!(child.kind(), "string_literal" | "raw_string_literal") {
+            return Some(child);
+        }
+    }
+    None
+}
+
+/// Given a string-literal argument node believed to hold embedded SQL, parse
+/// its content with the SQL extractor and emit a [`RefRole::TypeRef`]
+/// reference (`cross_artifact: true`) for each entity use-site found, anchored
+/// at the entity's position within the original Rust source.
+#[cfg(feature = "sql")]
+fn emit_bound_sql_refs(arg: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    if !matches!(arg.kind(), "string_literal" | "raw_string_literal") {
+        return;
+    }
+    let Some(content) = arg
+        .children(&mut arg.walk())
+        .find(|c| c.kind() == "string_content")
+    else {
+        return;
+    };
+    let sql_text = node_text(&content, bytes);
+    let content_start = content.start_byte();
+
+    for entity in collect_sql_entity_references(sql_text) {
+        let abs = content_start + entity.rel_byte;
+        let (line, col) = byte_to_line_col(bytes, abs);
+        out.push(Reference {
+            name: entity.name,
+            occ: crate::graph::types::Occurrence {
+                file: file.to_owned(),
+                line,
+                col,
+                byte: abs,
+            },
+            role: RefRole::TypeRef,
+            source_module: None,
+            from_path: None,
+            is_reexport: false,
+            imported_name: None,
+            qualifier: entity.qualifier,
+            scope: None,
+            type_ref_ctx: None,
+            cross_artifact: true,
+        });
     }
 }
 
@@ -3269,6 +3425,125 @@ impl std::fmt::Display for Point {
                 .iter()
                 .map(|e| format!("{} -> {}", e.from.to_scip_string(), e.to.to_scip_string()))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    // ── Query-binding cross-artifact refs (code→SQL) ─────────────────────────
+
+    #[cfg(feature = "sql")]
+    #[test]
+    fn sqlx_query_call_emits_cross_artifact_typeref() {
+        let src = r#"pub fn f() { sqlx::query("SELECT id FROM users"); }"#;
+        let facts = RustExtractor
+            .extract_with_bindings(src, "src/app.rs", &BindingRules::with_defaults())
+            .unwrap();
+
+        let found = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::TypeRef && r.name == "users" && r.cross_artifact);
+        let r = found.expect("expected a cross-artifact TypeRef reference named 'users'");
+
+        let select_byte = src.find("SELECT").expect("fixture contains SELECT");
+        assert!(
+            r.occ.byte >= select_byte,
+            "reference byte {} should point at/after 'SELECT' at {}",
+            r.occ.byte,
+            select_byte
+        );
+    }
+
+    #[cfg(feature = "sql")]
+    #[test]
+    fn sqlx_query_macro_emits_cross_artifact_typeref() {
+        let src = r#"pub fn f() { sqlx::query!("SELECT id FROM users"); }"#;
+        let facts = RustExtractor
+            .extract_with_bindings(src, "src/app.rs", &BindingRules::with_defaults())
+            .unwrap();
+
+        let found = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::TypeRef && r.name == "users" && r.cross_artifact);
+        let r = found.expect(
+            "expected a cross-artifact TypeRef reference named 'users' from the macro form",
+        );
+
+        let select_byte = src.find("SELECT").expect("fixture contains SELECT");
+        assert!(
+            r.occ.byte >= select_byte,
+            "reference byte {} should point at/after 'SELECT' at {}",
+            r.occ.byte,
+            select_byte
+        );
+    }
+
+    #[cfg(feature = "sql")]
+    #[test]
+    fn empty_binding_rules_yield_no_cross_artifact_reference() {
+        let src = r#"pub fn f() { sqlx::query("SELECT id FROM users"); }"#;
+        let file = "src/app.rs";
+
+        let with_empty_rules = RustExtractor
+            .extract_with_bindings(src, file, &BindingRules::empty())
+            .unwrap();
+        assert!(
+            !with_empty_rules.references.iter().any(|r| r.cross_artifact),
+            "an empty binding-rule registry must yield no cross-artifact references"
+        );
+
+        let plain = RustExtractor.extract(src, file).unwrap();
+        assert!(
+            !plain.references.iter().any(|r| r.cross_artifact),
+            "the plain extract() path must yield no cross-artifact references"
+        );
+    }
+
+    #[cfg(feature = "sql")]
+    #[test]
+    fn cross_artifact_query_binding_resolves_to_sql_table() {
+        use crate::extract::SqlExtractor;
+        use crate::graph::{Confidence, Provenance};
+        use crate::resolve::{Resolver, SymbolTableResolver};
+
+        let schema = SqlExtractor
+            .extract("CREATE TABLE users (id INT);", "db/schema.sql")
+            .unwrap();
+
+        let src = r#"pub fn f() { sqlx::query("SELECT id FROM users"); }"#;
+        let rust_file = RustExtractor
+            .extract_with_bindings(src, "src/app.rs", &BindingRules::with_defaults())
+            .unwrap();
+
+        let graph = SymbolTableResolver.resolve(&[schema, rust_file]).unwrap();
+
+        let edges_to_users: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.role == RefRole::TypeRef && e.to.to_scip_string().ends_with("users#"))
+            .collect();
+        assert_eq!(
+            edges_to_users.len(),
+            1,
+            "expected one Code→SQL TypeRef edge to 'users#', got: {:?}",
+            edges_to_users
+                .iter()
+                .map(|e| format!("{} -> {}", e.from.to_scip_string(), e.to.to_scip_string()))
+                .collect::<Vec<_>>()
+        );
+
+        let e = edges_to_users[0];
+        assert_eq!(
+            e.provenance,
+            Provenance::CrossArtifact,
+            "query-binding edge must carry Provenance::CrossArtifact, got {:?}",
+            e.provenance
+        );
+        assert_eq!(
+            e.confidence,
+            Confidence::NameOnly,
+            "query-binding edge must carry Confidence::NameOnly, got {:?}",
+            e.confidence
         );
     }
 }

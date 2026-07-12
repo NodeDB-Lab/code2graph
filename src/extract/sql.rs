@@ -273,6 +273,21 @@ fn collect_references(root: &Node, bytes: &[u8], file: &str) -> Vec<Reference> {
         .collect()
 }
 
+/// Parse a standalone SQL string and collect its entity use-sites — the reusable
+/// entry point for extractors that embed SQL inside another language's source.
+/// Owns its own parser (NOT called from `SqlExtractor::extract`, which reuses its
+/// shared tree). Never panics: parse failure or empty input returns an empty vec.
+pub(crate) fn collect_sql_entity_references(sql: &str) -> Vec<SqlEntityRef> {
+    let mut parser = Parser::new();
+    if parser.set_language(&crate::grammar::sql()).is_err() {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(sql, None) else {
+        return Vec::new();
+    };
+    collect_entity_refs(&tree.root_node(), sql.as_bytes())
+}
+
 /// A SQL entity use-site (table/view/object reference), with coordinates
 /// relative to the SQL string that was parsed — NOT tied to any file.
 ///

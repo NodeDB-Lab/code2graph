@@ -66,7 +66,10 @@ pub mod resolve;
 pub mod symbol;
 
 pub use error::{CodegraphError, Result};
-pub use extract::{BindingRules, Extractor, QueryBindingRule, extract_file, extract_path};
+pub use extract::{
+    BindingRules, Extractor, QueryBindingRule, extract_file, extract_file_with_bindings,
+    extract_path, extract_path_with_bindings,
+};
 pub use graph::{
     Binding, BindingKind, BindingTarget, ByteSpan, CODE_GRAPH_SCHEMA_VERSION, CodeGraph,
     Confidence, Edge, EdgeKey, EntryPoint, FILE_FACTS_SCHEMA_VERSION, FfiAbi, FfiExport, FileFacts,
