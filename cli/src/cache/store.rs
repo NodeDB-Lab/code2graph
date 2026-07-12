@@ -111,6 +111,35 @@ struct ExistingCandidateRow {
     inventory_total_bytes: i64,
 }
 
+/// Raw column tuple for the active-snapshot metadata join: candidate id,
+/// compatibility id, language/package fingerprints, compatibility created-at,
+/// completeness, candidate created-at, inventory file count and total bytes, and
+/// resolver tier.
+type ActiveMetadataRow = (
+    Vec<u8>,
+    Vec<u8>,
+    Vec<u8>,
+    Vec<u8>,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    String,
+);
+
+/// Raw column tuple for a single cached file's metadata: language, content hash,
+/// size, mtime seconds/nanoseconds, package assignment, and the file subgraph blob.
+type CachedFileMetadataRow = (
+    String,
+    Vec<u8>,
+    i64,
+    Option<i64>,
+    Option<i64>,
+    String,
+    Option<Vec<u8>>,
+);
+
 /// An open project-cache database. The SQLite connection remains private so
 /// future cache publication can preserve the transaction protocol.
 pub struct CacheStore {
@@ -568,7 +597,7 @@ impl CacheStore {
         deadline: &Deadline,
     ) -> Result<Option<super::ActiveSnapshotMetadata>, CacheError> {
         self.with_read_transaction(deadline, || {
-            let row: Option<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, i64, i64, i64, i64, i64, String)> = self.connection.query_row(
+            let row: Option<ActiveMetadataRow> = self.connection.query_row(
                 "SELECT c.candidate_id, c.compatibility_id, k.language_fingerprint, k.package_fingerprint, k.created_at_ns, c.completeness, c.created_at_ns, c.inventory_file_count, c.inventory_total_bytes, g.resolver_tier FROM active_snapshots a JOIN graph_snapshots g ON g.snapshot_id = a.snapshot_id JOIN candidates c ON c.candidate_id = g.candidate_id JOIN compatibility k ON k.compatibility_id = c.compatibility_id WHERE a.resolver_tier = ?1 AND a.completeness = ?2",
                 params![tier.as_sql(), completeness.as_sql()],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?)),
@@ -663,7 +692,7 @@ impl CacheStore {
         deadline: &Deadline,
     ) -> Result<Option<super::CachedFileMetadata>, CacheError> {
         self.with_read_transaction(deadline, || {
-            let row: Option<(String, Vec<u8>, i64, Option<i64>, Option<i64>, String, Option<Vec<u8>>)> = self.connection.query_row(
+            let row: Option<CachedFileMetadataRow> = self.connection.query_row(
                 "SELECT language, content_hash, size_bytes, mtime_seconds, mtime_nanoseconds, package_assignment, file_subgraph FROM candidate_files WHERE candidate_id = ?1 AND path = ?2",
                 params![candidate_id.as_bytes().as_slice(), path],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),

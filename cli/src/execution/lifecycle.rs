@@ -60,6 +60,11 @@ struct ExecutionRefreshOptions {
     trust_mtime: bool,
 }
 
+// The owned in-memory `GraphIndex` variant is larger than the borrowed cache
+// read handle, but `QueryGraph` is only ever a single short-lived local per
+// query (never held in bulk), so the size difference is immaterial here and
+// boxing it would only add an indirection across every `GraphRead` method.
+#[allow(clippy::large_enum_variant)]
 enum QueryGraph<'a, 'deadline> {
     InMemory(GraphIndex),
     Cached(CacheGraphRead<'a, 'deadline>),
