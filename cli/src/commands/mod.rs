@@ -10,6 +10,7 @@ use code2graph_query::{GraphIndex, GraphRead};
 use crate::{Cancellation, CliError, Deadline, LoadedGraph, Selector};
 
 mod definition;
+mod diff_impact;
 mod impact;
 mod imports;
 mod module_deps;
@@ -92,6 +93,7 @@ pub(crate) struct DefinitionCommandRequest<'a> {
 }
 
 pub(crate) use definition::execute_definition;
+pub(crate) use diff_impact::{DiffImpactCommandRequest, execute_diff_impact};
 pub(crate) use impact::{ImpactCommandRequest, execute_impact};
 pub(crate) use imports::{ImportsCommandRequest, execute_imports};
 pub(crate) use module_deps::{ModuleDepsCommandRequest, execute_module_deps};

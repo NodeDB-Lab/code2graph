@@ -8,11 +8,11 @@ use crate::cache::{
     CacheStore, CandidateSnapshot, LoadedSnapshot, ResolverCacheTier,
 };
 use crate::commands::{
-    DefinitionCommandRequest, ImpactCommandRequest, ImportsCommandRequest,
-    ModuleDepsCommandRequest, QueryCommandContext, ReferencesCommandRequest,
+    DefinitionCommandRequest, DiffImpactCommandRequest, ImpactCommandRequest,
+    ImportsCommandRequest, ModuleDepsCommandRequest, QueryCommandContext, ReferencesCommandRequest,
     RelationCommandRequest, RelationDirection, SymbolsCommandRequest, execute_definition,
-    execute_impact, execute_imports, execute_module_deps, execute_references, execute_relations,
-    execute_symbols,
+    execute_diff_impact, execute_impact, execute_imports, execute_module_deps, execute_references,
+    execute_relations, execute_symbols,
 };
 use crate::inventory::{OmissionImpact, discover_sources_checked};
 use crate::refresh::{
@@ -401,6 +401,17 @@ pub fn execute(request: CliRequest, context: &ExecutionContext<'_>) -> Result<Co
                 min_confidence,
             },
         ),
+        CommandRequest::DiffImpact { base, role, depth } => execute_diff_impact_query(
+            request,
+            context,
+            DiffImpactCommandRequest {
+                base,
+                role,
+                depth,
+                max_nodes: result_limit,
+                min_confidence,
+            },
+        ),
     }
 }
 
@@ -462,6 +473,16 @@ fn execute_impact_query(
 ) -> Result<CommandOutput> {
     execute_query_backend(request, execution, |context| {
         execute_impact(context, command).map(CommandOutput::Impact)
+    })
+}
+
+fn execute_diff_impact_query(
+    request: CliRequest,
+    execution: &ExecutionContext<'_>,
+    command: DiffImpactCommandRequest,
+) -> Result<CommandOutput> {
+    execute_query_backend(request, execution, |context| {
+        execute_diff_impact(context, command).map(CommandOutput::Impact)
     })
 }
 
@@ -669,8 +690,10 @@ fn cached_sources_are_current(
     if sources.len() as u64 != metadata.inventory_file_count + omission_paths.len() as u64 {
         return Ok(false);
     }
-    let cached_by_path: std::collections::HashMap<&str, _> =
-        cached.iter().map(|file| (file.path.as_str(), file)).collect();
+    let cached_by_path: std::collections::HashMap<&str, _> = cached
+        .iter()
+        .map(|file| (file.path.as_str(), file))
+        .collect();
     for candidate in sources {
         match cached_by_path.get(candidate.path.as_str()) {
             // A successfully-extracted file: it must be byte-for-byte unchanged.

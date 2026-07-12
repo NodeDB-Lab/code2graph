@@ -116,7 +116,7 @@ fn contained_regular_file(
     Ok(canonical)
 }
 
-fn read_utf8_bounded(
+pub(crate) fn read_utf8_bounded(
     path: &Path,
     max_file_bytes: usize,
     deadline: &Deadline,

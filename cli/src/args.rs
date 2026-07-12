@@ -118,6 +118,8 @@ enum RawCommand {
     Callers(RelationCommand),
     Callees(RelationCommand),
     Impact(ImpactCommand),
+    #[command(name = "diff-impact")]
+    DiffImpact(DiffImpactCommand),
     Usages(RelationCommand),
     Imports {
         file: String,
@@ -185,6 +187,15 @@ struct ImpactCommand {
     kind: Option<SymbolKind>,
     #[arg(long)]
     require_unique: bool,
+    #[arg(long, value_parser = parse_role)]
+    role: Option<RefRole>,
+    #[arg(long, default_value_t = DEFAULT_IMPACT_DEPTH)]
+    depth: u32,
+}
+
+#[derive(Args)]
+struct DiffImpactCommand {
+    base: Option<String>,
     #[arg(long, value_parser = parse_role)]
     role: Option<RefRole>,
     #[arg(long, default_value_t = DEFAULT_IMPACT_DEPTH)]
@@ -309,6 +320,11 @@ impl RawCli {
                     depth: value.depth,
                 }
             }
+            RawCommand::DiffImpact(value) => CommandRequest::DiffImpact {
+                base: value.base,
+                role: value.role,
+                depth: value.depth,
+            },
             RawCommand::Imports { file } => CommandRequest::Imports { file },
             RawCommand::ModuleDeps => CommandRequest::ModuleDeps,
             RawCommand::References { file, name, role } => {
@@ -479,6 +495,7 @@ mod tests {
             &["code2graph", "callers", "run"],
             &["code2graph", "callees", "run"],
             &["code2graph", "impact", "run"],
+            &["code2graph", "diff-impact"],
             &["code2graph", "usages", "run"],
             &["code2graph", "imports", "src/a.rs"],
             &["code2graph", "module-deps"],

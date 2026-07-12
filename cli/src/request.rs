@@ -63,6 +63,11 @@ pub enum CommandRequest {
         require_unique: bool,
         role: Option<RefRole>,
     },
+    DiffImpact {
+        base: Option<String>,
+        role: Option<RefRole>,
+        depth: u32,
+    },
     Imports {
         file: String,
     },
@@ -85,6 +90,7 @@ impl CommandRequest {
             Self::Callers { .. } => "callers",
             Self::Callees { .. } => "callees",
             Self::Impact { .. } => "impact",
+            Self::DiffImpact { .. } => "diff-impact",
             Self::Usages { .. } => "usages",
             Self::Imports { .. } => "imports",
             Self::ModuleDeps => "module-deps",

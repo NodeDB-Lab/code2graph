@@ -114,7 +114,7 @@ where
     Ok(envelope)
 }
 
-fn default_impact_role<R>(index: &R, seed: &SymbolId) -> Result<Option<RefRole>>
+pub(crate) fn default_impact_role<R>(index: &R, seed: &SymbolId) -> Result<Option<RefRole>>
 where
     R: GraphRead,
     R::Error: Into<crate::CliError>,
@@ -137,7 +137,7 @@ where
     }
 }
 
-fn append_seed_impact<R>(
+pub(crate) fn append_seed_impact<R>(
     index: &R,
     seed: &SymbolId,
     filter: EdgeFilter,
