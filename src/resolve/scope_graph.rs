@@ -579,6 +579,118 @@ mod tests {
         );
     }
 
+    /// Code→SQL, baseline: a Rust `TypeRef` naming a SQL table symbol resolves
+    /// through the stitch phase as an ordinary ScopeGraph edge (the globally
+    /// unique cross-namespace TypeRef path already covered in `subgraph.rs`'s
+    /// tests). This establishes the pre-marker baseline the next test overrides.
+    #[cfg(all(feature = "rust", feature = "sql"))]
+    #[test]
+    fn code_to_sql_typeref_edge_is_scope_graph_by_default() {
+        use crate::extract::SqlExtractor;
+        use crate::graph::types::RefRole;
+
+        let schema = SqlExtractor
+            .extract("CREATE TABLE users (id INT);", "db/schema.sql")
+            .unwrap();
+        let rust_file = RustExtractor
+            .extract("pub fn run(u: users) {}", "src/app.rs")
+            .unwrap();
+
+        let graph = ScopeGraphResolver.resolve(&[schema, rust_file]).unwrap();
+
+        let edges_to_sql_table: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.role == RefRole::TypeRef && e.to.to_scip_string().ends_with("users#"))
+            .collect();
+
+        assert_eq!(
+            edges_to_sql_table.len(),
+            1,
+            "expected one Code→SQL TypeRef edge to 'users#', got {:?}",
+            edges_to_sql_table
+                .iter()
+                .map(|e| format!(
+                    "{} → {} ({:?}/{:?})",
+                    e.from.to_scip_string(),
+                    e.to.to_scip_string(),
+                    e.role,
+                    e.confidence
+                ))
+                .collect::<Vec<_>>()
+        );
+        let e = edges_to_sql_table[0];
+        assert_eq!(
+            e.provenance,
+            Provenance::ScopeGraph,
+            "without a cross_artifact marker, the edge stays ScopeGraph provenance"
+        );
+    }
+
+    /// Code→SQL, marked cross-artifact: the same `users` TypeRef reference as
+    /// [`code_to_sql_typeref_edge_is_scope_graph_by_default`], but with
+    /// `cross_artifact: true` set on the source reference (as a future
+    /// SQL-in-string extractor would set it). The scope-graph resolver must
+    /// override both provenance and confidence — `Provenance::CrossArtifact` and
+    /// `Confidence::NameOnly` — exactly as `SymbolTableResolver` already does,
+    /// even though the match is otherwise globally unique (which would
+    /// otherwise earn `Confidence::Scoped`).
+    #[cfg(all(feature = "rust", feature = "sql"))]
+    #[test]
+    fn cross_artifact_reference_yields_cross_artifact_provenance_and_name_only_confidence() {
+        use crate::extract::SqlExtractor;
+        use crate::graph::types::RefRole;
+
+        let schema = SqlExtractor
+            .extract("CREATE TABLE users (id INT);", "db/schema.sql")
+            .unwrap();
+        let mut rust_file = RustExtractor
+            .extract("pub fn run(u: users) {}", "src/app.rs")
+            .unwrap();
+
+        let marked = rust_file
+            .references
+            .iter_mut()
+            .find(|r| r.role == RefRole::TypeRef && r.name == "users")
+            .expect("Rust extractor must emit a TypeRef ref for 'users'");
+        marked.cross_artifact = true;
+
+        let graph = ScopeGraphResolver.resolve(&[schema, rust_file]).unwrap();
+
+        let edges_to_sql_table: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.role == RefRole::TypeRef && e.to.to_scip_string().ends_with("users#"))
+            .collect();
+
+        assert_eq!(
+            edges_to_sql_table.len(),
+            1,
+            "expected one Code→SQL TypeRef edge to 'users#', got {:?}",
+            edges_to_sql_table
+                .iter()
+                .map(|e| format!(
+                    "{} → {} ({:?}/{:?})",
+                    e.from.to_scip_string(),
+                    e.to.to_scip_string(),
+                    e.role,
+                    e.confidence
+                ))
+                .collect::<Vec<_>>()
+        );
+        let e = edges_to_sql_table[0];
+        assert_eq!(
+            e.confidence,
+            Confidence::NameOnly,
+            "cross-artifact ref must be forced to NameOnly regardless of unique match"
+        );
+        assert_eq!(
+            e.provenance,
+            Provenance::CrossArtifact,
+            "cross-artifact ref must be attributed to Provenance::CrossArtifact"
+        );
+    }
+
     #[cfg(feature = "go")]
     #[test]
     fn go_same_package_cross_file_call_resolves_scoped() {

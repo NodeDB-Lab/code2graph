@@ -13,11 +13,11 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::graph::types::{Edge, Provenance, RefRole, Symbol, SymbolKind};
+use crate::graph::types::{Edge, RefRole, Symbol, SymbolKind};
 use crate::symbol::SymbolId;
 
 use super::super::{enclosing_path_ends_with, namespaces_end_with};
-use super::subgraph::{FileSubgraph, PendingRef, ReExport};
+use super::subgraph::{FileSubgraph, PendingRef, ReExport, edge_tags};
 
 /// A physical definition record in a [`GlobalIndex`]. Its key is deliberately
 /// structural rather than a SCIP identity: equal symbol IDs in different files
@@ -395,12 +395,17 @@ pub(crate) fn resolve_pending(p: &PendingRef, index: &GlobalIndex) -> Option<Edg
     if matched == p.from {
         return None;
     }
+    // A pending ref derived from a secondary artifact embedded in source (e.g.
+    // SQL inside a code string) is attributed to Provenance::CrossArtifact and
+    // forced to Confidence::NameOnly — a bare embedded name is inherently
+    // ambiguous, never scope-precise, regardless of the match being unique.
+    let (confidence, provenance) = edge_tags(p.cross_artifact, p.confidence);
     Some(Edge {
         from: p.from.clone(),
         to: matched,
         role: p.role,
-        confidence: p.confidence,
-        provenance: Provenance::ScopeGraph,
+        confidence,
+        provenance,
         occ: p.occ.clone(),
     })
 }
@@ -420,6 +425,7 @@ mod tests {
     use super::super::subgraph::build_subgraph;
     use super::*;
     use crate::extract::{Extractor, RustExtractor};
+    use crate::graph::types::Provenance;
 
     /// Insert-then-remove returns the index to a not-matching state: a name that
     /// resolved uniquely before insertion no longer does after the matching
@@ -661,6 +667,7 @@ mod tests {
             confidence: Confidence::Scoped,
             qualified: false,
             type_only: false,
+            cross_artifact: false,
         }];
 
         let edges = stitch(&pending, &index);

@@ -51,6 +51,33 @@ pub(crate) struct PendingRef {
     pub qualified: bool,
     /// Restrict a TypeRef to actual type definitions rather than modules.
     pub type_only: bool,
+    /// Mirrors [`Reference::cross_artifact`](crate::graph::types::Reference::cross_artifact).
+    /// When true, the stitch phase forces the resolved edge to
+    /// [`Confidence::NameOnly`](crate::graph::types::Confidence::NameOnly) +
+    /// [`Provenance::CrossArtifact`](crate::graph::types::Provenance::CrossArtifact),
+    /// regardless of `confidence` above — a bare cross-language name match is
+    /// never scope-precise. Defaulted on deserialize for back-compat with
+    /// older persisted blobs that predate this field.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub cross_artifact: bool,
+}
+
+/// Decide `(confidence, provenance)` for a resolved edge, honoring the
+/// cross-artifact override: a cross-artifact reference always forces
+/// [`Confidence::NameOnly`] + [`Provenance::CrossArtifact`] — a bare
+/// cross-language/embedded name match is never scope-precise, regardless of
+/// `base_confidence`. Otherwise `base_confidence` pairs with
+/// [`Provenance::ScopeGraph`]. Shared by every call site (both phases) so the
+/// override rule has one implementation.
+pub(crate) fn edge_tags(
+    cross_artifact: bool,
+    base_confidence: Confidence,
+) -> (Confidence, Provenance) {
+    if cross_artifact {
+        (Confidence::NameOnly, Provenance::CrossArtifact)
+    } else {
+        (base_confidence, Provenance::ScopeGraph)
+    }
 }
 
 /// A public module alias created by a Rust `pub use` declaration.
@@ -168,6 +195,7 @@ pub(crate) fn build_subgraph(f: &FileFacts) -> FileSubgraph {
                 confidence: Confidence::Scoped,
                 qualified: false,
                 type_only: false,
+                cross_artifact: r.cross_artifact,
             });
             continue;
         }
@@ -184,6 +212,7 @@ pub(crate) fn build_subgraph(f: &FileFacts) -> FileSubgraph {
                 confidence: Confidence::Scoped,
                 qualified: false,
                 type_only: true,
+                cross_artifact: r.cross_artifact,
             });
             continue;
         }
@@ -218,6 +247,7 @@ pub(crate) fn build_subgraph(f: &FileFacts) -> FileSubgraph {
                     confidence: Confidence::Exact,
                     qualified: true,
                     type_only: r.role == RefRole::TypeRef && r.type_ref_ctx.is_some(),
+                    cross_artifact: r.cross_artifact,
                 });
             }
             continue; // qualified ref handled (deferred or honest no-op)
@@ -249,6 +279,7 @@ pub(crate) fn build_subgraph(f: &FileFacts) -> FileSubgraph {
                     confidence: Confidence::Scoped,
                     qualified: false,
                     type_only: r.type_ref_ctx.is_some(),
+                    cross_artifact: r.cross_artifact,
                 });
                 continue;
             }
@@ -269,6 +300,7 @@ pub(crate) fn build_subgraph(f: &FileFacts) -> FileSubgraph {
                     confidence: Confidence::Scoped,
                     qualified: false,
                     type_only: false,
+                    cross_artifact: r.cross_artifact,
                 });
             }
             continue;
@@ -291,12 +323,13 @@ pub(crate) fn build_subgraph(f: &FileFacts) -> FileSubgraph {
                 );
                 let to = SymbolId::local(f.file.clone(), local_id);
 
+                let (confidence, provenance) = edge_tags(r.cross_artifact, Confidence::Exact);
                 intra_edges.push(Edge {
                     from,
                     to,
                     role: r.role,
-                    confidence: Confidence::Exact,
-                    provenance: Provenance::ScopeGraph,
+                    confidence,
+                    provenance,
                     occ: r.occ.clone(),
                 });
             }
@@ -307,12 +340,14 @@ pub(crate) fn build_subgraph(f: &FileFacts) -> FileSubgraph {
                     // A definition never links to itself (same-file recursion) —
                     // parity with Tier-A, which skips `i == from_idx`.
                     if &from != target_id {
+                        let (confidence, provenance) =
+                            edge_tags(r.cross_artifact, Confidence::Scoped);
                         intra_edges.push(Edge {
                             from,
                             to: target_id.clone(),
                             role: r.role,
-                            confidence: Confidence::Scoped,
-                            provenance: Provenance::ScopeGraph,
+                            confidence,
+                            provenance,
                             occ: r.occ.clone(),
                         });
                     }
@@ -339,6 +374,7 @@ pub(crate) fn build_subgraph(f: &FileFacts) -> FileSubgraph {
                             confidence: Confidence::Exact,
                             qualified: false,
                             type_only: false,
+                            cross_artifact: r.cross_artifact,
                         });
                     }
                     // Empty segs → drop (Tier-B never fakes precision; Tier-A
