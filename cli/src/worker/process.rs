@@ -10,7 +10,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
-use code2graph::FileFacts;
+use code2graph::{FileFacts, QueryBindingRule};
 
 use crate::{Cancellation, CliError, Deadline, InventoryFile};
 
@@ -54,14 +54,17 @@ impl From<WorkerFailure> for CliError {
 }
 
 /// Extracts one admitted file in a fresh worker using the current executable.
+/// `rules` are project-supplied custom query-binding rules (from
+/// `code2graph.toml`) carried to the worker alongside the built-in defaults.
 pub fn extract_inventory_file(
     file: &InventoryFile,
     request_id: RequestId,
     deadline: &Deadline,
     cancellation: &dyn Cancellation,
+    rules: &[QueryBindingRule],
 ) -> Result<FileFacts, CliError> {
     let executable = std::env::current_exe().map_err(|_| WorkerFailure::Spawn)?;
-    extract_with_executable(&executable, file, request_id, deadline, cancellation)
+    extract_with_executable(&executable, file, request_id, deadline, cancellation, rules)
         .map_err(Into::into)
 }
 
@@ -71,9 +74,10 @@ fn extract_with_executable(
     request_id: RequestId,
     deadline: &Deadline,
     cancellation: &dyn Cancellation,
+    rules: &[QueryBindingRule],
 ) -> Result<FileFacts, WorkerFailure> {
     deadline.check(cancellation).map_err(check_failure)?;
-    let request = WorkerRequest::from_inventory_file(request_id, file)
+    let request = WorkerRequest::from_inventory_file(request_id, file, rules)
         .map_err(|_| WorkerFailure::Protocol)?;
     let frame = encode_frame(&request, REQUEST_FRAME_MAX).map_err(|_| WorkerFailure::Protocol)?;
     let mut command = Command::new(executable);
@@ -249,7 +253,7 @@ pub(crate) fn extract_with_test_executable(
     deadline: &Deadline,
     cancellation: &dyn Cancellation,
 ) -> Result<FileFacts, WorkerFailure> {
-    extract_with_executable(&executable, file, request_id, deadline, cancellation)
+    extract_with_executable(&executable, file, request_id, deadline, cancellation, &[])
 }
 
 #[cfg(all(test, unix))]

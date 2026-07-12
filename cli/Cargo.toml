@@ -25,6 +25,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 ignore = "0.4"
 blake3 = "1"
+toml = "0.8"
 directories.workspace = true
 zerompk = { version = "=0.6.0", features = ["derive"] }
 rusqlite = { version = "0.32", features = ["bundled"] }

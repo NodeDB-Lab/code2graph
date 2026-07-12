@@ -8,6 +8,7 @@ use crate::cache::{
     CacheCompleteness, CacheOmission, CacheStore, CandidateFileRecord, LoadedSnapshot,
     PackageFingerprint,
 };
+use crate::config::load_query_binding_rules;
 use crate::inventory::{
     MaterializedCandidate, OmissionImpact, SourceCandidate, discover_sources_checked,
     materialize_candidate_checked,
@@ -42,7 +43,13 @@ pub fn prepare_and_publish(
     inputs: PrepareCandidateInputs<'_>,
     allow_partial: bool,
 ) -> Result<PublishedRefresh> {
-    prepare_and_publish_with(&ProcessFactsExtractor, store, inputs, allow_partial)
+    let rules = load_query_binding_rules(&inputs.selection.canonical_root)?;
+    prepare_and_publish_with(
+        &ProcessFactsExtractor::new(rules),
+        store,
+        inputs,
+        allow_partial,
+    )
 }
 
 /// Equivalent to [`prepare_and_publish`], with an injectable extractor for

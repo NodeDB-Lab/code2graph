@@ -4,8 +4,8 @@
 
 use code2graph::{
     Binding, BindingKind, BindingTarget, ByteSpan, EntryPoint, FfiAbi, FfiExport, FileFacts,
-    FileFactsValidationContext, Language, Occurrence, RefRole, Reference, Scope, ScopeKind, Symbol,
-    SymbolId, SymbolIdWire, SymbolKind, TypeRefContext, Visibility,
+    FileFactsValidationContext, Language, Occurrence, QueryBindingRule, RefRole, Reference, Scope,
+    ScopeKind, Symbol, SymbolId, SymbolIdWire, SymbolKind, TypeRefContext, Visibility,
     validate_file_facts_with_context,
 };
 use zerompk::{Error as MessagePackError, FromMessagePack, Read, ToMessagePack, Write};
@@ -429,10 +429,13 @@ impl_numeric_map_codec!(FfiExportWire {
 });
 
 impl WorkerRequest {
-    /// Build and validate a request from an admitted inventory file.
+    /// Build and validate a request from an admitted inventory file, carrying
+    /// `rules` (project-supplied custom query-binding rules, sourced from
+    /// `code2graph.toml`) to the worker as wire DTOs.
     pub fn from_inventory_file(
         request_id: RequestId,
         file: &InventoryFile,
+        rules: &[QueryBindingRule],
     ) -> Result<Self, WorkerProtocolError> {
         validate_inventory_file(file)?;
         let request = Self {
@@ -442,7 +445,14 @@ impl WorkerRequest {
             path: file.path.as_str().to_owned(),
             language: language_to_tag(file.language),
             source: file.bytes.clone(),
-            custom_rules: Vec::new(),
+            custom_rules: rules
+                .iter()
+                .map(|rule| QueryBindingRuleWire {
+                    lang: rule.lang.as_str().to_owned(),
+                    construct: rule.construct.clone(),
+                    sql_arg: rule.sql_arg as u64,
+                })
+                .collect(),
         };
         validate_request_for_file(&request, file)?;
         Ok(request)
@@ -1274,7 +1284,7 @@ mod tests {
             bytes,
             mtime: None,
         };
-        let request = WorkerRequest::from_inventory_file(41, &file).unwrap();
+        let request = WorkerRequest::from_inventory_file(41, &file, &[]).unwrap();
         assert_eq!(
             validate_request_for_file(&request, &file).unwrap(),
             Language::Rust

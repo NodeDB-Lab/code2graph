@@ -1,9 +1,89 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+
+use code2graph::{Language, QueryBindingRule};
+
+use crate::error::{CliError, Result};
+
+/// Filename of the project-local configuration file, read from the project root.
+const CONFIG_FILE_NAME: &str = "code2graph.toml";
+
+/// Deserialized shape of `code2graph.toml`.
+///
+/// ```toml
+/// [[query_binding]]
+/// lang = "rust"
+/// construct = "mydb::sql"
+/// sql_arg = 0
+/// ```
+#[derive(Debug, Deserialize)]
+struct Code2graphToml {
+    #[serde(default)]
+    query_binding: Vec<RawQueryBindingRule>,
+}
+
+/// One `[[query_binding]]` table before its `lang` string is resolved to a
+/// `code2graph::Language` and validated.
+#[derive(Debug, Deserialize)]
+struct RawQueryBindingRule {
+    lang: String,
+    construct: String,
+    sql_arg: usize,
+}
+
+/// Loads project-supplied custom query-binding rules from `code2graph.toml`
+/// at `project_root`, merged by the caller with `BindingRules::with_defaults()`.
+///
+/// A missing file is normal (not every project customizes query binding) and
+/// yields an empty list; the built-in defaults still apply. A present but
+/// unparsable file, or a rule naming an unknown language or an empty
+/// `construct`, is a load-time configuration error reported to the user.
+pub(crate) fn load_query_binding_rules(project_root: &Path) -> Result<Vec<QueryBindingRule>> {
+    let path = project_root.join(CONFIG_FILE_NAME);
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(CliError::Fatal(format!(
+                "failed to read {}: {error}",
+                path.display()
+            )));
+        }
+    };
+    let parsed: Code2graphToml = toml::from_str(&content)
+        .map_err(|error| CliError::Fatal(format!("failed to parse {}: {error}", path.display())))?;
+    parsed
+        .query_binding
+        .into_iter()
+        .map(|raw| convert_rule(raw, &path))
+        .collect()
+}
+
+fn convert_rule(raw: RawQueryBindingRule, path: &Path) -> Result<QueryBindingRule> {
+    let lang = Language::from_tag(&raw.lang).ok_or_else(|| {
+        CliError::Fatal(format!(
+            "{}: unknown query-binding language {:?}",
+            path.display(),
+            raw.lang
+        ))
+    })?;
+    if raw.construct.is_empty() {
+        return Err(CliError::Fatal(format!(
+            "{}: query-binding rule for {:?} has an empty construct",
+            path.display(),
+            raw.lang
+        )));
+    }
+    Ok(QueryBindingRule {
+        lang,
+        construct: raw.construct,
+        sql_arg: raw.sql_arg,
+    })
+}
 
 /// Default maximum number of files considered by one invocation.
 pub const DEFAULT_MAX_FILES: usize = 10_000;
@@ -160,5 +240,72 @@ mod tests {
                 tier
             );
         }
+    }
+
+    #[test]
+    fn absent_config_file_yields_no_custom_rules() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let rules = load_query_binding_rules(temp.path()).expect("absent file is not an error");
+        assert!(rules.is_empty());
+    }
+
+    #[test]
+    fn valid_config_file_yields_its_rules() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            temp.path().join(CONFIG_FILE_NAME),
+            r#"
+[[query_binding]]
+lang = "rust"
+construct = "mydb::sql"
+sql_arg = 0
+
+[[query_binding]]
+lang = "python"
+construct = "app.raw"
+sql_arg = 1
+"#,
+        )
+        .expect("write config");
+        let rules = load_query_binding_rules(temp.path()).expect("valid config parses");
+        assert_eq!(
+            rules,
+            vec![
+                QueryBindingRule {
+                    lang: Language::Rust,
+                    construct: "mydb::sql".into(),
+                    sql_arg: 0,
+                },
+                QueryBindingRule {
+                    lang: Language::Python,
+                    construct: "app.raw".into(),
+                    sql_arg: 1,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn unknown_language_is_rejected_with_a_clear_message() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            temp.path().join(CONFIG_FILE_NAME),
+            r#"
+[[query_binding]]
+lang = "klingon"
+construct = "mydb::sql"
+sql_arg = 0
+"#,
+        )
+        .expect("write config");
+        let error = load_query_binding_rules(temp.path()).expect_err("unknown lang is rejected");
+        assert!(error.to_string().contains("klingon"));
+    }
+
+    #[test]
+    fn malformed_toml_is_rejected() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join(CONFIG_FILE_NAME), "not = [valid").expect("write config");
+        assert!(load_query_binding_rules(temp.path()).is_err());
     }
 }

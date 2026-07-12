@@ -11,7 +11,7 @@ use crate::cache::{
     CompatibilityFingerprint, CompatibilityRecord, LanguageFeatureFingerprint, LoadedSnapshot,
     PackageFingerprint, ProjectInputDigest, ResolverCacheTier,
 };
-use crate::config::{ResolverTier, ResourceLimits};
+use crate::config::{ResolverTier, ResourceLimits, load_query_binding_rules};
 use crate::deadline::{Cancellation, Deadline};
 use crate::inventory::{
     MaterializedCandidate, OmissionImpact, OmissionReason, OmittedFile, SourceCandidate,
@@ -21,7 +21,7 @@ use crate::package_assignment::assign_packages_checked;
 use crate::project::{ProjectPath, ProjectSelection};
 use crate::worker::{RequestId, WorkerErrorCode, WorkerFailure, extract_inventory_file};
 use crate::{CliError, Result};
-use code2graph::{FileFacts, validate_file_facts};
+use code2graph::{FileFacts, QueryBindingRule, validate_file_facts};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub struct PrepareCandidateInputs<'a> {
@@ -53,7 +53,17 @@ pub trait FactsExtractor: Sync {
         cancellation: &dyn Cancellation,
     ) -> Result<FileFacts>;
 }
-pub struct ProcessFactsExtractor;
+/// Extracts one file in an isolated worker subprocess, carrying the project's
+/// custom query-binding rules (loaded from `code2graph.toml`) alongside the
+/// worker's built-in defaults.
+pub struct ProcessFactsExtractor {
+    custom_rules: Vec<QueryBindingRule>,
+}
+impl ProcessFactsExtractor {
+    pub fn new(custom_rules: Vec<QueryBindingRule>) -> Self {
+        Self { custom_rules }
+    }
+}
 impl FactsExtractor for ProcessFactsExtractor {
     fn extract(
         &self,
@@ -62,7 +72,7 @@ impl FactsExtractor for ProcessFactsExtractor {
         deadline: &Deadline,
         cancellation: &dyn Cancellation,
     ) -> Result<FileFacts> {
-        extract_inventory_file(file, request_id, deadline, cancellation)
+        extract_inventory_file(file, request_id, deadline, cancellation, &self.custom_rules)
     }
 }
 
@@ -141,7 +151,8 @@ fn parallel_extract(
 pub fn prepare_refresh_candidate(
     inputs: PrepareCandidateInputs<'_>,
 ) -> Result<PreparedRefreshCandidate> {
-    prepare_refresh_candidate_with(&ProcessFactsExtractor, inputs)
+    let rules = load_query_binding_rules(&inputs.selection.canonical_root)?;
+    prepare_refresh_candidate_with(&ProcessFactsExtractor::new(rules), inputs)
 }
 pub fn prepare_refresh_candidate_with(
     extractor: &dyn FactsExtractor,
@@ -1231,5 +1242,64 @@ mod tests {
             Err(CliError::Cancelled)
         ));
         assert_eq!(extractor.calls.load(Ordering::Relaxed), 0);
+    }
+
+    // `prepare_refresh_candidate` (the production, non-`_with` entry point) is
+    // exercised here for the config-loading seam only: does it load
+    // `code2graph.toml` from `selection.canonical_root` and propagate a load
+    // failure? A full round trip through real extraction (proving the rule
+    // reaches a cross-artifact reference) requires a worker subprocess dispatch
+    // that only exists in the compiled `code2graph` binary (`main.rs`), not in
+    // this crate's unit-test binary (`std::env::current_exe()` there is the
+    // test harness itself) — that combination is covered instead by the
+    // extractor-level tests in `code2graph::extract::rust` (e.g.
+    // `cross_artifact_query_binding_resolves_to_sql_table`) and by
+    // `worker::runtime`'s tests that the wire `custom_rules` merge into
+    // `BindingRules::with_defaults()`.
+    #[test]
+    fn production_entry_point_loads_project_config_with_no_source_to_extract() {
+        // No source files admit an `Extract` decision, so `parallel_extract`
+        // never spawns a worker subprocess; this isolates the config-loading
+        // seam from subprocess dispatch while still exercising the real
+        // `prepare_refresh_candidate` entry point end to end.
+        let (_temp, selection) = project(&[(
+            "code2graph.toml",
+            "[[query_binding]]\nlang = \"rust\"\nconstruct = \"mydb::sql\"\nsql_arg = 0\n",
+        )]);
+        let prepared = prepare_refresh_candidate(PrepareCandidateInputs {
+            selection: &selection,
+            limits: &ResourceLimits::default(),
+            include_hidden: false,
+            force: false,
+            trust_mtime: false,
+            tier: ResolverTier::Name,
+            prior: None,
+            prepared_at_ns: 1,
+            deadline: &Deadline::new(None),
+            cancellation: &NeverCancelled,
+        })
+        .expect("a valid project config must not block preparation");
+        assert!(prepared.snapshot.files.is_empty());
+    }
+
+    #[test]
+    fn production_entry_point_propagates_a_malformed_project_config() {
+        let (_temp, selection) =
+            project(&[("code2graph.toml", "not = [valid"), ("a.rs", "fn a() {}\n")]);
+        assert!(matches!(
+            prepare_refresh_candidate(PrepareCandidateInputs {
+                selection: &selection,
+                limits: &ResourceLimits::default(),
+                include_hidden: false,
+                force: false,
+                trust_mtime: false,
+                tier: ResolverTier::Name,
+                prior: None,
+                prepared_at_ns: 1,
+                deadline: &Deadline::new(None),
+                cancellation: &NeverCancelled,
+            }),
+            Err(CliError::Fatal(_))
+        ));
     }
 }
