@@ -100,6 +100,29 @@ mod tests {
     }
 
     #[test]
+    fn runtime_round_trip_accepts_qualified_and_renamed_reexports() {
+        for source in [
+            b"pub use inner::Thing as T;".as_slice(),
+            b"pub use inner::deep;".as_slice(),
+            b"pub use inner::deep::d;".as_slice(),
+            b"pub use crate::inner::helper;".as_slice(),
+        ] {
+            let request = request("src/lib.rs", source);
+            let mut input =
+                std::io::Cursor::new(encode_frame(&request, REQUEST_FRAME_MAX).unwrap());
+            let mut output = Vec::new();
+            run_worker(&mut input, &mut output).unwrap();
+            assert!(
+                validate_response(&decode_response_frame(&output).unwrap(), &request)
+                    .unwrap()
+                    .is_ok(),
+                "worker rejected {}",
+                String::from_utf8_lossy(source)
+            );
+        }
+    }
+
+    #[test]
     fn runtime_returns_typed_error_for_invalid_request_and_utf8() {
         for request in [
             request("src/a.py", b"fn run() {}"),

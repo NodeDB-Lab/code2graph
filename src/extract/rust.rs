@@ -819,7 +819,10 @@ fn collect_use_leaves(
             }
             if let Some(alias) = node.child_by_field_name("alias") {
                 let alias = node_text(&alias, bytes).to_owned();
-                for reference in &mut out[first..] {
+                for reference in out[first..]
+                    .iter_mut()
+                    .filter(|reference| reference.role == RefRole::Import)
+                {
                     reference.imported_name = Some(reference.name.clone());
                     reference.name = alias.clone();
                 }
@@ -862,7 +865,10 @@ fn collect_imports(
             collect_use_leaves(&arg, bytes, file, out, module_id, "");
         }
         if read_visibility(node, bytes) == Visibility::Public {
-            for reference in &mut out[first..] {
+            for reference in out[first..]
+                .iter_mut()
+                .filter(|reference| reference.role == RefRole::Import)
+            {
                 reference.is_reexport = true;
             }
         }
@@ -1634,6 +1640,36 @@ impl std::fmt::Display for Point {
                 .and_then(|reference| reference.imported_name.as_deref()),
             Some("b")
         );
+    }
+
+    #[test]
+    fn qualified_reexport_metadata_is_confined_to_import_leaves() {
+        for src in [
+            "pub use inner::Thing as T;",
+            "pub use inner::deep;",
+            "pub use inner::deep::d;",
+            "pub use crate::inner::helper;",
+        ] {
+            let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
+            crate::validate_file_facts_with_context(
+                &facts,
+                crate::FileFactsValidationContext {
+                    expected_file: "src/lib.rs",
+                    expected_language: Language::Rust,
+                    source_len: src.len(),
+                },
+            )
+            .unwrap();
+            assert!(
+                facts.references.iter().any(|reference| {
+                    reference.role == RefRole::Import && reference.is_reexport
+                })
+            );
+            assert!(facts.references.iter().all(|reference| {
+                reference.role == RefRole::Import
+                    || (!reference.is_reexport && reference.imported_name.is_none())
+            }));
+        }
     }
 
     #[test]

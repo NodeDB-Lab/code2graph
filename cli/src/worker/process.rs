@@ -18,8 +18,8 @@ use super::WORKER_SENTINEL;
 use super::frame::{decode_response_frame, encode_frame};
 use super::platform;
 use super::protocol::{
-    REQUEST_FRAME_MAX, RESPONSE_FRAME_MAX, RequestId, WorkerErrorCode, WorkerRequest,
-    validate_response,
+    REQUEST_FRAME_MAX, RESPONSE_FRAME_MAX, RequestId, WorkerErrorCode, WorkerProtocolError,
+    WorkerRequest, validate_response,
 };
 
 const STDERR_TAIL_MAX: usize = 64 * 1024;
@@ -188,8 +188,15 @@ fn extract_with_executable(
     }
     let response = decode_response_frame(&stdout).map_err(|_| WorkerFailure::Protocol)?;
     validate_response(&response, &request)
-        .map_err(|_| WorkerFailure::Protocol)?
+        .map_err(classify_response_error)?
         .map_err(|remote| WorkerFailure::Remote(remote.code))
+}
+
+fn classify_response_error(error: WorkerProtocolError) -> WorkerFailure {
+    match error {
+        WorkerProtocolError::Facts(_) => WorkerFailure::Remote(WorkerErrorCode::Extraction),
+        _ => WorkerFailure::Protocol,
+    }
 }
 
 fn check_failure(error: CliError) -> WorkerFailure {
@@ -298,6 +305,18 @@ mod tests {
             &deadline,
             &NeverCancelled,
         )
+    }
+
+    #[test]
+    fn invalid_worker_facts_are_classified_as_omittable_extraction_failures() {
+        assert!(matches!(
+            classify_response_error(WorkerProtocolError::Facts("invalid facts".into())),
+            WorkerFailure::Remote(WorkerErrorCode::Extraction)
+        ));
+        assert!(matches!(
+            classify_response_error(WorkerProtocolError::Malformed("bad frame")),
+            WorkerFailure::Protocol
+        ));
     }
 
     #[test]
