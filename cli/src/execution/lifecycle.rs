@@ -622,9 +622,6 @@ fn cached_sources_are_current(
     deadline: &Deadline,
     cancellation: &dyn crate::Cancellation,
 ) -> Result<bool> {
-    if metadata.completeness != CacheCompleteness::Complete {
-        return Ok(false);
-    }
     let discovery = discover_sources_checked(
         selection,
         &request.global.limits,
@@ -632,30 +629,65 @@ fn cached_sources_are_current(
         deadline,
         cancellation,
     )?;
+    // A discovery-level omission that shrinks the source set (e.g. a metadata
+    // budget or an oversized file) still forces a refresh: it changes which
+    // sources exist, not merely which ones extracted.
     if discovery
         .omitted
         .iter()
         .any(|omission| omission.impact == OmissionImpact::IncompleteSourceSet)
-        || discovery.candidates.len() as u64 != metadata.inventory_file_count
     {
         return Ok(false);
     }
+    // A PARTIAL snapshot (some files failed extraction — normal for any real
+    // codebase with an unparseable file) is still a valid cache: those files
+    // contribute no facts, so the graph is unchanged as long as the SOURCE SET
+    // is unchanged. Serve it from cache instead of re-indexing on every query.
+    // The expected source set is the successfully-cached files plus the recorded
+    // extraction omissions; a mismatch (added/removed source) forces a refresh.
     let cached = store.candidate_file_metadata(metadata.candidate_id, deadline)?;
-    if cached.len() != discovery.candidates.len() {
-        return Ok(false);
-    }
-    Ok(discovery
+    let omission_paths: std::collections::HashSet<&str> = metadata
+        .omissions
+        .iter()
+        .map(|omission| omission.path.as_str())
+        .collect();
+    // Only language-bearing candidates are real sources: discovery also lists
+    // files it recognises but has no extractor for (`language == None`), which the
+    // index neither extracts nor records as omissions. Comparing against those
+    // would wrongly report every query as stale. The accounted set is therefore
+    // the successfully-cached files plus the recorded extraction omissions.
+    let sources: Vec<_> = discovery
         .candidates
         .iter()
-        .zip(cached)
-        .all(|(candidate, cached)| {
-            candidate.path.as_str() == cached.path
-                && candidate
+        .filter(|candidate| candidate.language.is_some())
+        .collect();
+    if sources.len() as u64 != metadata.inventory_file_count + omission_paths.len() as u64 {
+        return Ok(false);
+    }
+    let cached_by_path: std::collections::HashMap<&str, _> =
+        cached.iter().map(|file| (file.path.as_str(), file)).collect();
+    for candidate in sources {
+        match cached_by_path.get(candidate.path.as_str()) {
+            // A successfully-extracted file: it must be byte-for-byte unchanged.
+            Some(cached) => {
+                let unchanged = candidate
                     .language
                     .is_some_and(|language| language.as_str() == cached.language)
-                && candidate.size_bytes == cached.size_bytes
-                && candidate.mtime == cached.mtime
-        }))
+                    && candidate.size_bytes == cached.size_bytes
+                    && candidate.mtime == cached.mtime;
+                if !unchanged {
+                    return Ok(false);
+                }
+            }
+            // A file that failed extraction last time: its bytes are not tracked
+            // (it contributed no facts), so accept it as still-omitted. An
+            // explicit `index` re-checks whether it has since become parseable.
+            None if omission_paths.contains(candidate.path.as_str()) => {}
+            // A source the cache has never seen → refresh.
+            None => return Ok(false),
+        }
+    }
+    Ok(true)
 }
 
 fn loaded_from_metadata(
