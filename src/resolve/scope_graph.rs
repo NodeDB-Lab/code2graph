@@ -140,7 +140,13 @@ mod tests {
     use crate::extract::PythonExtractor;
     #[cfg(feature = "rust")]
     use crate::extract::RustExtractor;
-    #[cfg(feature = "rust")]
+    #[cfg(any(
+        feature = "rust",
+        feature = "python",
+        feature = "typescript",
+        feature = "go",
+        feature = "ruby"
+    ))]
     use crate::graph::types::Confidence;
     #[cfg(any(
         feature = "rust",
@@ -1125,6 +1131,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "rust")]
     #[test]
     fn cyclic_or_ambiguous_rust_pub_use_emits_no_type_edge() {
         use crate::graph::types::RefRole;
@@ -1179,6 +1186,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "rust")]
     #[test]
     fn scoped_struct_field_type_resolves_across_files() {
         use crate::graph::types::RefRole;
@@ -1199,6 +1207,7 @@ mod tests {
         }));
     }
 
+    #[cfg(feature = "rust")]
     #[test]
     fn typeref_resolves_to_same_file_definition() {
         use crate::graph::types::RefRole;
