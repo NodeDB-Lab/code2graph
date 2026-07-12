@@ -720,6 +720,7 @@ fn same_binary_hidden_worker_succeeds_before_clap_and_stays_out_of_help() {
         path: "src/a.rs".into(),
         language: 0,
         source: b"fn run() {}".to_vec(),
+        custom_rules: Vec::new(),
     };
     let payload = zerompk::to_msgpack_vec(&request).unwrap();
     let mut frame = u32::try_from(payload.len()).unwrap().to_be_bytes().to_vec();

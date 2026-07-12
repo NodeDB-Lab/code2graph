@@ -160,6 +160,12 @@ impl Language {
         }
     }
 
+    /// Parses the lowercase tag produced by [`Language::as_str`] back into a
+    /// `Language`, or `None` if the tag is unrecognized.
+    pub fn from_tag(tag: &str) -> Option<Language> {
+        Language::ALL.iter().copied().find(|l| l.as_str() == tag)
+    }
+
     /// Map a lowercase file extension to a `Language`, or `None` if unknown.
     /// Derives from `extensions()` so the mapping has a single source of truth.
     pub fn from_extension(ext: &str) -> Option<Self> {
@@ -242,6 +248,16 @@ mod tests {
     #[test]
     fn tag_is_stable_lowercase() {
         assert_eq!(Language::TypeScript.as_str(), "typescript");
+    }
+
+    #[test]
+    fn from_tag_reverses_as_str() {
+        assert_eq!(Language::from_tag("rust"), Some(Language::Rust));
+        assert_eq!(Language::from_tag("sql"), Some(Language::Sql));
+        assert_eq!(Language::from_tag("nope"), None);
+        for &l in Language::ALL {
+            assert_eq!(Language::from_tag(l.as_str()), Some(l));
+        }
     }
 
     /// Compile-time guard: a new `Language` variant forces a new arm here (no

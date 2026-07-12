@@ -100,7 +100,8 @@ pub enum WorkerProtocolError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-/// Stable numeric keys: version, kind, request ID, path, language, source.
+/// Stable numeric keys: version, kind, request ID, path, language, source,
+/// custom query-binding rules.
 pub struct WorkerRequest {
     pub version: u16,
     pub kind: u8,
@@ -108,6 +109,15 @@ pub struct WorkerRequest {
     pub path: String,
     pub language: u16,
     pub source: Vec<u8>,
+    pub custom_rules: Vec<QueryBindingRuleWire>,
+}
+
+/// Wire form of a `code2graph::QueryBindingRule` sourced from `code2graph.toml`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryBindingRuleWire {
+    pub lang: String,
+    pub construct: String,
+    pub sql_arg: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -235,9 +245,14 @@ pub struct FfiExportWire {
     pub export_name: String,
 }
 
+impl_numeric_map_codec!(QueryBindingRuleWire {
+    required { 0 => lang: String, 1 => construct: String, 2 => sql_arg: u64 }
+    optional {}
+});
+
 impl ToMessagePack for WorkerRequest {
     fn write<W: Write>(&self, writer: &mut W) -> zerompk::Result<()> {
-        writer.write_map_len(6)?;
+        writer.write_map_len(7)?;
         writer.write_u8(0)?;
         self.version.write(writer)?;
         writer.write_u8(1)?;
@@ -250,6 +265,8 @@ impl ToMessagePack for WorkerRequest {
         self.language.write(writer)?;
         writer.write_u8(5)?;
         writer.write_binary(&self.source)?;
+        writer.write_u8(6)?;
+        self.custom_rules.write(writer)?;
         Ok(())
     }
 }
@@ -271,6 +288,7 @@ impl<'a> FromMessagePack<'a> for WorkerRequest {
             let mut path = None;
             let mut language = None;
             let mut source = None;
+            let mut custom_rules = None;
             for _ in 0..len {
                 match reader.read_u64()? {
                     0 if version.is_none() => version = Some(reader.read_u16()?),
@@ -279,12 +297,16 @@ impl<'a> FromMessagePack<'a> for WorkerRequest {
                     3 if path.is_none() => path = Some(read_string_capped(reader)?),
                     4 if language.is_none() => language = Some(reader.read_u16()?),
                     5 if source.is_none() => source = Some(reader.read_binary()?.into_owned()),
+                    6 if custom_rules.is_none() => {
+                        custom_rules = Some(Vec::<QueryBindingRuleWire>::read(reader)?)
+                    }
                     0 => return Err(MessagePackError::KeyDuplicated("version".into())),
                     1 => return Err(MessagePackError::KeyDuplicated("kind".into())),
                     2 => return Err(MessagePackError::KeyDuplicated("request_id".into())),
                     3 => return Err(MessagePackError::KeyDuplicated("path".into())),
                     4 => return Err(MessagePackError::KeyDuplicated("language".into())),
                     5 => return Err(MessagePackError::KeyDuplicated("source".into())),
+                    6 => return Err(MessagePackError::KeyDuplicated("custom_rules".into())),
                     _ => reader.skip_value()?,
                 }
             }
@@ -304,6 +326,7 @@ impl<'a> FromMessagePack<'a> for WorkerRequest {
                 language: language
                     .ok_or_else(|| MessagePackError::KeyNotFound("language".into()))?,
                 source,
+                custom_rules: custom_rules.unwrap_or_default(),
             })
         })();
         reader.decrement_depth();
@@ -419,6 +442,7 @@ impl WorkerRequest {
             path: file.path.as_str().to_owned(),
             language: language_to_tag(file.language),
             source: file.bytes.clone(),
+            custom_rules: Vec::new(),
         };
         validate_request_for_file(&request, file)?;
         Ok(request)
@@ -1078,6 +1102,7 @@ mod tests {
             path: "src/a.rs".into(),
             language: 0,
             source: b"fn run() {}".to_vec(),
+            custom_rules: Vec::new(),
         }
     }
 
@@ -1278,13 +1303,36 @@ mod tests {
             path: "a.rs".into(),
             language: 0,
             source: vec![0xff],
+            custom_rules: Vec::new(),
         };
         assert_eq!(
             zerompk::to_msgpack_vec(&request).unwrap(),
             [
-                0x86, 0x00, 0x01, 0x01, 0x01, 0x02, 0x07, 0x03, 0xa4, b'a', b'.', b'r', b's', 0x04,
-                0x00, 0x05, 0xc4, 0x01, 0xff,
+                0x87, 0x00, 0x01, 0x01, 0x01, 0x02, 0x07, 0x03, 0xa4, b'a', b'.', b'r', b's', 0x04,
+                0x00, 0x05, 0xc4, 0x01, 0xff, 0x06, 0x90,
             ]
+        );
+    }
+
+    #[test]
+    fn request_round_trips_custom_rules() {
+        let mut request = request();
+        request.custom_rules = vec![
+            QueryBindingRuleWire {
+                lang: "rust".into(),
+                construct: "mydb::sql".into(),
+                sql_arg: 0,
+            },
+            QueryBindingRuleWire {
+                lang: "python".into(),
+                construct: "mydb.execute".into(),
+                sql_arg: 1,
+            },
+        ];
+        let encoded = zerompk::to_msgpack_vec(&request).unwrap();
+        assert_eq!(
+            zerompk::from_msgpack::<WorkerRequest>(&encoded).unwrap(),
+            request
         );
     }
 

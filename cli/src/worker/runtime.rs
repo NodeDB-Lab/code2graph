@@ -4,12 +4,14 @@
 
 use std::io::{Read, Write};
 
-use code2graph::{BindingRules, extract_file_with_bindings, validate_file_facts};
+use code2graph::{
+    BindingRules, Language, QueryBindingRule, extract_file_with_bindings, validate_file_facts,
+};
 
 use super::frame::{decode_request_frame, read_frame, reject_trailing_bytes, write_frame};
 use super::protocol::{
-    FileFactsWire, PROTOCOL_VERSION, REQUEST_FRAME_MAX, RESPONSE_FRAME_MAX, WorkerErrorCode,
-    WorkerErrorWire, WorkerProtocolError, WorkerResponse, validate_request,
+    FileFactsWire, MAX_STRING_BYTES, PROTOCOL_VERSION, REQUEST_FRAME_MAX, RESPONSE_FRAME_MAX,
+    WorkerErrorCode, WorkerErrorWire, WorkerProtocolError, WorkerResponse, validate_request,
 };
 
 /// Hidden sole argument which enters the worker runtime before CLI parsing.
@@ -35,7 +37,25 @@ pub fn run_worker<R: Read, W: Write>(
     // Cross-artifact code→SQL edges are on by default: extraction applies the
     // built-in query-binding rules so embedded SQL in recognized constructs
     // (e.g. `sqlx::query("… FROM users")`) yields references to SQL entities.
-    let rules = BindingRules::with_defaults();
+    // Project-supplied custom rules (from `code2graph.toml`, wired through the
+    // request) are layered on top of the defaults.
+    let mut rules = BindingRules::with_defaults();
+    for wire in &request.custom_rules {
+        // A malformed/foreign advisory rule must never break extraction of an
+        // otherwise-valid file: unknown lang tags and implausibly large strings
+        // are skipped, not errored. (Bounds mirror the codebase's per-string cap
+        // for wire data; genuine constructs are a few dozen bytes.)
+        if wire.lang.len() > MAX_STRING_BYTES || wire.construct.len() > MAX_STRING_BYTES {
+            continue;
+        }
+        if let Some(lang) = Language::from_tag(&wire.lang) {
+            rules.register(QueryBindingRule {
+                lang,
+                construct: wire.construct.clone(),
+                sql_arg: wire.sql_arg as usize,
+            });
+        }
+    }
     let response = match validate_request(&request) {
         Ok(language) => match std::str::from_utf8(&request.source)
             .ok()
@@ -78,7 +98,7 @@ fn remote_error(
 #[cfg(test)]
 mod tests {
     use super::super::frame::{decode_response_frame, encode_frame};
-    use super::super::protocol::{WorkerRequest, validate_response};
+    use super::super::protocol::{QueryBindingRuleWire, WorkerRequest, validate_response};
     use super::*;
 
     fn request(path: &str, source: &[u8]) -> WorkerRequest {
@@ -89,6 +109,7 @@ mod tests {
             path: path.into(),
             language: 0,
             source: source.into(),
+            custom_rules: Vec::new(),
         }
     }
 
@@ -126,6 +147,33 @@ mod tests {
                 String::from_utf8_lossy(source)
             );
         }
+    }
+
+    #[test]
+    fn runtime_applies_custom_query_binding_rules_from_the_request() {
+        let mut req = request(
+            "src/app.rs",
+            b"pub fn f() { mydb::sql(\"SELECT id FROM users\"); }",
+        );
+        req.custom_rules = vec![QueryBindingRuleWire {
+            lang: "rust".into(),
+            construct: "mydb::sql".into(),
+            sql_arg: 0,
+        }];
+        let mut input = std::io::Cursor::new(encode_frame(&req, REQUEST_FRAME_MAX).unwrap());
+        let mut output = Vec::new();
+        run_worker(&mut input, &mut output).unwrap();
+        let response = decode_response_frame(&output).unwrap();
+        let facts = response.facts.expect("valid request should produce facts");
+        assert!(
+            facts
+                .references
+                .iter()
+                // role 4 == RefRole::TypeRef (see `ref_role_tag` in protocol.rs).
+                .any(|r| r.name == "users" && r.role == 4 && r.cross_artifact == Some(true)),
+            "expected a cross-artifact TypeRef reference named 'users' from the custom rule, got {:?}",
+            facts.references
+        );
     }
 
     #[test]

@@ -379,6 +379,7 @@ mod tests {
             path: "src/a.rs".into(),
             language: 0,
             source: b"fn run() {}".to_vec(),
+            custom_rules: Vec::new(),
         };
         let frame = encode_frame(&request, REQUEST_FRAME_MAX).unwrap();
         let decoded = decode_request_frame(&frame).unwrap();
@@ -413,6 +414,7 @@ mod tests {
             path: "src/a.rs".into(),
             language: 0,
             source: b"fn run() {}".to_vec(),
+            custom_rules: Vec::new(),
         };
         let mut output = Vec::new();
         write_frame(&mut output, &request, REQUEST_FRAME_MAX).unwrap();
@@ -479,6 +481,7 @@ mod tests {
                 path: "src/a.rs".into(),
                 language: 0,
                 source: b"fn run() {}".to_vec(),
+                custom_rules: Vec::new(),
             },
             REQUEST_FRAME_MAX,
         )
@@ -526,6 +529,7 @@ mod tests {
             path: "src/a.rs".into(),
             language: 0,
             source: b"fn run() {}".to_vec(),
+            custom_rules: Vec::new(),
         };
         let mut frame = encode_frame(&request, REQUEST_FRAME_MAX).unwrap();
         let start = frame
