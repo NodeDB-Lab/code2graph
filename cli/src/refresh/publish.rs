@@ -693,7 +693,10 @@ mod tests {
             Err(CliError::Index(message)) if message.contains("continued to drift")
         ));
         assert_eq!(hook.generation.get(), MAX_REFRESH_ATTEMPTS);
-        assert_eq!(extractor.calls.load(Ordering::Relaxed), MAX_REFRESH_ATTEMPTS);
+        assert_eq!(
+            extractor.calls.load(Ordering::Relaxed),
+            MAX_REFRESH_ATTEMPTS
+        );
     }
 
     #[test]

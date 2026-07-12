@@ -109,7 +109,8 @@ fn parallel_extract(
     }
 
     let cursor = AtomicUsize::new(0);
-    let results: Mutex<Vec<(usize, Result<FileFacts>)>> = Mutex::new(Vec::with_capacity(work.len()));
+    let results: Mutex<Vec<(usize, Result<FileFacts>)>> =
+        Mutex::new(Vec::with_capacity(work.len()));
     std::thread::scope(|scope| {
         for _ in 0..workers {
             scope.spawn(|| {
@@ -329,8 +330,12 @@ fn prepare(
     // Pass 2 (parallel): run the independent per-file extractions across a bounded
     // pool. Results come back keyed by plan index and are merged in that order, so
     // `facts`, `changed`, and `extra_omissions` are identical to a serial run.
-    let extracted =
-        parallel_extract(extractor, &extract_work, inputs.deadline, inputs.cancellation);
+    let extracted = parallel_extract(
+        extractor,
+        &extract_work,
+        inputs.deadline,
+        inputs.cancellation,
+    );
 
     // Pass 3 (sequential, in plan order): apply each extraction outcome.
     for (index, result) in extracted {
