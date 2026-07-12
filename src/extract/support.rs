@@ -534,6 +534,53 @@ pub(crate) fn shift_offsets(
     }
 }
 
+/// Given an argument node believed to hold embedded SQL, parse its
+/// `content_kind` child (the grammar's raw-string-content node kind — e.g.
+/// `"string_content"` for Rust/Python, `"string_fragment"` for TS/JS) with the
+/// SQL extractor and emit a [`RefRole::TypeRef`] reference (`cross_artifact:
+/// true`) for each entity use-site found, anchored at the entity's position
+/// within the original source. Shared by every per-language query-binding scan
+/// so the emit logic is defined exactly once.
+#[cfg(feature = "sql")]
+pub(crate) fn emit_embedded_sql_refs(
+    arg: &Node,
+    content_kind: &str,
+    bytes: &[u8],
+    file: &str,
+    out: &mut Vec<Reference>,
+) {
+    let Some(content) = arg
+        .children(&mut arg.walk())
+        .find(|c| c.kind() == content_kind)
+    else {
+        return;
+    };
+    let content_start = content.start_byte();
+
+    for entity in super::collect_sql_entity_references(node_text(&content, bytes)) {
+        let abs = content_start + entity.rel_byte;
+        let (line, col) = byte_to_line_col(bytes, abs);
+        out.push(Reference {
+            name: entity.name,
+            occ: Occurrence {
+                file: file.to_owned(),
+                line,
+                col,
+                byte: abs,
+            },
+            role: RefRole::TypeRef,
+            source_module: None,
+            from_path: None,
+            is_reexport: false,
+            imported_name: None,
+            qualifier: entity.qualifier,
+            scope: None,
+            type_ref_ctx: None,
+            cross_artifact: true,
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

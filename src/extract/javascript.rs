@@ -29,7 +29,16 @@ impl Extractor for JavaScriptExtractor {
     }
 
     fn extract(&self, source: &str, file: &str) -> Result<FileFacts> {
-        extract_ecmascript(source, file, Language::JavaScript)
+        extract_ecmascript(source, file, Language::JavaScript, None)
+    }
+
+    fn extract_with_bindings(
+        &self,
+        source: &str,
+        file: &str,
+        rules: &super::BindingRules,
+    ) -> Result<FileFacts> {
+        extract_ecmascript(source, file, Language::JavaScript, Some(rules))
     }
 }
 

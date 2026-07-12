@@ -115,6 +115,9 @@ pub use swift::SwiftExtractor;
 #[cfg(feature = "typescript")]
 pub use typescript::TypeScriptExtractor;
 
+#[cfg(all(feature = "_extractors", feature = "sql"))]
+#[allow(unused_imports)]
+pub(crate) use support::emit_embedded_sql_refs;
 #[cfg(feature = "_extractors")]
 #[allow(unused_imports)]
 pub(crate) use support::{

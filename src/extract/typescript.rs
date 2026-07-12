@@ -27,8 +27,10 @@ use crate::graph::types::{
 use crate::lang::Language;
 use crate::symbol::Descriptor;
 
+#[cfg(feature = "sql")]
+use super::emit_embedded_sql_refs;
 use super::{
-    ExtractCtx, Extractor, MIN_REF_LEN, attach_reference_scopes, child_text,
+    BindingRules, ExtractCtx, Extractor, MIN_REF_LEN, attach_reference_scopes, child_text,
     collect_call_references, definition_bindings, import_bindings, make_symbol, node_span,
     node_text, one_line_signature, push_binding, push_ref, push_scope, push_type_ref,
 };
@@ -52,14 +54,28 @@ impl Extractor for TypeScriptExtractor {
     }
 
     fn extract(&self, source: &str, file: &str) -> Result<FileFacts> {
-        extract_ecmascript(source, file, Language::TypeScript)
+        extract_ecmascript(source, file, Language::TypeScript, None)
+    }
+
+    fn extract_with_bindings(
+        &self,
+        source: &str,
+        file: &str,
+        rules: &BindingRules,
+    ) -> Result<FileFacts> {
+        extract_ecmascript(source, file, Language::TypeScript, Some(rules))
     }
 }
 
 /// Shared TypeScript/JavaScript extraction core. The TypeScript grammar is a
 /// superset of JavaScript, so both extractors parse with it; `lang` selects the
 /// language tag and SCIP scheme. `.tsx`/`.jsx` files use the TSX grammar.
-pub(super) fn extract_ecmascript(source: &str, file: &str, lang: Language) -> Result<FileFacts> {
+pub(super) fn extract_ecmascript(
+    source: &str,
+    file: &str,
+    lang: Language,
+    rules: Option<&BindingRules>,
+) -> Result<FileFacts> {
     let ts_language = if file.ends_with(".tsx") || file.ends_with(".jsx") {
         crate::grammar::tsx()
     } else {
@@ -95,6 +111,13 @@ pub(super) fn extract_ecmascript(source: &str, file: &str, lang: Language) -> Re
     collect_type_references(&root, bytes, file, &mut references);
     collect_read_references(&root, bytes, file, &mut references);
     collect_write_references(&root, bytes, file, &mut references);
+
+    #[cfg(feature = "sql")]
+    if let Some(rules) = rules {
+        collect_query_bindings(&root, bytes, file, lang, rules, &mut references);
+    }
+    #[cfg(not(feature = "sql"))]
+    let _ = rules;
 
     let scopes = collect_scopes(&root, source.len());
     attach_reference_scopes(&mut references, &scopes);
@@ -682,6 +705,52 @@ fn collect_write_references(node: &Node, bytes: &[u8], file: &str, out: &mut Vec
     }
     for child in node.children(&mut node.walk()) {
         collect_write_references(&child, bytes, file, out);
+    }
+}
+
+// ── Query-binding scan (cross-artifact code→SQL edges) ───────────────────────
+
+/// Recursively walk `node` looking for call sites matching one of `rules`'s
+/// constructs for `lang` (e.g. `knex.raw`), and emit a [`RefRole::TypeRef`]
+/// reference (`cross_artifact: true`) for every SQL entity (table/view) named
+/// in the embedded SQL argument.
+///
+/// Never fails extraction: a construct that doesn't match the expected shape
+/// (unexpected argument kind, no string literal, malformed SQL, …) is simply
+/// skipped.
+#[cfg(feature = "sql")]
+fn collect_query_bindings(
+    node: &Node,
+    bytes: &[u8],
+    file: &str,
+    lang: Language,
+    rules: &BindingRules,
+    out: &mut Vec<Reference>,
+) {
+    if node.kind() == "call_expression" {
+        if let Some(func) = node.child_by_field_name("function") {
+            if func.kind() == "member_expression" {
+                let callee = node_text(&func, bytes);
+                for rule in rules.for_language(lang) {
+                    if rule.construct != callee {
+                        continue;
+                    }
+                    let Some(arguments) = node.child_by_field_name("arguments") else {
+                        continue;
+                    };
+                    let Some(arg) = arguments
+                        .named_children(&mut arguments.walk())
+                        .nth(rule.sql_arg)
+                    else {
+                        continue;
+                    };
+                    emit_embedded_sql_refs(&arg, "string_fragment", bytes, file, out);
+                }
+            }
+        }
+    }
+    for child in node.children(&mut node.walk()) {
+        collect_query_bindings(&child, bytes, file, lang, rules, out);
     }
 }
 
@@ -1316,6 +1385,67 @@ export const Y = 2;
         assert!(
             foo_reads.is_empty(),
             "property 'foo' in member_expression must NOT be a Read ref; got: {foo_reads:?}"
+        );
+    }
+
+    // ── Query-binding scan (cross-artifact code→SQL edges) ───────────────────
+
+    #[cfg(feature = "sql")]
+    #[test]
+    fn knex_raw_call_emits_cross_artifact_typeref_ts() {
+        let src = r#"function run() { knex.raw("SELECT id FROM users"); }"#;
+        let facts = TypeScriptExtractor
+            .extract_with_bindings(src, "src/app.ts", &BindingRules::with_defaults())
+            .unwrap();
+        let r = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::TypeRef && r.name == "users" && r.cross_artifact)
+            .expect("expected a cross-artifact TypeRef reference for 'users'");
+        assert!(
+            r.occ.byte >= src.find("SELECT").unwrap(),
+            "reference byte offset should be inside the SQL string"
+        );
+    }
+
+    #[cfg(feature = "sql")]
+    #[test]
+    fn knex_raw_call_emits_cross_artifact_typeref_js() {
+        use crate::extract::JavaScriptExtractor;
+
+        let src = r#"function run() { knex.raw("SELECT id FROM users"); }"#;
+        let facts = JavaScriptExtractor
+            .extract_with_bindings(src, "src/app.js", &BindingRules::with_defaults())
+            .unwrap();
+        let r = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::TypeRef && r.name == "users" && r.cross_artifact)
+            .expect("expected a cross-artifact TypeRef reference for 'users'");
+        assert!(
+            r.occ.byte >= src.find("SELECT").unwrap(),
+            "reference byte offset should be inside the SQL string"
+        );
+    }
+
+    #[cfg(feature = "sql")]
+    #[test]
+    fn empty_binding_rules_yield_no_cross_artifact_reference_ts() {
+        let src = r#"function run() { knex.raw("SELECT id FROM users"); }"#;
+        let file = "src/app.ts";
+
+        let facts_empty = TypeScriptExtractor
+            .extract_with_bindings(src, file, &BindingRules::empty())
+            .unwrap();
+        assert!(
+            !facts_empty.references.iter().any(|r| r.cross_artifact),
+            "empty BindingRules must yield no cross_artifact references"
+        );
+
+        let facts_plain = TypeScriptExtractor.extract(src, file).unwrap();
+        assert!(
+            !facts_plain.references.iter().any(|r| r.cross_artifact),
+            "plain extract() must yield no cross_artifact references"
         );
     }
 }

@@ -102,7 +102,7 @@ impl Extractor for SvelteExtractor {
             // but these definitions belong to the enclosing Svelte document.
             // Keeping the output language Svelte makes every global identity
             // agree with the containing FileFacts coordinates.
-            let mut block_facts = extract_ecmascript(inner_source, file, Language::Svelte)?;
+            let mut block_facts = extract_ecmascript(inner_source, file, Language::Svelte, None)?;
             shift_offsets(&mut block_facts, delta, file, "svelte", bytes);
 
             // Merge: fix up ScopeId indices before extending. `scope_base` is >= 1

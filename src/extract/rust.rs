@@ -23,13 +23,13 @@ use crate::graph::types::{
 use crate::lang::Language;
 use crate::symbol::Descriptor;
 
+#[cfg(feature = "sql")]
+use super::emit_embedded_sql_refs;
 use super::{
     BindingRules, ExtractCtx, Extractor, MIN_REF_LEN, attach_reference_scopes, child_text,
     collect_call_references, definition_bindings, import_bindings, make_symbol, node_occurrence,
     node_span, node_text, one_line_signature, push_binding, push_ref, push_scope,
 };
-#[cfg(feature = "sql")]
-use super::{byte_to_line_col, collect_sql_entity_references};
 
 /// Tree-sitter query capturing call-callee identifiers (and optional qualifier).
 const CALL_QUERY: &str = r#"
@@ -1296,46 +1296,17 @@ fn nth_macro_string_arg<'a>(token_tree: &Node<'a>, index: usize) -> Option<Node<
     None
 }
 
-/// Given a string-literal argument node believed to hold embedded SQL, parse
-/// its content with the SQL extractor and emit a [`RefRole::TypeRef`]
-/// reference (`cross_artifact: true`) for each entity use-site found, anchored
-/// at the entity's position within the original Rust source.
+/// Given a string-literal argument node believed to hold embedded SQL, emit a
+/// [`RefRole::TypeRef`] reference (`cross_artifact: true`) for each entity
+/// use-site found, anchored at the entity's position within the original Rust
+/// source. Delegates to the shared [`super::emit_embedded_sql_refs`] once the
+/// Rust-specific string-literal guard is satisfied.
 #[cfg(feature = "sql")]
 fn emit_bound_sql_refs(arg: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
     if !matches!(arg.kind(), "string_literal" | "raw_string_literal") {
         return;
     }
-    let Some(content) = arg
-        .children(&mut arg.walk())
-        .find(|c| c.kind() == "string_content")
-    else {
-        return;
-    };
-    let sql_text = node_text(&content, bytes);
-    let content_start = content.start_byte();
-
-    for entity in collect_sql_entity_references(sql_text) {
-        let abs = content_start + entity.rel_byte;
-        let (line, col) = byte_to_line_col(bytes, abs);
-        out.push(Reference {
-            name: entity.name,
-            occ: crate::graph::types::Occurrence {
-                file: file.to_owned(),
-                line,
-                col,
-                byte: abs,
-            },
-            role: RefRole::TypeRef,
-            source_module: None,
-            from_path: None,
-            is_reexport: false,
-            imported_name: None,
-            qualifier: entity.qualifier,
-            scope: None,
-            type_ref_ctx: None,
-            cross_artifact: true,
-        });
-    }
+    emit_embedded_sql_refs(arg, "string_content", bytes, file, out);
 }
 
 // ── Scope tree ───────────────────────────────────────────────────────────────
