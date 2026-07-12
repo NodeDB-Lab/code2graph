@@ -53,6 +53,18 @@ pub(crate) struct PendingRef {
     pub type_only: bool,
 }
 
+/// A public module alias created by a Rust `pub use` declaration.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ReExport {
+    /// Namespace path of the module publishing `name`.
+    pub module_path: Vec<String>,
+    /// Local public name, including an `as` alias when present.
+    pub name: String,
+    /// Fully normalized source path, including the source leaf.
+    pub source_path: Vec<String>,
+}
+
 /// The resolution facts for ONE file, isolated from all other files.
 ///
 /// A `FileSubgraph` is the per-file unit of incremental Tier-B resolution.
@@ -80,6 +92,9 @@ pub struct FileSubgraph {
     pub(crate) intra_edges: Vec<Edge>,
     /// Cross-file refs awaiting the global index.
     pub(crate) pending: Vec<PendingRef>,
+    /// Public aliases exported by this file's module.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub(crate) reexports: Vec<ReExport>,
 }
 
 /// Resolve everything in `f` that can be resolved without other files, deferring
@@ -124,6 +139,8 @@ pub(crate) fn build_subgraph(f: &FileFacts) -> FileSubgraph {
         .find(|s| s.id.namespaces_iter().next().is_some())
         .map(|s| s.id.namespaces_iter().map(str::to_owned).collect())
         .unwrap_or_default();
+
+    let reexports = collect_reexports(f, &symbols);
 
     let mut intra_edges: Vec<Edge> = Vec::new();
     let mut pending: Vec<PendingRef> = Vec::new();
@@ -188,7 +205,10 @@ pub(crate) fn build_subgraph(f: &FileFacts) -> FileSubgraph {
         // never faked: stitch only emits an edge on a UNIQUE match.
         if let Some(qual) = &r.qualifier {
             let segs = normalize_from_path(qual);
-            if !segs.is_empty() {
+            let crate_root_type = r.role == RefRole::TypeRef
+                && r.type_ref_ctx.is_some()
+                && matches!(qual.as_str(), "crate" | "::");
+            if !segs.is_empty() || crate_root_type {
                 pending.push(PendingRef {
                     from,
                     name: r.name.clone(),
@@ -335,6 +355,7 @@ pub(crate) fn build_subgraph(f: &FileFacts) -> FileSubgraph {
         symbols,
         intra_edges,
         pending,
+        reexports,
     }
 }
 
@@ -343,6 +364,62 @@ pub(crate) fn build_subgraph(f: &FileFacts) -> FileSubgraph {
 ///
 /// The walk goes outward only (child → parent), so a reference never sees
 /// bindings in sibling or child scopes — block visibility falls out for free.
+fn collect_reexports(facts: &FileFacts, symbols: &[Symbol]) -> Vec<ReExport> {
+    facts
+        .references
+        .iter()
+        .filter(|reference| reference.role == RefRole::Import && reference.is_reexport)
+        .filter_map(|reference| {
+            let source = reference.from_path.as_deref()?;
+            let module = symbols
+                .iter()
+                .filter(|symbol| {
+                    symbol.kind == crate::graph::types::SymbolKind::Module
+                        && symbol.span.contains(reference.occ.byte)
+                })
+                .min_by_key(|symbol| symbol.span.end.saturating_sub(symbol.span.start))?;
+            let mut module_path: Vec<String> =
+                module.id.namespaces_iter().map(str::to_owned).collect();
+            if module_path.len() == 1 && matches!(module_path[0].as_str(), "lib" | "main") {
+                module_path.clear();
+            }
+            let super_count = source
+                .split("::")
+                .take_while(|segment| *segment == "super")
+                .count();
+            let mut source_path = if source == "crate" || source.starts_with("crate::") {
+                normalize_from_path(source)
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect()
+            } else if super_count > 0 {
+                let mut path = module_path.clone();
+                for _ in 0..super_count {
+                    path.pop();
+                }
+                path.extend(normalize_from_path(source).into_iter().map(str::to_owned));
+                path
+            } else {
+                let mut path = module_path.clone();
+                path.extend(normalize_from_path(source).into_iter().map(str::to_owned));
+                path
+            };
+            source_path.push(
+                reference
+                    .imported_name
+                    .as_ref()
+                    .unwrap_or(&reference.name)
+                    .clone(),
+            );
+            Some(ReExport {
+                module_path,
+                name: reference.name.clone(),
+                source_path,
+            })
+        })
+        .collect()
+}
+
 fn scope_walk<'b>(
     name: &str,
     ref_byte: usize,

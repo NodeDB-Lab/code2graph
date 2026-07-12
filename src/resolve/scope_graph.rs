@@ -97,13 +97,10 @@ impl Resolver for ScopeGraphResolver {
             .flat_map(|s| s.symbols.iter().cloned())
             .collect();
 
-        // Global leaf-name → physical definition-instance index for the
-        // cross-file stitch phase (mirrors Tier-A's `by_name`).
-        let symbol_sets: Vec<(&str, &[Symbol])> = subs
-            .iter()
-            .map(|sub| (sub.owner_file.as_str(), sub.symbols.as_slice()))
-            .collect();
-        let index = GlobalIndex::from_symbols(&symbol_sets);
+        // Global definition and public re-export index for the cross-file
+        // stitch phase. Re-export aliases remain neutral file facts until this
+        // resolver follows them to a unique terminal definition.
+        let index = GlobalIndex::from_subgraphs(&subs);
 
         // Intra-file edges first (all files, in order), then the stitched
         // cross-file edges. Tests assert edge sets, not positional order.
@@ -914,6 +911,162 @@ mod tests {
     }
 
     #[cfg(feature = "rust")]
+    #[test]
+    fn transitive_rust_pub_use_resolves_qualified_type_reference() {
+        use crate::graph::types::RefRole;
+
+        let definition = RustExtractor
+            .extract("pub struct FusionParams {}", "src/api/variants.rs")
+            .unwrap();
+        let inner_reexport = RustExtractor
+            .extract(
+                "pub use super::variants::FusionParams as Params;",
+                "src/api/graph_parse/mod.rs",
+            )
+            .unwrap();
+        let outer_reexport = RustExtractor
+            .extract(
+                "pub use graph_parse::Params as FusionParams;",
+                "src/api/mod.rs",
+            )
+            .unwrap();
+        let consumer = RustExtractor
+            .extract(
+                "pub struct Request { params: crate::api::FusionParams }",
+                "src/client.rs",
+            )
+            .unwrap();
+
+        let graph = ScopeGraphResolver
+            .resolve(&[definition, inner_reexport, outer_reexport, consumer])
+            .unwrap();
+        assert!(graph.edges.iter().any(|edge| {
+            edge.role == RefRole::TypeRef
+                && edge
+                    .to
+                    .to_scip_string()
+                    .ends_with("api/variants/FusionParams#")
+        }));
+    }
+
+    #[cfg(feature = "rust")]
+    #[test]
+    fn crate_root_reexport_resolves_without_synthetic_lib_namespace() {
+        use crate::graph::types::RefRole;
+
+        let definition = RustExtractor
+            .extract("pub struct Thing {}", "src/variants.rs")
+            .unwrap();
+        let root = RustExtractor
+            .extract("pub use variants::Thing;", "src/lib.rs")
+            .unwrap();
+        let consumer = RustExtractor
+            .extract("pub struct Use { value: crate::Thing }", "src/use.rs")
+            .unwrap();
+        let graph = ScopeGraphResolver
+            .resolve(&[definition, root, consumer])
+            .unwrap();
+        assert!(graph.edges.iter().any(|edge| {
+            edge.role == RefRole::TypeRef && edge.to.to_scip_string().ends_with("variants/Thing#")
+        }));
+    }
+
+    #[cfg(feature = "rust")]
+    #[test]
+    fn repeated_super_and_inline_module_reexports_keep_their_module_paths() {
+        use crate::graph::types::RefRole;
+
+        let definition = RustExtractor
+            .extract("pub struct Thing {}", "src/variants.rs")
+            .unwrap();
+        let nested = RustExtractor
+            .extract(
+                "pub use super::super::variants::Thing;",
+                "src/api/nested/mod.rs",
+            )
+            .unwrap();
+        let inline = RustExtractor
+            .extract(
+                "pub mod public { pub use crate::variants::Thing; }",
+                "src/lib.rs",
+            )
+            .unwrap();
+        let consumer = RustExtractor
+            .extract(
+                "pub struct Use { a: crate::api::nested::Thing, b: crate::public::Thing }",
+                "src/use.rs",
+            )
+            .unwrap();
+        let graph = ScopeGraphResolver
+            .resolve(&[definition, nested, inline, consumer])
+            .unwrap();
+        assert_eq!(
+            graph
+                .edges
+                .iter()
+                .filter(|edge| {
+                    edge.role == RefRole::TypeRef
+                        && edge.to.to_scip_string().ends_with("variants/Thing#")
+                })
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn cyclic_or_ambiguous_rust_pub_use_emits_no_type_edge() {
+        use crate::graph::types::RefRole;
+
+        let cycle_a = RustExtractor
+            .extract("pub use super::cycle_b::Thing;", "src/cycle_a.rs")
+            .unwrap();
+        let cycle_b = RustExtractor
+            .extract("pub use super::cycle_a::Thing;", "src/cycle_b.rs")
+            .unwrap();
+        let cycle_consumer = RustExtractor
+            .extract(
+                "pub struct Use { value: crate::cycle_a::Thing }",
+                "src/cycle_use.rs",
+            )
+            .unwrap();
+        let cycle_graph = ScopeGraphResolver
+            .resolve(&[cycle_a, cycle_b, cycle_consumer])
+            .unwrap();
+        assert!(
+            !cycle_graph
+                .edges
+                .iter()
+                .any(|edge| edge.role == RefRole::TypeRef),
+            "cyclic aliases must not produce a precise type edge"
+        );
+
+        let first = RustExtractor
+            .extract("pub struct Thing {}", "src/first.rs")
+            .unwrap();
+        let second = RustExtractor
+            .extract("pub struct Thing {}", "src/second.rs")
+            .unwrap();
+        let aliases = RustExtractor
+            .extract(
+                "pub use super::first::Thing; pub use super::second::Thing;",
+                "src/api/mod.rs",
+            )
+            .unwrap();
+        let consumer = RustExtractor
+            .extract("pub struct Use { value: crate::api::Thing }", "src/use.rs")
+            .unwrap();
+        let ambiguous_graph = ScopeGraphResolver
+            .resolve(&[first, second, aliases, consumer])
+            .unwrap();
+        assert!(
+            !ambiguous_graph
+                .edges
+                .iter()
+                .any(|edge| edge.role == RefRole::TypeRef),
+            "ambiguous aliases must not produce a precise type edge"
+        );
+    }
+
     #[test]
     fn scoped_struct_field_type_resolves_across_files() {
         use crate::graph::types::RefRole;

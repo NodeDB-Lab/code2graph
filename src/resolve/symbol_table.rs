@@ -41,6 +41,8 @@ fn is_type_definition(kind: SymbolKind) -> bool {
             | SymbolKind::Class
             | SymbolKind::Interface
             | SymbolKind::TypeAlias
+            | SymbolKind::Table
+            | SymbolKind::View
     )
 }
 
@@ -436,6 +438,8 @@ mod tests {
             role: RefRole::Import,
             source_module: None,
             from_path: None,
+            is_reexport: false,
+            imported_name: None,
             qualifier: None,
             scope: None,
             type_ref_ctx: None,

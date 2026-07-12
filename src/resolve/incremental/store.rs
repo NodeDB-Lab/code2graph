@@ -318,6 +318,19 @@ impl IncrementalGraph {
                 }
             }
         }
+        let reexports_changed = changes.iter().any(|change| match change {
+            PreparedChange::Upsert { file, subgraph } => self
+                .files
+                .get(file)
+                .is_none_or(|old| old.reexports != subgraph.reexports),
+            PreparedChange::Remove { file } => self
+                .files
+                .get(file)
+                .is_some_and(|old| !old.reexports.is_empty()),
+        });
+        if reexports_changed {
+            affected.extend(self.pending_state.all_ids().cloned());
+        }
         let before_symbols = self.bound_symbols(&targets);
         let before_edges = self.bound_edges(&targets, &affected);
 
@@ -326,14 +339,14 @@ impl IncrementalGraph {
             match change {
                 PreparedChange::Upsert { file, subgraph } => {
                     if let Some(old) = self.files.get(&file) {
-                        self.index.remove_symbols(&file, &old.symbols);
+                        self.index.remove_subgraph(old);
                     }
-                    self.index.insert_symbols(&file, &subgraph.symbols);
+                    self.index.insert_subgraph(&subgraph);
                     self.files.insert(file, subgraph);
                 }
                 PreparedChange::Remove { file } => {
                     if let Some(old) = self.files.remove(&file) {
-                        self.index.remove_symbols(&file, &old.symbols);
+                        self.index.remove_subgraph(&old);
                     }
                 }
             }
@@ -495,6 +508,41 @@ mod tests {
             )
             .unwrap();
         vec![conf, app, util]
+    }
+
+    #[cfg(feature = "rust")]
+    #[test]
+    fn removing_reexport_restitches_type_consumers() {
+        let definition = RustExtractor
+            .extract("pub struct Config {}", "src/inner.rs")
+            .unwrap();
+        let reexport = RustExtractor
+            .extract("pub use super::inner::Config;", "src/api/mod.rs")
+            .unwrap();
+        let consumer = RustExtractor
+            .extract(
+                "pub struct Use { config: crate::api::Config }",
+                "src/use.rs",
+            )
+            .unwrap();
+        let mut graph = IncrementalGraph::from_files(&[definition, reexport, consumer]);
+        assert!(
+            graph
+                .graph()
+                .edges
+                .iter()
+                .any(|edge| edge.role == crate::RefRole::TypeRef)
+        );
+
+        graph.remove("src/api/mod.rs");
+        assert!(
+            !graph
+                .graph()
+                .edges
+                .iter()
+                .any(|edge| edge.role == crate::RefRole::TypeRef),
+            "removing an alias must clear dependent type edges"
+        );
     }
 
     #[cfg(feature = "rust")]

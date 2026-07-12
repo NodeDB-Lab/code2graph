@@ -222,6 +222,15 @@ pub struct Reference {
     /// from, as written in the source (e.g. `"pkg.models"`, `"std::io"`,
     /// `"./svc"`). `None` for non-import refs or when unavailable.
     pub from_path: Option<String>,
+    /// For an aliased import, the source leaf before it was renamed locally.
+    /// `None` when the local and source names are identical or unavailable.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub imported_name: Option<String>,
+    /// Whether this import republishes its local name as part of the enclosing
+    /// module's public API. Resolvers may follow these neutral alias facts when
+    /// binding a later qualified reference; `false` for ordinary imports.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub is_reexport: bool,
     /// Written context that narrows the referenced relationship. For a
     /// path-qualified call or type reference (`mod_a::process()`, `a::b::Type`),
     /// this is the qualifier immediately before the leaf (for example `"mod_a"`
@@ -874,6 +883,8 @@ mod serde_tests {
                     byte: 80,
                 },
                 role: RefRole::Call,
+                is_reexport: false,
+                imported_name: None,
                 source_module: None,
                 from_path: None,
                 qualifier: None,

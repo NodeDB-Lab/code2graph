@@ -368,6 +368,8 @@ fn collect_references_recursive(node: &Node, bytes: &[u8], file: &str, out: &mut
                                     occ: super::node_occurrence(first, file),
                                     source_module: None,
                                     from_path: None,
+                                    is_reexport: false,
+                                    imported_name: None,
                                     scope: None,
                                     type_ref_ctx: None,
                                 });

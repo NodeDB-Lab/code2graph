@@ -54,10 +54,10 @@ const ASSOCIATED_CALL_SUBJECT_QUERY: &str = r#"
 /// - `field_declaration` has field `type: _type`
 /// - `ordered_field_declaration_list` has field `type: _type` (multiple = true, for tuple structs)
 const TYPE_QUERY: &str = r#"
-(parameter type: (_) @ty)
-(function_item return_type: (_) @ty)
-(field_declaration type: (_) @ty)
-(ordered_field_declaration_list type: (_) @ty)
+(parameter type: (_) @parameter_ty)
+(function_item return_type: (_) @return_ty)
+(field_declaration type: (_) @field_ty)
+(ordered_field_declaration_list type: (_) @field_ty)
 "#;
 
 /// Extracts Rust symbols and references.
@@ -810,9 +810,19 @@ fn collect_use_leaves(
             }
         }
         "use_as_clause" => {
-            // Alias is ignored; recurse into the path child, passing prefix through.
+            // Preserve the local alias: it is the public name re-exported by
+            // `pub use path::Item as Alias`, while `from_path` remains the
+            // source path collected from the child.
+            let first = out.len();
             if let Some(path_node) = node.child_by_field_name("path") {
                 collect_use_leaves(&path_node, bytes, file, out, module_id, prefix);
+            }
+            if let Some(alias) = node.child_by_field_name("alias") {
+                let alias = node_text(&alias, bytes).to_owned();
+                for reference in &mut out[first..] {
+                    reference.imported_name = Some(reference.name.clone());
+                    reference.name = alias.clone();
+                }
             }
         }
         "scoped_use_list" => {
@@ -847,8 +857,14 @@ fn collect_imports(
     module_id: &str,
 ) {
     if node.kind() == "use_declaration" {
+        let first = out.len();
         if let Some(arg) = node.child_by_field_name("argument") {
             collect_use_leaves(&arg, bytes, file, out, module_id, "");
+        }
+        if read_visibility(node, bytes) == Visibility::Public {
+            for reference in &mut out[first..] {
+                reference.is_reexport = true;
+            }
         }
         // No need to recurse further inside a use_declaration.
         return;
@@ -860,45 +876,63 @@ fn collect_imports(
 
 // ── Type reference capture ────────────────────────────────────────────────────
 
-/// Reduce a (possibly compound) type node to its base named type.
-///
-/// Returns `(bare_name, qualifier)` for the type forms we handle in v1.
-/// Returns `None` for forms we defer (tuple, array, pointer, slice, fn pointer,
-/// lifetime-only, etc.) — they produce no [`RefRole::TypeRef`] reference.
-///
-/// Recursion depth is bounded by type nesting depth (a handful of levels at
-/// most); no panic paths, no `unwrap`.
-///
-/// **Primitive types are skipped** (`primitive_type` matches `None`): they
-/// never resolve to a user-defined [`Symbol`], so capturing them adds noise
-/// with zero benefit. E.g. `u32`, `bool`, `i64` produce no TypeRef ref.
-fn base_type_name(node: &Node, bytes: &[u8]) -> Option<(String, Option<String>)> {
+/// Recursively collect every named type component. Primitive and lifetime nodes
+/// are deliberately ignored. Child type arguments are marked `GenericArg`.
+fn collect_named_type_nodes(
+    node: &Node,
+    bytes: &[u8],
+    context: TypeRefContext,
+    file: &str,
+    out: &mut Vec<Reference>,
+) {
     match node.kind() {
-        "type_identifier" => Some((node_text(node, bytes).to_owned(), None)),
-        // Primitive types (u8, i32, bool, str, …) — skip to reduce noise.
-        "primitive_type" => None,
+        "primitive_type" | "lifetime" => {}
+        "type_identifier" => out.push(Reference {
+            name: node_text(node, bytes).to_owned(),
+            occ: node_occurrence(node, file),
+            role: RefRole::TypeRef,
+            source_module: None,
+            from_path: None,
+            is_reexport: false,
+            imported_name: None,
+            qualifier: None,
+            scope: None,
+            type_ref_ctx: Some(context),
+        }),
         "scoped_type_identifier" => {
-            // Grammar-verified fields: `name: type_identifier`, `path: ...`
-            let name = node
-                .child_by_field_name("name")
-                .map(|n| node_text(&n, bytes).to_owned())?;
-            let qual = node
-                .child_by_field_name("path")
-                .map(|n| node_text(&n, bytes).to_owned());
-            Some((name, qual))
+            let Some(name_node) = node.child_by_field_name("name") else {
+                return;
+            };
+            out.push(Reference {
+                name: node_text(&name_node, bytes).to_owned(),
+                occ: node_occurrence(&name_node, file),
+                role: RefRole::TypeRef,
+                source_module: None,
+                from_path: None,
+                is_reexport: false,
+                imported_name: None,
+                qualifier: node
+                    .child_by_field_name("path")
+                    .map(|path| node_text(&path, bytes).to_owned()),
+                scope: None,
+                type_ref_ctx: Some(context),
+            });
         }
-        // Vec<Config> → base name "Vec"; the Config inside type_arguments is
-        // deferred in v1 (not captured here).
-        "generic_type" => node
-            .child_by_field_name("type")
-            .and_then(|t| base_type_name(&t, bytes)),
-        // &Config / &mut Config → descend through the `type` field (grammar-verified).
-        "reference_type" => node
-            .child_by_field_name("type")
-            .and_then(|t| base_type_name(&t, bytes)),
-        // Defer: tuple_type, array_type, pointer_type, slice_type, abstract_type,
-        // dynamic_type, fn types, macro_invocation types, etc.
-        _ => None,
+        "generic_type" => {
+            if let Some(base) = node.child_by_field_name("type") {
+                collect_named_type_nodes(&base, bytes, context, file, out);
+            }
+            if let Some(args) = node.child_by_field_name("type_arguments") {
+                for child in args.named_children(&mut args.walk()) {
+                    collect_named_type_nodes(&child, bytes, TypeRefContext::GenericArg, file, out);
+                }
+            }
+        }
+        _ => {
+            for child in node.named_children(&mut node.walk()) {
+                collect_named_type_nodes(&child, bytes, context, file, out);
+            }
+        }
     }
 }
 
@@ -950,6 +984,8 @@ fn collect_associated_call_type_references(
                 role: RefRole::TypeRef,
                 source_module: None,
                 from_path: None,
+                is_reexport: false,
+                imported_name: None,
                 qualifier,
                 scope: None,
                 type_ref_ctx: Some(TypeRefContext::Other),
@@ -970,31 +1006,37 @@ fn collect_type_references(
         lang: "rust".to_owned(),
         msg: e.to_string(),
     })?;
-    let ty_idx = query
-        .capture_index_for_name("ty")
-        .ok_or_else(|| CodegraphError::Query {
-            lang: "rust".to_owned(),
-            msg: "missing @ty capture".to_owned(),
-        })?;
-
+    let capture_context = |index| {
+        if Some(index) == query.capture_index_for_name("parameter_ty") {
+            Some(TypeRefContext::ParameterType)
+        } else if Some(index) == query.capture_index_for_name("return_ty") {
+            Some(TypeRefContext::ReturnType)
+        } else if Some(index) == query.capture_index_for_name("field_ty") {
+            Some(TypeRefContext::Field)
+        } else {
+            None
+        }
+    };
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(&query, *root, bytes);
     while let Some(m) = matches.next() {
-        for cap in m.captures.iter().filter(|c| c.index == ty_idx) {
-            if let Some((name, qualifier)) = base_type_name(&cap.node, bytes) {
-                out.push(Reference {
-                    name,
-                    occ: node_occurrence(&cap.node, file),
-                    role: RefRole::TypeRef,
-                    source_module: None,
-                    from_path: None,
-                    qualifier,
-                    scope: None, // filled in by attach_reference_scopes
-                    type_ref_ctx: None,
-                });
+        for cap in m.captures {
+            if let Some(context) = capture_context(cap.index) {
+                collect_named_type_nodes(&cap.node, bytes, context, file, out);
             }
         }
     }
+    // Multiple grammar productions can expose the same type node. Keep only one
+    // neutral fact per written occurrence/context, preserving source order.
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|reference| {
+        reference.role != RefRole::TypeRef
+            || seen.insert((
+                reference.occ.byte,
+                reference.name.clone(),
+                reference.type_ref_ctx,
+            ))
+    });
     Ok(())
 }
 
@@ -1569,8 +1611,8 @@ impl std::fmt::Display for Point {
     }
 
     #[test]
-    fn import_use_as_clause_emits_real_leaf_not_alias() {
-        // `use a::b as c;` → Import ref `b` (not `c`)
+    fn import_use_as_clause_preserves_alias_and_source_leaf() {
+        // `use a::b as c;` → local Import ref `c` with source leaf `b`.
         let src = "use a::b as c;";
         let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
         let import_names: Vec<&str> = facts
@@ -1581,8 +1623,16 @@ impl std::fmt::Display for Point {
             .collect();
         assert_eq!(
             import_names,
-            vec!["b"],
-            "expected ['b'], got {import_names:?}"
+            vec!["c"],
+            "expected ['c'], got {import_names:?}"
+        );
+        assert_eq!(
+            facts
+                .references
+                .iter()
+                .find(|reference| reference.role == RefRole::Import)
+                .and_then(|reference| reference.imported_name.as_deref()),
+            Some("b")
         );
     }
 
@@ -2473,9 +2523,8 @@ impl std::fmt::Display for Point {
     }
 
     #[test]
-    fn typeref_generic_base_type_captured_inner_deferred() {
-        // `fn f(v: Vec<Config>) {}` → TypeRef ref for `Vec` (the base generic type).
-        // `Config` inside the type_arguments is NOT captured (v1 boundary).
+    fn typeref_generic_base_and_argument_are_captured() {
+        // `fn f(v: Vec<Config>) {}` captures both base and generic argument.
         let src = "fn f(v: Vec<Config>) {}";
         let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
         let names: Vec<&str> = type_refs(&facts).iter().map(|r| r.name.as_str()).collect();
@@ -2484,8 +2533,15 @@ impl std::fmt::Display for Point {
             "expected TypeRef for 'Vec' (base generic) in {names:?}"
         );
         assert!(
-            !names.contains(&"Config"),
-            "Config inside generic args should NOT be captured in v1 (got {names:?})"
+            names.contains(&"Config"),
+            "expected generic argument in {names:?}"
+        );
+        assert_eq!(
+            type_refs(&facts)
+                .into_iter()
+                .find(|reference| reference.name == "Config")
+                .and_then(|reference| reference.type_ref_ctx),
+            Some(TypeRefContext::GenericArg)
         );
     }
 
@@ -2504,6 +2560,30 @@ impl std::fmt::Display for Point {
             Some("std::io".to_owned()),
             "qualifier should be 'std::io', got {:?}",
             r.qualifier
+        );
+    }
+
+    #[test]
+    fn typeref_compound_types_capture_all_named_components() {
+        let facts = RustExtractor
+            .extract(
+                "struct Holder { value: Option<Vec<Config>>, pair: (Left, Right) }",
+                "src/lib.rs",
+            )
+            .unwrap();
+        let references = type_refs(&facts);
+        for name in ["Option", "Vec", "Config", "Left", "Right"] {
+            assert!(
+                references.iter().any(|reference| reference.name == name),
+                "missing {name}"
+            );
+        }
+        assert_eq!(
+            references
+                .iter()
+                .find(|reference| reference.name == "Config")
+                .and_then(|reference| reference.type_ref_ctx),
+            Some(TypeRefContext::GenericArg)
         );
     }
 

@@ -105,6 +105,16 @@ pub fn validate_file_facts_with_context(
                 "reference {index} has from_path outside import role"
             )));
         }
+        if reference.is_reexport && reference.role != super::RefRole::Import {
+            return Err(malformed(format!(
+                "reference {index} has is_reexport outside import role"
+            )));
+        }
+        if reference.imported_name.is_some() && reference.role != super::RefRole::Import {
+            return Err(malformed(format!(
+                "reference {index} has imported_name outside import role"
+            )));
+        }
         if reference.qualifier.is_some()
             && !matches!(
                 reference.role,
@@ -358,6 +368,8 @@ mod tests {
                 role: RefRole::Call,
                 source_module: None,
                 from_path: None,
+                is_reexport: false,
+                imported_name: None,
                 qualifier: None,
                 scope: Some(0),
                 type_ref_ctx: None,

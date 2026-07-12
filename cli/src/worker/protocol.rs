@@ -204,6 +204,8 @@ pub struct ReferenceWire {
     pub role: u8,
     pub source_module: Option<String>,
     pub from_path: Option<String>,
+    pub imported_name: Option<String>,
+    pub is_reexport: Option<bool>,
     pub qualifier: Option<String>,
     pub scope: Option<u64>,
     pub type_ref_ctx: Option<u8>,
@@ -337,7 +339,7 @@ impl_numeric_map_codec!(OccurrenceWire {
 });
 impl_numeric_map_codec!(ReferenceWire {
     required { 0 => name: String, 1 => occ: OccurrenceWire, 2 => role: u8 }
-    optional { 3 => source_module: Option<String>, 4 => from_path: Option<String>, 5 => qualifier: Option<String>, 6 => scope: Option<u64>, 7 => type_ref_ctx: Option<u8> }
+    optional { 3 => source_module: Option<String>, 4 => from_path: Option<String>, 5 => qualifier: Option<String>, 6 => scope: Option<u64>, 7 => type_ref_ctx: Option<u8>, 8 => is_reexport: Option<bool>, 9 => imported_name: Option<String> }
 });
 impl ToMessagePack for ScopeWire {
     fn write<W: Write>(&self, writer: &mut W) -> zerompk::Result<()> {
@@ -895,6 +897,8 @@ impl From<&Reference> for ReferenceWire {
             role: ref_role_tag(r.role),
             source_module: r.source_module.clone(),
             from_path: r.from_path.clone(),
+            imported_name: r.imported_name.clone(),
+            is_reexport: Some(r.is_reexport),
             qualifier: r.qualifier.clone(),
             scope: r.scope.map(|v| v as u64),
             type_ref_ctx: r.type_ref_ctx.map(type_ref_context_tag),
@@ -918,6 +922,7 @@ impl TryFrom<ReferenceWire> for Reference {
         cap(&r.occ.file)?;
         cap_option(&r.source_module)?;
         cap_option(&r.from_path)?;
+        cap_option(&r.imported_name)?;
         cap_option(&r.qualifier)?;
         let roles = [
             RefRole::Call,
@@ -947,6 +952,8 @@ impl TryFrom<ReferenceWire> for Reference {
             role: *tag(r.role, &roles)?,
             source_module: r.source_module,
             from_path: r.from_path,
+            imported_name: r.imported_name,
+            is_reexport: r.is_reexport.unwrap_or(false),
             qualifier: r.qualifier,
             scope: r.scope.map(usize_from).transpose()?,
             type_ref_ctx: r.type_ref_ctx.map(|v| tag(v, &ctx).copied()).transpose()?,
@@ -1099,6 +1106,8 @@ mod tests {
                     role: RefRole::TypeRef,
                     source_module: None,
                     from_path: None,
+                    imported_name: None,
+                    is_reexport: false,
                     qualifier: Some("crate::module".into()),
                     scope: Some(0),
                     type_ref_ctx: Some(TypeRefContext::ReturnType),
@@ -1114,6 +1123,8 @@ mod tests {
                     role: RefRole::Import,
                     source_module: Some("codegraph . . . a/".into()),
                     from_path: Some("dependency::module".into()),
+                    imported_name: None,
+                    is_reexport: false,
                     qualifier: None,
                     scope: None,
                     type_ref_ctx: None,

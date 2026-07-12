@@ -312,6 +312,10 @@ pub struct ReferenceOutput {
     pub source_module: Option<String>,
     #[serde(rename = "fromPath", skip_serializing_if = "Option::is_none")]
     pub from_path: Option<String>,
+    #[serde(rename = "importedName", skip_serializing_if = "Option::is_none")]
+    pub imported_name: Option<String>,
+    #[serde(rename = "isReexport", skip_serializing_if = "std::ops::Not::not")]
+    pub is_reexport: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub qualifier: Option<String>,
     #[serde(rename = "typeRefContext", skip_serializing_if = "Option::is_none")]

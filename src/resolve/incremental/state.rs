@@ -159,6 +159,10 @@ impl PendingState {
         }
     }
 
+    pub(crate) fn all_ids(&self) -> impl Iterator<Item = &PendingRefId> {
+        self.pending.keys()
+    }
+
     pub(crate) fn owner_ids(&self, owner: &str) -> impl Iterator<Item = &PendingRefId> {
         self.by_owner
             .get(owner)
@@ -272,7 +276,7 @@ mod tests {
     }
 
     #[test]
-    fn typeref_is_affected_by_both_fallback_and_preferred_target_domains() {
+    fn type_annotations_ignore_same_named_module_symbols() {
         let consumer = RustExtractor
             .extract("pub struct Order { value: Config }", "src/order.rs")
             .expect("extract consumer");
@@ -330,13 +334,16 @@ mod tests {
         ]);
         let module_affected = state.affected_by_symbol(module);
         assert!(
-            !module_affected.is_empty(),
-            "module preference must select TypeRef"
+            module_affected.is_empty(),
+            "type annotations must ignore modules"
         );
-        state.resolve(module_affected, &preferred_index);
+        state.resolve(
+            [super::PendingRefId::new("src/order.rs", type_ordinal)],
+            &preferred_index,
+        );
         assert!(matches!(
             state.resolved(&consumer_sub.owner_file, type_ordinal),
-            Some(Some(edge)) if edge.to == module.id
+            Some(Some(edge)) if edge.to == ordinary.id
         ));
     }
 }

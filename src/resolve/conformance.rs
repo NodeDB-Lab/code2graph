@@ -260,6 +260,8 @@ mod tests {
             role: RefRole::Call,
             source_module: None,
             from_path: None,
+            is_reexport: false,
+            imported_name: None,
             qualifier: Some(qualifier.to_owned()),
             scope: None,
             type_ref_ctx: None,

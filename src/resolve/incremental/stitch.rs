@@ -17,7 +17,7 @@ use crate::graph::types::{Edge, Provenance, RefRole, Symbol, SymbolKind};
 use crate::symbol::SymbolId;
 
 use super::super::{enclosing_path_ends_with, namespaces_end_with};
-use super::subgraph::PendingRef;
+use super::subgraph::{FileSubgraph, PendingRef, ReExport};
 
 /// A physical definition record in a [`GlobalIndex`]. Its key is deliberately
 /// structural rather than a SCIP identity: equal symbol IDs in different files
@@ -31,6 +31,8 @@ fn is_type_kind(kind: SymbolKind) -> bool {
             | SymbolKind::Class
             | SymbolKind::Interface
             | SymbolKind::TypeAlias
+            | SymbolKind::Table
+            | SymbolKind::View
     )
 }
 
@@ -41,6 +43,13 @@ struct DefinitionInstance {
     id: SymbolId,
 }
 
+#[derive(Clone, Hash, PartialEq, Eq)]
+struct ReExportInstance {
+    owner_file: Arc<str>,
+    ordinal: usize,
+    source_path: Vec<String>,
+}
+
 /// Global definition index: leaf name → physical definition instances.
 #[derive(Default)]
 pub(crate) struct GlobalIndex {
@@ -49,6 +58,7 @@ pub(crate) struct GlobalIndex {
     /// because module symbols have a `Namespace`-only id (no leaf name).
     modules_by_name: HashMap<String, HashSet<DefinitionInstance>>,
     types_by_name: HashMap<String, HashSet<DefinitionInstance>>,
+    reexports_by_path: HashMap<Vec<String>, HashSet<ReExportInstance>>,
 }
 
 impl GlobalIndex {
@@ -60,16 +70,36 @@ impl GlobalIndex {
             by_name: HashMap::new(),
             modules_by_name: HashMap::new(),
             types_by_name: HashMap::new(),
+            reexports_by_path: HashMap::new(),
         }
     }
 
-    /// Build from owner-labelled symbol sets (batch path).
+    /// Build from owner-labelled symbol sets for isolated resolver tests.
+    #[cfg(test)]
     pub(crate) fn from_symbols(symbol_sets: &[(&str, &[Symbol])]) -> Self {
         let mut idx = Self::new();
         for (owner_file, symbols) in symbol_sets {
             idx.insert_symbols(owner_file, symbols);
         }
         idx
+    }
+
+    pub(crate) fn from_subgraphs(subgraphs: &[FileSubgraph]) -> Self {
+        let mut index = Self::new();
+        for subgraph in subgraphs {
+            index.insert_subgraph(subgraph);
+        }
+        index
+    }
+
+    pub(crate) fn insert_subgraph(&mut self, subgraph: &FileSubgraph) {
+        self.insert_symbols(&subgraph.owner_file, &subgraph.symbols);
+        self.insert_reexports(&subgraph.owner_file, &subgraph.reexports);
+    }
+
+    pub(crate) fn remove_subgraph(&mut self, subgraph: &FileSubgraph) {
+        self.remove_symbols(&subgraph.owner_file, &subgraph.symbols);
+        self.remove_reexports(&subgraph.owner_file, &subgraph.reexports);
     }
 
     /// Add one file's symbols. `ordinal` is the record's position in that
@@ -143,6 +173,89 @@ impl GlobalIndex {
                     }
                 }
             }
+        }
+    }
+
+    fn insert_reexports(&mut self, owner_file: &str, reexports: &[ReExport]) {
+        let owner_file = Arc::<str>::from(owner_file);
+        for (ordinal, reexport) in reexports.iter().enumerate() {
+            let mut path = reexport.module_path.clone();
+            path.push(reexport.name.clone());
+            self.reexports_by_path
+                .entry(path)
+                .or_default()
+                .insert(ReExportInstance {
+                    owner_file: Arc::clone(&owner_file),
+                    ordinal,
+                    source_path: reexport.source_path.clone(),
+                });
+        }
+    }
+
+    fn remove_reexports(&mut self, owner_file: &str, reexports: &[ReExport]) {
+        for (ordinal, reexport) in reexports.iter().enumerate() {
+            let mut path = reexport.module_path.clone();
+            path.push(reexport.name.clone());
+            if let Some(instances) = self.reexports_by_path.get_mut(&path) {
+                instances.retain(|instance| {
+                    instance.owner_file.as_ref() != owner_file || instance.ordinal != ordinal
+                });
+                if instances.is_empty() {
+                    self.reexports_by_path.remove(&path);
+                }
+            }
+        }
+    }
+
+    fn resolved_path_instances(
+        &self,
+        path: &[String],
+        type_only: bool,
+        visited: &mut HashSet<Vec<String>>,
+    ) -> HashSet<DefinitionInstance> {
+        if !visited.insert(path.to_vec()) {
+            return HashSet::new();
+        }
+        let Some((name, namespaces)) = path.split_last() else {
+            return HashSet::new();
+        };
+        let candidates = if type_only {
+            self.types_by_name.get(name)
+        } else {
+            self.by_name.get(name)
+        };
+        let mut resolved = candidates
+            .into_iter()
+            .flatten()
+            .filter(|instance| namespaces_end_with(&instance.id, namespaces))
+            .cloned()
+            .collect::<HashSet<_>>();
+        if let Some(exports) = self.reexports_by_path.get(path) {
+            for export in exports {
+                resolved.extend(self.resolved_path_instances(
+                    &export.source_path,
+                    type_only,
+                    visited,
+                ));
+            }
+        }
+        visited.remove(path);
+        resolved
+    }
+
+    fn unique_reexport_match(
+        &self,
+        name: &str,
+        segs: &[String],
+        type_only: bool,
+    ) -> Option<SymbolId> {
+        let mut path = segs.to_vec();
+        path.push(name.to_owned());
+        let resolved = self.resolved_path_instances(&path, type_only, &mut HashSet::new());
+        let mut instances = resolved.iter();
+        match (instances.next(), instances.next()) {
+            (Some(only), None) => Some(only.id.clone()),
+            _ => None,
         }
     }
 
@@ -259,23 +372,32 @@ pub(crate) fn resolve_pending(p: &PendingRef, index: &GlobalIndex) -> Option<Edg
     // ModuleRefs resolve ONLY against the module index; everything else resolves
     // ONLY against the leaf-name index.
     let matched = match p.role {
-        RefRole::ModuleRef => index.unique_module_match(&p.name, &p.segs),
-        // HCL and similar DSLs use type-like references to modules. Prefer a
-        // unique module target, then retain ordinary type lookup.
-        RefRole::TypeRef if p.type_only => index.unique_type_match(&p.name, &p.segs),
+        RefRole::ModuleRef => index.unique_module_match(&p.name, &p.segs).cloned(),
+        RefRole::TypeRef if p.type_only => index
+            .unique_reexport_match(&p.name, &p.segs, true)
+            .or_else(|| index.unique_type_match(&p.name, &p.segs).cloned()),
         RefRole::TypeRef => index
-            .unique_module_match(&p.name, &p.segs)
-            .or_else(|| index.unique_match(&p.name, &p.segs)),
-        _ if p.qualified => index.unique_qualified_match(&p.name, &p.segs),
-        _ => index.unique_match(&p.name, &p.segs),
+            .unique_reexport_match(&p.name, &p.segs, false)
+            .or_else(|| {
+                index
+                    .unique_module_match(&p.name, &p.segs)
+                    .or_else(|| index.unique_match(&p.name, &p.segs))
+                    .cloned()
+            }),
+        _ if p.qualified => index
+            .unique_reexport_match(&p.name, &p.segs, false)
+            .or_else(|| index.unique_qualified_match(&p.name, &p.segs).cloned()),
+        _ => index
+            .unique_reexport_match(&p.name, &p.segs, false)
+            .or_else(|| index.unique_match(&p.name, &p.segs).cloned()),
     }?;
     // A definition never links to itself (parity with Tier-A).
-    if *matched == p.from {
+    if matched == p.from {
         return None;
     }
     Some(Edge {
         from: p.from.clone(),
-        to: matched.clone(),
+        to: matched,
         role: p.role,
         confidence: p.confidence,
         provenance: Provenance::ScopeGraph,

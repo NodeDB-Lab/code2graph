@@ -397,21 +397,18 @@ mod tests {
                 .any(|edge| { edge.role == RefRole::ModuleRef && edge.occ.file == "src/lib.rs" })
         );
         assert!(
-            delta.removed_edges.iter().any(|key| {
+            !delta.removed_edges.iter().any(|key| {
                 key.role == RefRole::TypeRef && key.occurrence_file == "src/order.rs"
-            })
+            }),
+            "a same-named module must not change a type annotation edge"
         );
-        let config_module_id = &config_module
-            .symbols
-            .iter()
-            .find(|symbol| symbol.kind == crate::SymbolKind::Module)
-            .expect("Config module symbol")
-            .id;
-        assert!(delta.upserted_edges.iter().any(|edge| {
-            edge.role == RefRole::TypeRef
-                && edge.occ.file == "src/order.rs"
-                && &edge.to == config_module_id
-        }));
+        assert!(
+            !delta
+                .upserted_edges
+                .iter()
+                .any(|edge| { edge.role == RefRole::TypeRef && edge.occ.file == "src/order.rs" }),
+            "the existing type-definition edge remains stable"
+        );
     }
 
     #[test]
