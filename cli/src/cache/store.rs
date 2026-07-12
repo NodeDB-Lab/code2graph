@@ -2099,10 +2099,7 @@ mod tests {
                 .expect("read cache directory")
                 .map(|entry| {
                     let entry = entry.expect("directory entry");
-                    // Reading through the filesystem handle first makes buffered WAL
-                    // growth visible before Windows reports file metadata.
-                    fs::read(entry.path()).expect("read cache file");
-                    let metadata = entry.metadata().expect("metadata");
+                    let metadata = fs::metadata(entry.path()).expect("metadata");
                     (
                         entry.file_name(),
                         metadata.len(),
@@ -2120,6 +2117,16 @@ mod tests {
         let cache_location = location(&root, temp.path());
         let writer = CacheStore::open_writable(&cache_location, &root, &Deadline::new(None))
             .expect("writer");
+        // Start from a fully checkpointed WAL, then use FULL synchronization so
+        // SQLite has made the new WAL frame durable (and its final length visible
+        // to Windows filesystem metadata) before the baseline is sampled. The
+        // checkpoint must precede the insert: checkpointing afterward would let
+        // the reader satisfy the query from the main database and would no longer
+        // prove that a frozen handle can read committed WAL state.
+        writer
+            .connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA synchronous=FULL")
+            .expect("prepare deterministic WAL baseline");
         writer
             .connection
             .execute(
@@ -2127,6 +2134,11 @@ mod tests {
                 params![vec![7_u8; 32], vec![8_u8; 32], vec![9_u8; 32]],
             )
             .expect("committed WAL row");
+        let wal_path = cache_location.database_path.with_extension("sqlite3-wal");
+        assert!(
+            fs::metadata(&wal_path).expect("WAL metadata").len() > 32,
+            "committed row must remain in a WAL frame"
+        );
         let before = directory_state(&cache_location.directory);
         let frozen = CacheStore::open_frozen(&cache_location, &root, &Deadline::new(None))
             .expect("frozen WAL reader");

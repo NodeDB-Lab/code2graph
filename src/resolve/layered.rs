@@ -25,7 +25,7 @@ use super::{
 /// treated as the "same fact" resolved at potentially different confidence or by
 /// different analysis passes.  The rule is:
 /// - Only edges at the *maximum* confidence for that key are kept.
-/// - Among those max-confidence edges, distinct [`Provenance`] values are all
+/// - Among those max-confidence edges, distinct [`Provenance`](crate::graph::Provenance) values are all
 ///   kept (provenance is orthogonal to confidence).
 /// - Exact duplicates (same key **and** same provenance) are collapsed to one.
 ///
