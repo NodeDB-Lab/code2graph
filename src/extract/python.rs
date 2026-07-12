@@ -20,10 +20,12 @@ use crate::graph::types::{
 use crate::lang::Language;
 use crate::symbol::Descriptor;
 
+#[cfg(feature = "sql")]
+use super::emit_embedded_sql_refs;
 use super::{
-    ExtractCtx, Extractor, MIN_REF_LEN, attach_reference_scopes, collect_call_references,
-    definition_bindings, field_text, import_bindings, make_symbol, node_span, node_text,
-    one_line_signature, push_binding, push_ref, push_scope, push_type_ref,
+    BindingRules, ExtractCtx, Extractor, MIN_REF_LEN, attach_reference_scopes,
+    collect_call_references, definition_bindings, field_text, import_bindings, make_symbol,
+    node_span, node_text, one_line_signature, push_binding, push_ref, push_scope, push_type_ref,
 };
 
 /// Tree-sitter query capturing call-callee identifiers.
@@ -45,6 +47,26 @@ impl Extractor for PythonExtractor {
     }
 
     fn extract(&self, source: &str, file: &str) -> Result<FileFacts> {
+        self.extract_impl(source, file, None)
+    }
+
+    fn extract_with_bindings(
+        &self,
+        source: &str,
+        file: &str,
+        rules: &BindingRules,
+    ) -> Result<FileFacts> {
+        self.extract_impl(source, file, Some(rules))
+    }
+}
+
+impl PythonExtractor {
+    fn extract_impl(
+        &self,
+        source: &str,
+        file: &str,
+        rules: Option<&BindingRules>,
+    ) -> Result<FileFacts> {
         let ts_language = crate::grammar::python();
         let mut parser = Parser::new();
         parser
@@ -91,6 +113,12 @@ impl Extractor for PythonExtractor {
         collect_type_references(&root, bytes, file, &mut references);
         collect_read_references(&root, bytes, file, &mut references);
         collect_write_references(&root, bytes, file, &mut references);
+        #[cfg(feature = "sql")]
+        if let Some(rules) = rules {
+            collect_query_bindings(&root, bytes, file, rules, &mut references);
+        }
+        #[cfg(not(feature = "sql"))]
+        let _ = rules;
 
         let scopes = collect_scopes(&root, source.len());
         attach_reference_scopes(&mut references, &scopes);
@@ -798,6 +826,62 @@ fn collect_write_references(node: &Node, bytes: &[u8], file: &str, out: &mut Vec
     }
     for child in node.children(&mut node.walk()) {
         collect_write_references(&child, bytes, file, out);
+    }
+}
+
+// ── Query-binding scan (cross-artifact code→SQL edges) ───────────────────────
+
+/// Recursively walk `node` looking for call sites matching one of `rules`'s
+/// Python constructs (e.g. `cursor.execute`, `text`), and emit a
+/// [`RefRole::TypeRef`] reference (`cross_artifact: true`) for every SQL entity
+/// (table/view) named in the embedded SQL argument.
+///
+/// The Python matching convention is the callee's FINAL name segment (not a
+/// dotted path): `cursor.execute(...)` matches on `"execute"`, a bare
+/// `text(...)` matches on `"text"`. Never fails extraction: a call that
+/// doesn't match the expected shape (no matching rule, non-string argument,
+/// malformed SQL, …) is simply skipped.
+#[cfg(feature = "sql")]
+fn collect_query_bindings(
+    node: &Node,
+    bytes: &[u8],
+    file: &str,
+    rules: &BindingRules,
+    out: &mut Vec<Reference>,
+) {
+    if node.kind() == "call" {
+        if let Some(func) = node.child_by_field_name("function") {
+            let attr_name;
+            let callee_name: Option<&str> = match func.kind() {
+                "identifier" => Some(node_text(&func, bytes)),
+                "attribute" => {
+                    attr_name = field_text(&func, "attribute", bytes);
+                    attr_name.as_deref()
+                }
+                _ => None,
+            };
+            if let Some(callee_name) = callee_name {
+                for rule in rules.for_language(Language::Python) {
+                    if rule.construct != callee_name {
+                        continue;
+                    }
+                    let Some(arguments) = node.child_by_field_name("arguments") else {
+                        continue;
+                    };
+                    let Some(arg) = arguments
+                        .named_children(&mut arguments.walk())
+                        .nth(rule.sql_arg)
+                    else {
+                        continue;
+                    };
+                    emit_embedded_sql_refs(&arg, "string_content", bytes, file, out);
+                }
+            }
+        }
+    }
+
+    for child in node.children(&mut node.walk()) {
+        collect_query_bindings(&child, bytes, file, rules, out);
     }
 }
 
@@ -1680,6 +1764,67 @@ MAX_RETRIES = 3
             module.entry_points.is_empty(),
             "non-main guard must not mark the module; got [{}]",
             ep_str(&module.entry_points)
+        );
+    }
+
+    // ── Query-binding cross-artifact refs (code→SQL) ─────────────────────────
+
+    #[cfg(feature = "sql")]
+    #[test]
+    fn method_call_query_binding_emits_cross_artifact_typeref() {
+        let src = "cursor.execute(\"SELECT id FROM users\")\n";
+        let facts = PythonExtractor
+            .extract_with_bindings(src, "src/app.py", &BindingRules::with_defaults())
+            .unwrap();
+
+        let found = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::TypeRef && r.name == "users" && r.cross_artifact);
+        let r = found.expect("expected a cross-artifact TypeRef reference named 'users'");
+
+        let select_byte = src.find("SELECT").expect("fixture contains SELECT");
+        assert!(
+            r.occ.byte >= select_byte,
+            "reference byte {} should point at/after 'SELECT' at {}",
+            r.occ.byte,
+            select_byte
+        );
+    }
+
+    #[cfg(feature = "sql")]
+    #[test]
+    fn plain_function_query_binding_emits_cross_artifact_typeref() {
+        let src = "text(\"SELECT id FROM orders\")\n";
+        let facts = PythonExtractor
+            .extract_with_bindings(src, "src/app.py", &BindingRules::with_defaults())
+            .unwrap();
+
+        let found = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::TypeRef && r.name == "orders" && r.cross_artifact);
+        found.expect("expected a cross-artifact TypeRef reference named 'orders'");
+    }
+
+    #[cfg(feature = "sql")]
+    #[test]
+    fn empty_binding_rules_yield_no_cross_artifact_reference() {
+        let src = "cursor.execute(\"SELECT id FROM users\")\n";
+        let file = "src/app.py";
+
+        let with_empty_rules = PythonExtractor
+            .extract_with_bindings(src, file, &BindingRules::empty())
+            .unwrap();
+        assert!(
+            !with_empty_rules.references.iter().any(|r| r.cross_artifact),
+            "an empty binding-rule registry must yield no cross-artifact references"
+        );
+
+        let plain = PythonExtractor.extract(src, file).unwrap();
+        assert!(
+            !plain.references.iter().any(|r| r.cross_artifact),
+            "the plain extract() path must yield no cross-artifact references"
         );
     }
 }
