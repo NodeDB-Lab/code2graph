@@ -81,9 +81,10 @@ pub(crate) fn edge_filter(
         Some("Conformance") => Some(Provenance::Conformance),
         Some("NormalizedName") => Some(Provenance::NormalizedName),
         Some("External") => Some(Provenance::External),
+        Some("CrossArtifact") => Some(Provenance::CrossArtifact),
         Some(value) => {
             return Err(PyValueError::new_err(format!(
-                "invalid provenance {value:?}; expected SymbolTable, ScopeGraph, FfiBridge, Conformance, NormalizedName, or External"
+                "invalid provenance {value:?}; expected SymbolTable, ScopeGraph, FfiBridge, Conformance, NormalizedName, External, or CrossArtifact"
             )));
         }
     };

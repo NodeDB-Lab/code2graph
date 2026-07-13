@@ -9,7 +9,7 @@ export type SymbolId = GlobalSymbolId | LocalSymbolId;
 export type SymbolIdInput = SymbolId | string;
 export type Confidence = "Heuristic" | "NameOnly" | "Scoped" | "Exact";
 export type RefRole = "Call" | "IsImplementation" | "Import" | "ModuleRef" | "TypeRef" | "Read" | "Write";
-export type Provenance = "SymbolTable" | "ScopeGraph" | "FfiBridge" | "Conformance" | "NormalizedName" | "External";
+export type Provenance = "SymbolTable" | "ScopeGraph" | "FfiBridge" | "Conformance" | "NormalizedName" | "External" | "CrossArtifact";
 
 export interface Occurrence { file: string; line: number; col: number; byte: number }
 export interface SymbolFact {
