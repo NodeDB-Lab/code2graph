@@ -105,7 +105,8 @@ pub fn extract_file_with_bindings(
     rules: &super::BindingRules,
 ) -> Result<FileFacts> {
     #[allow(unreachable_patterns)]
-    match lang {
+    #[cfg_attr(not(feature = "_extractors"), allow(unused_mut))]
+    let mut facts = match lang {
         #[cfg(feature = "c")]
         Language::C => CExtractor.extract_with_bindings(source, file, rules),
         #[cfg(feature = "csharp")]
@@ -156,7 +157,24 @@ pub fn extract_file_with_bindings(
             "{} (grammar feature disabled)",
             lang.as_str()
         ))),
-    }
+    }?;
+    #[cfg(feature = "_extractors")]
+    dedupe_symbol_identities(&mut facts);
+    Ok(facts)
+}
+
+/// Enforce the `FileFacts` invariant that every symbol has a unique
+/// `SymbolId`. A build-free syntactic pass can emit the same definition twice
+/// when it is guarded by mutually-exclusive `#[cfg(...)]` (or `#ifdef`) — the
+/// two occurrences are one logical symbol, so keep the first and drop the
+/// rest. Mirrors the first-seen-wins dedup the layered resolver applies when
+/// merging (see `resolve::layered`).
+#[cfg(feature = "_extractors")]
+fn dedupe_symbol_identities(facts: &mut FileFacts) {
+    let mut seen = std::collections::HashSet::with_capacity(facts.symbols.len());
+    facts
+        .symbols
+        .retain(|symbol| seen.insert(symbol.id.clone()));
 }
 
 /// Extract facts from a file, inferring the language from its path extension,
@@ -175,4 +193,38 @@ pub fn extract_path_with_bindings(
     let lang = Language::from_path(file)
         .ok_or_else(|| CodegraphError::UnsupportedLanguage(file.to_owned()))?;
     extract_file_with_bindings(lang, source, file, rules)
+}
+
+#[cfg(all(test, feature = "rust"))]
+mod tests {
+    use super::*;
+
+    /// A syntactic pass can't evaluate `#[cfg(...)]`, so mutually-exclusive
+    /// cfg-gated definitions of the same item (common in Rust for
+    /// platform-specific code) are both emitted by the tree-sitter walk. They
+    /// must collapse to a single logical symbol rather than surviving as two
+    /// symbols with the same `SymbolId` — which would later fail
+    /// `validate_structure`'s duplicate-identity check and abort the whole
+    /// file.
+    #[test]
+    fn cfg_gated_duplicate_definitions_collapse_to_one_symbol() {
+        let src = r#"
+#[cfg(unix)]
+fn identity() -> u32 { 1 }
+
+#[cfg(not(unix))]
+fn identity() -> u32 { 2 }
+"#;
+        let facts = extract_path("src/lib.rs", src).unwrap();
+        let matches: Vec<_> = facts
+            .symbols
+            .iter()
+            .filter(|s| s.name == "identity")
+            .collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "cfg-gated duplicate definitions must dedupe to a single symbol, got {matches:?}"
+        );
+    }
 }
