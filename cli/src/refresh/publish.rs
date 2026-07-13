@@ -119,7 +119,9 @@ fn prepare_and_publish_inner<E: FactsExtractor>(
         // above deliberately happen outside that transaction.
         store.publish_candidate(&prepared.snapshot, inputs.deadline)?;
         inputs.deadline.check(inputs.cancellation)?;
-        let loaded = store.load_candidate(prepared.snapshot.candidate_id, inputs.deadline)?;
+        // The snapshot was just published verbatim; build the loaded view from
+        // the in-memory candidate instead of re-decoding it back out of SQLite.
+        let loaded = prepared.snapshot.clone().into();
         return Ok(PublishedRefresh { prepared, loaded });
     }
     Err(CliError::Index(

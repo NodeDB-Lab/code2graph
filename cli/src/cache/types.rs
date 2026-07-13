@@ -118,3 +118,24 @@ pub struct LoadedSnapshot {
     pub files: Vec<CandidateFileRecord>,
     pub tier_graphs: Vec<(ResolverCacheTier, CodeGraph)>,
 }
+
+impl From<CandidateSnapshot> for LoadedSnapshot {
+    /// Moves an in-memory candidate snapshot into its loaded form. Field-identical
+    /// to what a coherent SQLite read-back of the same published candidate would
+    /// return, without repeating the JSON decode of every file's facts, subgraph,
+    /// and graph row.
+    fn from(snapshot: CandidateSnapshot) -> Self {
+        Self {
+            candidate_id: snapshot.candidate_id,
+            compatibility: snapshot.compatibility,
+            input_digest: snapshot.input_digest,
+            completeness: snapshot.completeness,
+            omissions: snapshot.omissions,
+            created_at_ns: snapshot.created_at_ns,
+            inventory_file_count: snapshot.inventory_file_count,
+            inventory_total_bytes: snapshot.inventory_total_bytes,
+            files: snapshot.files,
+            tier_graphs: snapshot.tier_graphs,
+        }
+    }
+}

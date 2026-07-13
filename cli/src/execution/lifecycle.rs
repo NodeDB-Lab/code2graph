@@ -5,7 +5,7 @@ use code2graph_query::{EdgeFilter, GraphIndex, GraphPage, GraphRead};
 
 use crate::cache::{
     ActiveSnapshotMetadata, CacheCompleteness, CacheError, CacheGraphRead, CacheLocation,
-    CacheStore, CandidateSnapshot, LoadedSnapshot, ResolverCacheTier,
+    CacheStore, LoadedSnapshot, ResolverCacheTier,
 };
 use crate::commands::{
     DefinitionCommandRequest, DiffImpactCommandRequest, ImpactCommandRequest,
@@ -785,7 +785,7 @@ fn execute_index(request: CliRequest, context: &ExecutionContext<'_>) -> Result<
             context,
         })?;
         enforce_partial(&prepared, request.global.allow_partial)?;
-        let snapshot = loaded_from_candidate(prepared.snapshot.clone());
+        let snapshot: LoadedSnapshot = prepared.snapshot.clone().into();
         return Ok(CommandOutput::Index(index_envelope(
             &selection,
             &snapshot,
@@ -867,7 +867,7 @@ fn execute_status(request: CliRequest, context: &ExecutionContext<'_>) -> Result
         return Ok(CommandOutput::Status(status_envelope(
             &request,
             &selection,
-            loaded_from_candidate(prepared.snapshot),
+            prepared.snapshot.into(),
             Freshness::Fresh,
             CacheDisposition::Disabled,
         )));
@@ -992,7 +992,7 @@ pub fn load_query_graph(
         enforce_partial(&prepared, request.global.allow_partial)?;
         return graph_from_snapshot(
             selection,
-            loaded_from_candidate(prepared.snapshot),
+            prepared.snapshot.into(),
             request.global.tier,
             Freshness::Fresh,
             CacheDisposition::Disabled,
@@ -1083,21 +1083,6 @@ fn cache_location(
 ) -> Result<CacheLocation> {
     CacheLocation::for_project(context.cache_base.as_deref(), &selection.canonical_root)
         .ok_or_else(|| CliError::Cache("no operating-system cache directory is available".into()))
-}
-
-fn loaded_from_candidate(snapshot: CandidateSnapshot) -> LoadedSnapshot {
-    LoadedSnapshot {
-        candidate_id: snapshot.candidate_id,
-        compatibility: snapshot.compatibility,
-        input_digest: snapshot.input_digest,
-        completeness: snapshot.completeness,
-        omissions: snapshot.omissions,
-        created_at_ns: snapshot.created_at_ns,
-        inventory_file_count: snapshot.inventory_file_count,
-        inventory_total_bytes: snapshot.inventory_total_bytes,
-        files: snapshot.files,
-        tier_graphs: snapshot.tier_graphs,
-    }
 }
 
 fn index_envelope(
