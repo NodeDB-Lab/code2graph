@@ -153,6 +153,22 @@ pub(super) fn module_namespaces(file: &str) -> Vec<String> {
     parts
 }
 
+/// Strips a single trailing conventional TS/JS module extension from an
+/// import specifier, e.g. `./commands.ts` → `./commands`. Mirrors the
+/// extension-stripping [`module_namespaces`] applies to a file's own path,
+/// so an import `from_path` lands on the same extension-free segments as
+/// the imported file's namespace chain (required for scope-tier suffix
+/// matching to succeed). Leaves bare package specifiers (`react`,
+/// `@scope/pkg`) and extensionless paths (`./foo`) untouched, since their
+/// trailing segment never matches a known extension.
+fn strip_module_extension(path: &str) -> &str {
+    const KNOWN_EXTENSIONS: &[&str] = &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
+    match path.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() && KNOWN_EXTENSIONS.contains(&ext) => stem,
+        _ => path,
+    }
+}
+
 /// Bare top-level declaration node kinds that are emitted with
 /// [`Visibility::Private`] (non-exported, module-scoped).
 const BARE_DECL_KINDS: &[&str] = &[
@@ -431,7 +447,8 @@ fn collect_imports(
             .child_by_field_name("source")
             .map(|n| {
                 let raw = super::node_text(&n, bytes);
-                raw.trim_matches('"').trim_matches('\'').to_owned()
+                let unquoted = raw.trim_matches('"').trim_matches('\'');
+                strip_module_extension(unquoted).to_owned()
             })
             .unwrap_or_default();
 
@@ -1259,6 +1276,72 @@ export const Y = 2;
             "from_path should be './svc', got {:?}",
             r.from_path
         );
+    }
+
+    #[test]
+    fn ts_import_from_path_strips_ts_extension() {
+        // `import { X } from "./mod.ts";` → from_path == "./mod" (extension
+        // stripped so it matches module_namespaces' extension-free segments).
+        let src = r#"import { X } from "./mod.ts";"#;
+        let facts = TypeScriptExtractor.extract(src, "src/client.ts").unwrap();
+        let r = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Import && r.name == "X")
+            .expect("expected Import ref for 'X'");
+        assert_eq!(
+            r.from_path,
+            Some("./mod".to_owned()),
+            "from_path should be './mod' (extension stripped), got {:?}",
+            r.from_path
+        );
+    }
+
+    #[test]
+    fn js_import_from_path_strips_js_extension() {
+        // Same extraction path is shared with JS; `.js` should strip too.
+        use crate::extract::Extractor as _;
+        use crate::extract::JavaScriptExtractor;
+        let src = r#"import { X } from "./mod.js";"#;
+        let facts = JavaScriptExtractor.extract(src, "src/client.js").unwrap();
+        let r = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Import && r.name == "X")
+            .expect("expected Import ref for 'X'");
+        assert_eq!(
+            r.from_path,
+            Some("./mod".to_owned()),
+            "from_path should be './mod' (extension stripped), got {:?}",
+            r.from_path
+        );
+    }
+
+    #[test]
+    fn ts_import_from_path_without_extension_is_unchanged() {
+        // `import { X } from "./mod";` (no extension) stays as-is.
+        let src = r#"import { X } from "./mod";"#;
+        let facts = TypeScriptExtractor.extract(src, "src/client.ts").unwrap();
+        let r = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Import && r.name == "X")
+            .expect("expected Import ref for 'X'");
+        assert_eq!(r.from_path, Some("./mod".to_owned()));
+    }
+
+    #[test]
+    fn ts_import_from_path_bare_package_specifier_is_unchanged() {
+        // Bare package specifiers with dotted names (e.g. `lodash.debounce`)
+        // must not be mistaken for a file extension.
+        let src = r#"import { X } from "lodash.debounce";"#;
+        let facts = TypeScriptExtractor.extract(src, "src/client.ts").unwrap();
+        let r = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Import && r.name == "X")
+            .expect("expected Import ref for 'X'");
+        assert_eq!(r.from_path, Some("lodash.debounce".to_owned()));
     }
 
     // ── Edge richness: TypeRef / Read / Write ────────────────────────────────
