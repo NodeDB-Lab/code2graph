@@ -69,7 +69,7 @@
 use crate::graph::types::{CodeGraph, Edge, FileFacts, Symbol};
 
 use super::incremental::{FileSubgraph, GlobalIndex, build_subgraph, stitch};
-use super::{Resolver, dedup_files_last_wins};
+use super::{Resolver, dedup_files_last_wins, retain_first_symbol_by_id};
 
 /// Scope-aware resolver. See module docs.
 #[derive(Debug, Default, Clone, Copy)]
@@ -92,10 +92,15 @@ impl Resolver for ScopeGraphResolver {
 
         // The returned graph's symbols are the per-file symbols, concatenated in
         // file order (synthesized Local edge targets are never added here).
-        let symbols: Vec<Symbol> = subs
+        let mut symbols: Vec<Symbol> = subs
             .iter()
             .flat_map(|s| s.symbols.iter().cloned())
             .collect();
+        // A CodeGraph must contain exactly one node per SymbolId: a Go/Java
+        // package can span multiple files, each emitting the same
+        // namespace-only package symbol. Keep the first occurrence, before the
+        // global index below (or anything else) indexes into `symbols`.
+        retain_first_symbol_by_id(&mut symbols);
 
         // Global definition and public re-export index for the cross-file
         // stitch phase. Re-export aliases remain neutral file facts until this
@@ -740,6 +745,38 @@ mod tests {
             "same-package cross-file call must be Scoped"
         );
         assert_eq!(edges[0].provenance, Provenance::ScopeGraph);
+    }
+
+    /// A Go package spanning multiple files: every file emits its own
+    /// namespace-only package `Symbol`, and files in the same package produce
+    /// the SAME `SymbolId`. The merged graph must still contain exactly one
+    /// node for that id.
+    #[cfg(feature = "go")]
+    #[test]
+    fn duplicate_package_module_symbol_is_deduped() {
+        use crate::extract::GoExtractor;
+        use crate::graph::types::SymbolKind;
+
+        let util = GoExtractor
+            .extract("package main\nfunc Helper() {}\n", "util.go")
+            .unwrap();
+        let main = GoExtractor
+            .extract("package main\nfunc Run() {\n\tHelper()\n}\n", "main.go")
+            .unwrap();
+
+        let graph = ScopeGraphResolver.resolve(&[util, main]).unwrap();
+
+        let module_ids: Vec<_> = graph
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Module && s.name == "main")
+            .map(|s| &s.id)
+            .collect();
+        assert_eq!(
+            module_ids.len(),
+            1,
+            "expected exactly one package module symbol for `main`, got {module_ids:?}"
+        );
     }
 
     #[cfg(feature = "rust")]

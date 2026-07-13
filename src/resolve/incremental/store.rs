@@ -430,8 +430,18 @@ impl IncrementalGraph {
 
         let mut symbols = Vec::new();
         let mut edges = Vec::new();
+        // A CodeGraph must contain exactly one node per SymbolId: a Go/Java
+        // package can span multiple files, each emitting the same
+        // namespace-only package symbol. Keep the first occurrence in the
+        // deterministic sorted-file-key order established above.
+        let mut seen_symbols = HashSet::new();
         for (_, sub) in entries {
-            symbols.extend(sub.symbols.iter().cloned());
+            symbols.extend(
+                sub.symbols
+                    .iter()
+                    .filter(|s| seen_symbols.insert(s.id.clone()))
+                    .cloned(),
+            );
             edges.extend(sub.intra_edges.iter().cloned());
             for (ordinal, _) in sub.pending.iter().enumerate() {
                 if let Some(Some(edge)) = self.pending_state.resolved(&sub.owner_file, ordinal) {
@@ -622,6 +632,38 @@ mod tests {
             ids.len(),
             total,
             "duplicate file keys must not yield duplicate SymbolIds"
+        );
+    }
+
+    /// A Go package spanning multiple files: every file emits its own
+    /// namespace-only package `Symbol` with the SAME `SymbolId`. `graph()` must
+    /// still return exactly one node for that id.
+    #[cfg(feature = "go")]
+    #[test]
+    fn graph_dedupes_shared_package_module_symbol() {
+        use crate::extract::GoExtractor;
+        use crate::graph::types::SymbolKind;
+
+        let util = GoExtractor
+            .extract("package main\nfunc Helper() {}\n", "util.go")
+            .unwrap();
+        let main = GoExtractor
+            .extract("package main\nfunc Run() {\n\tHelper()\n}\n", "main.go")
+            .unwrap();
+
+        let store = IncrementalGraph::from_files(&[util, main]);
+        let g = store.graph();
+
+        let module_ids: Vec<_> = g
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Module && s.name == "main")
+            .map(|s| &s.id)
+            .collect();
+        assert_eq!(
+            module_ids.len(),
+            1,
+            "expected exactly one package module symbol for `main`, got {module_ids:?}"
         );
     }
 

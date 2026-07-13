@@ -37,6 +37,6 @@ pub use resolver::Resolver;
 pub use scope_graph::ScopeGraphResolver;
 pub(crate) use support::{
     dedup_files_last_wins, enclosing_path_ends_with, enclosing_symbol_index, namespaces_end_with,
-    normalize_from_path,
+    normalize_from_path, retain_first_symbol_by_id,
 };
 pub use symbol_table::SymbolTableResolver;

@@ -157,10 +157,15 @@ fn same_edge(left: &Edge, right: &Edge) -> bool {
 }
 
 fn symbol_map(symbols: Vec<Symbol>) -> HashMap<SymbolId, Symbol> {
-    symbols
-        .into_iter()
-        .map(|symbol| (symbol.id.clone(), symbol))
-        .collect()
+    // First-wins by id, matching `IncrementalGraph::graph`'s dedup policy for
+    // the shared namespace-only symbol a multi-file package/module emits in
+    // each of its files — otherwise a diff built here could disagree with
+    // which copy the cold `graph()` build keeps.
+    let mut map = HashMap::new();
+    for symbol in symbols {
+        map.entry(symbol.id.clone()).or_insert(symbol);
+    }
+    map
 }
 
 fn edge_map(edges: Vec<Edge>) -> HashMap<EdgeKey, Edge> {

@@ -5,7 +5,7 @@
 //! Resolver-internal utilities that don't belong to any single tier. Kept here
 //! so Tier-A and Tier-B share one definition of caller attribution.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::graph::types::{FileFacts, Symbol};
 use crate::symbol::SymbolId;
@@ -38,6 +38,17 @@ pub(crate) fn dedup_files_last_wins(files: &[FileFacts]) -> Vec<&FileFacts> {
         .filter(|(i, f)| last[f.file.as_str()] == *i)
         .map(|(_, f)| f)
         .collect()
+}
+
+/// Keep only the first occurrence of each [`SymbolId`] in `symbols`, in place.
+///
+/// A `CodeGraph` must contain exactly one node per `SymbolId`: a Go/Java
+/// package can span multiple files, each emitting the same namespace-only
+/// package symbol. Call this before building any index that references
+/// `symbols` by position.
+pub(crate) fn retain_first_symbol_by_id(symbols: &mut Vec<Symbol>) {
+    let mut seen = HashSet::with_capacity(symbols.len());
+    symbols.retain(|s| seen.insert(s.id.clone()));
 }
 
 /// Index (into `symbols`) of the innermost symbol whose span contains `byte`,

@@ -26,6 +26,7 @@ use crate::graph::types::{
 use super::Resolver;
 use super::{
     dedup_files_last_wins, enclosing_symbol_index, namespaces_end_with, normalize_from_path,
+    retain_first_symbol_by_id,
 };
 
 /// Name-table resolver. See module docs.
@@ -57,10 +58,16 @@ impl Resolver for SymbolTableResolver {
         let files = dedup_files_last_wins(files);
 
         // leaf name → indices into the flattened symbol list
-        let symbols: Vec<Symbol> = files
+        let mut symbols: Vec<Symbol> = files
             .iter()
             .flat_map(|f| f.symbols.iter().cloned())
             .collect();
+        // A CodeGraph must contain exactly one node per SymbolId: a Go/Java
+        // package can span multiple files, each emitting the same
+        // namespace-only package symbol. Keep the first occurrence. This must
+        // happen before any index map below is built (those maps index into
+        // `symbols` by position).
+        retain_first_symbol_by_id(&mut symbols);
 
         // Ordinary references and module references have disjoint target domains.
         // This prevents a file/module symbol from polluting callable/value lookup.
@@ -1144,6 +1151,38 @@ resource "aws_instance" "web" { vpc_id = module.vpc.id }
                     .is_some_and(|symbol| symbol.kind == SymbolKind::Module)
             }),
             "module references must target only module symbols"
+        );
+    }
+
+    /// A Go/Java package spanning multiple files: every file emits its own
+    /// namespace-only package/module `Symbol`, and files in the same package
+    /// produce the SAME `SymbolId`. The merged graph must still contain exactly
+    /// one node for that id — duplicates break downstream consumers that index
+    /// a graph by `SymbolId` (e.g. `GraphIndex`).
+    #[cfg(feature = "java")]
+    #[test]
+    fn duplicate_package_module_symbol_is_deduped() {
+        use crate::extract::JavaExtractor;
+
+        let a = JavaExtractor
+            .extract("package p; public class A {}", "src/p/A.java")
+            .unwrap();
+        let b = JavaExtractor
+            .extract("package p; public class B {}", "src/p/B.java")
+            .unwrap();
+
+        let graph = SymbolTableResolver.resolve(&[a, b]).unwrap();
+
+        let module_ids: Vec<_> = graph
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Module && s.name == "p")
+            .map(|s| &s.id)
+            .collect();
+        assert_eq!(
+            module_ids.len(),
+            1,
+            "expected exactly one package module symbol for `p`, got {module_ids:?}"
         );
     }
 }
