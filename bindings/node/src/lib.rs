@@ -6,5 +6,5 @@ mod api;
 mod convert;
 mod query;
 
-pub use api::{build_graph, extract, language_of};
+pub use api::{QueryBindingRuleInput, build_graph, extract, extract_with_bindings, language_of};
 pub use query::GraphIndex;

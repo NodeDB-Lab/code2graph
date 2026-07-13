@@ -254,6 +254,7 @@ dependencies = [
  "code2graph-query",
  "pyo3",
  "pythonize",
+ "serde",
  "serde_json",
 ]
 

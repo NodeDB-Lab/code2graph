@@ -15,6 +15,7 @@ export interface NativeGraphIndex {
 }
 export interface Native {
   extract(file: string, source: string): FileFacts;
+  extractWithBindings(file: string, source: string, customRules?: { lang: string; construct: string; sqlArg: number }[]): FileFacts;
   buildGraph(files: FileFacts[], tier?: Tier | null): CodeGraph;
   languageOf(file: string): string | null;
   GraphIndex: new (graph: CodeGraph) => NativeGraphIndex;
@@ -24,7 +25,7 @@ let injectedNative: Native | undefined;
 
 export function validateNative(value: unknown): Native {
   const native = value as Partial<Native>;
-  if (typeof native?.extract !== "function" || typeof native.buildGraph !== "function" || typeof native.languageOf !== "function" || typeof native.GraphIndex !== "function") throw new TypeError("package did not expose extract, buildGraph, languageOf, and GraphIndex");
+  if (typeof native?.extract !== "function" || typeof native.extractWithBindings !== "function" || typeof native.buildGraph !== "function" || typeof native.languageOf !== "function" || typeof native.GraphIndex !== "function") throw new TypeError("package did not expose extract, extractWithBindings, buildGraph, languageOf, and GraphIndex");
   return native as Native;
 }
 

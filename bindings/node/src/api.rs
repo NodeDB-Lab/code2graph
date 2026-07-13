@@ -3,7 +3,8 @@
 //! Extraction and resolution entry points.
 
 use code2graph_core::{
-    FileFacts, Language, Resolver, ScopeGraphResolver, SymbolTableResolver, extract_path,
+    BindingRules, FileFacts, Language, QueryBindingRule, Resolver, ScopeGraphResolver,
+    SymbolTableResolver, extract_path, extract_path_with_bindings,
 };
 use napi_derive::napi;
 use serde_json::Value;
@@ -14,6 +15,39 @@ use crate::convert::to_napi_err;
 #[napi]
 pub fn extract(file: String, source: String) -> napi::Result<Value> {
     let facts = extract_path(&file, &source).map_err(to_napi_err)?;
+    serde_json::to_value(&facts).map_err(to_napi_err)
+}
+
+/// A custom query-binding rule: `construct` (e.g. "mydb::sql") in `lang` carries
+/// embedded SQL in argument `sqlArg`.
+#[napi(object)]
+pub struct QueryBindingRuleInput {
+    pub lang: String,
+    pub construct: String,
+    pub sql_arg: u32,
+}
+
+/// Extract facts AND cross-artifact code→SQL references. Applies the built-in
+/// query-binding rules (sqlx/diesel/knex/execute/…); `customRules` (optional)
+/// registers project-specific constructs on top of the defaults.
+#[napi]
+pub fn extract_with_bindings(
+    file: String,
+    source: String,
+    custom_rules: Option<Vec<QueryBindingRuleInput>>,
+) -> napi::Result<Value> {
+    let mut rules = BindingRules::with_defaults();
+    for raw in custom_rules.unwrap_or_default() {
+        let lang = Language::from_tag(&raw.lang).ok_or_else(|| {
+            napi::Error::from_reason(format!("unknown language tag {:?}", raw.lang))
+        })?;
+        rules.register(QueryBindingRule {
+            lang,
+            construct: raw.construct,
+            sql_arg: raw.sql_arg as usize,
+        });
+    }
+    let facts = extract_path_with_bindings(&file, &source, &rules).map_err(to_napi_err)?;
     serde_json::to_value(&facts).map_err(to_napi_err)
 }
 

@@ -14,7 +14,7 @@ const facts: FileFacts[] = [{ file: "sample.rs", lang: "rust", symbols: graph.sy
 
 function fixtureNative(constructions: { value: number }): Native {
   return {
-    extract: () => facts[0], buildGraph: () => graph, languageOf: file => file.endsWith(".rs") ? "rust" : null,
+    extract: () => facts[0], extractWithBindings: () => facts[0], buildGraph: () => graph, languageOf: file => file.endsWith(".rs") ? "rust" : null,
     GraphIndex: class {
       constructor(_graph: CodeGraph) { constructions.value++; }
       symbol() { return null; }
