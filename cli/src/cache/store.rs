@@ -359,12 +359,29 @@ impl CacheStore {
                         params![encoded.candidate_id.as_slice(), omission.path, omission.reason, omission.detail],
                     ).map_err(|error| map_sqlite_error(error, deadline))?;
                 }
-                for file in &encoded.files {
-                    ensure_time(deadline)?;
-                    self.connection.execute(
-                        "INSERT INTO candidate_files (candidate_id, path, language, content_hash, size_bytes, mtime_seconds, mtime_nanoseconds, package_assignment, file_facts, file_subgraph) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                        params![encoded.candidate_id.as_slice(), file.path, file.language, file.content_hash.as_slice(), file.size_bytes, file.mtime_seconds, file.mtime_nanoseconds, file.package_assignment, file.facts, file.subgraph],
-                    ).map_err(|error| map_sqlite_error(error, deadline))?;
+                {
+                    let mut stmt = self
+                        .connection
+                        .prepare(
+                            "INSERT INTO candidate_files (candidate_id, path, language, content_hash, size_bytes, mtime_seconds, mtime_nanoseconds, package_assignment, file_facts, file_subgraph) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                        )
+                        .map_err(|error| map_sqlite_error(error, deadline))?;
+                    for file in &encoded.files {
+                        ensure_time(deadline)?;
+                        stmt.execute(params![
+                            encoded.candidate_id.as_slice(),
+                            file.path,
+                            file.language,
+                            file.content_hash.as_slice(),
+                            file.size_bytes,
+                            file.mtime_seconds,
+                            file.mtime_nanoseconds,
+                            file.package_assignment,
+                            file.facts,
+                            file.subgraph
+                        ])
+                        .map_err(|error| map_sqlite_error(error, deadline))?;
+                    }
                 }
             }
             let candidate_created_at: i64 = self
@@ -392,23 +409,72 @@ impl CacheStore {
                     let snapshot_id = self.connection.last_insert_rowid();
                     // Precomputed in `PreparedCandidate::new` — the transaction body
                     // is serde-free: it inserts already-derived columns and payloads.
-                    for (ordinal, row) in graph.ids.iter().enumerate() {
-                        self.connection.execute(
-                            "INSERT INTO graph_ids (snapshot_id, ordinal, id, scip) VALUES (?1, ?2, ?3, ?4)",
-                            params![snapshot_id, i64::try_from(ordinal).map_err(|_| CacheError::Limits)?, row.id, row.scip],
-                        ).map_err(|error| map_sqlite_error(error, deadline))?;
+                    // Each bulk loop reuses ONE prepared statement rather than
+                    // re-compiling the INSERT per row (hundreds of thousands of rows).
+                    {
+                        let mut stmt = self
+                            .connection
+                            .prepare(
+                                "INSERT INTO graph_ids (snapshot_id, ordinal, id, scip) VALUES (?1, ?2, ?3, ?4)",
+                            )
+                            .map_err(|error| map_sqlite_error(error, deadline))?;
+                        for (ordinal, row) in graph.ids.iter().enumerate() {
+                            stmt.execute(params![
+                                snapshot_id,
+                                i64::try_from(ordinal).map_err(|_| CacheError::Limits)?,
+                                row.id,
+                                row.scip
+                            ])
+                            .map_err(|error| map_sqlite_error(error, deadline))?;
+                        }
                     }
-                    for (ordinal, row) in graph.symbols.iter().enumerate() {
-                        self.connection.execute(
-                            "INSERT INTO graph_symbols (snapshot_id, ordinal, id, scip, name, file, span_start, span_end, kind, symbol) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                            params![snapshot_id, i64::try_from(ordinal).map_err(|_| CacheError::Limits)?, row.id, row.scip, row.name, row.file, row.span_start, row.span_end, row.kind, row.payload],
-                        ).map_err(|error| map_sqlite_error(error, deadline))?;
+                    {
+                        let mut stmt = self
+                            .connection
+                            .prepare(
+                                "INSERT INTO graph_symbols (snapshot_id, ordinal, id, scip, name, file, span_start, span_end, kind, symbol) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                            )
+                            .map_err(|error| map_sqlite_error(error, deadline))?;
+                        for (ordinal, row) in graph.symbols.iter().enumerate() {
+                            stmt.execute(params![
+                                snapshot_id,
+                                i64::try_from(ordinal).map_err(|_| CacheError::Limits)?,
+                                row.id,
+                                row.scip,
+                                row.name,
+                                row.file,
+                                row.span_start,
+                                row.span_end,
+                                row.kind,
+                                row.payload
+                            ])
+                            .map_err(|error| map_sqlite_error(error, deadline))?;
+                        }
                     }
-                    for (ordinal, row) in graph.edges.iter().enumerate() {
-                        self.connection.execute(
-                            "INSERT INTO graph_edges (snapshot_id, ordinal, edge_key, from_id, to_id, role, confidence, confidence_rank, provenance, occurrence_file, occurrence_byte, edge) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-                            params![snapshot_id, i64::try_from(ordinal).map_err(|_| CacheError::Limits)?, row.edge_key, row.from_id, row.to_id, row.role, row.confidence, row.confidence_rank, row.provenance, row.occurrence_file, row.occurrence_byte, row.payload],
-                        ).map_err(|error| map_sqlite_error(error, deadline))?;
+                    {
+                        let mut stmt = self
+                            .connection
+                            .prepare(
+                                "INSERT INTO graph_edges (snapshot_id, ordinal, edge_key, from_id, to_id, role, confidence, confidence_rank, provenance, occurrence_file, occurrence_byte, edge) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                            )
+                            .map_err(|error| map_sqlite_error(error, deadline))?;
+                        for (ordinal, row) in graph.edges.iter().enumerate() {
+                            stmt.execute(params![
+                                snapshot_id,
+                                i64::try_from(ordinal).map_err(|_| CacheError::Limits)?,
+                                row.edge_key,
+                                row.from_id,
+                                row.to_id,
+                                row.role,
+                                row.confidence,
+                                row.confidence_rank,
+                                row.provenance,
+                                row.occurrence_file,
+                                row.occurrence_byte,
+                                row.payload
+                            ])
+                            .map_err(|error| map_sqlite_error(error, deadline))?;
+                        }
                     }
                     snapshot_id
                 };
