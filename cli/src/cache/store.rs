@@ -7,10 +7,12 @@ use std::cell::Cell;
 use std::fs;
 use std::io;
 use std::path::Path;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use code2graph::{
-    CodeGraph, Confidence, Edge, EdgeKey, FileFacts, IncrementalGraph, Symbol, SymbolId,
+    CodeGraph, Confidence, Edge, EdgeKey, FileFacts, FileSubgraph, IncrementalGraph, Symbol,
+    SymbolId,
 };
 use code2graph_query::{EdgeFilter, GraphPage, GraphRead};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
@@ -388,57 +390,24 @@ impl CacheStore {
                         params![encoded.candidate_id.as_slice(), graph.tier, candidate_created_at],
                     ).map_err(|error| map_sqlite_error(error, deadline))?;
                     let snapshot_id = self.connection.last_insert_rowid();
-                    let mut known_ids =
-                        Vec::with_capacity(graph.symbols.len() + graph.edges.len() * 2);
-                    for payload in &graph.symbols {
-                        known_ids.push(
-                            serde_json::from_slice::<Symbol>(payload)
-                                .map_err(|_| CacheError::Corrupt)?
-                                .id,
-                        );
-                    }
-                    for payload in &graph.edges {
-                        let edge: Edge =
-                            serde_json::from_slice(payload).map_err(|_| CacheError::Corrupt)?;
-                        known_ids.extend([edge.from, edge.to]);
-                    }
-                    known_ids.sort();
-                    known_ids.dedup();
-                    for (ordinal, id) in known_ids.iter().enumerate() {
+                    // Precomputed in `PreparedCandidate::new` — the transaction body
+                    // is serde-free: it inserts already-derived columns and payloads.
+                    for (ordinal, row) in graph.ids.iter().enumerate() {
                         self.connection.execute(
                             "INSERT INTO graph_ids (snapshot_id, ordinal, id, scip) VALUES (?1, ?2, ?3, ?4)",
-                            params![snapshot_id, i64::try_from(ordinal).map_err(|_| CacheError::Limits)?, serde_json::to_vec(id).map_err(|_| CacheError::Limits)?, id.to_scip_string()],
+                            params![snapshot_id, i64::try_from(ordinal).map_err(|_| CacheError::Limits)?, row.id, row.scip],
                         ).map_err(|error| map_sqlite_error(error, deadline))?;
                     }
-                    for (ordinal, payload) in graph.symbols.iter().enumerate() {
-                        let symbol: Symbol =
-                            serde_json::from_slice(payload).map_err(|_| CacheError::Corrupt)?;
-                        let id = serde_json::to_vec(&symbol.id).map_err(|_| CacheError::Limits)?;
-                        let kind =
-                            serde_json::to_string(&symbol.kind).map_err(|_| CacheError::Limits)?;
+                    for (ordinal, row) in graph.symbols.iter().enumerate() {
                         self.connection.execute(
                             "INSERT INTO graph_symbols (snapshot_id, ordinal, id, scip, name, file, span_start, span_end, kind, symbol) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                            params![snapshot_id, i64::try_from(ordinal).map_err(|_| CacheError::Limits)?, id.clone(), symbol.id.to_scip_string(), symbol.name, symbol.file, i64::try_from(symbol.span.start).map_err(|_| CacheError::Limits)?, i64::try_from(symbol.span.end).map_err(|_| CacheError::Limits)?, kind, payload],
+                            params![snapshot_id, i64::try_from(ordinal).map_err(|_| CacheError::Limits)?, row.id, row.scip, row.name, row.file, row.span_start, row.span_end, row.kind, row.payload],
                         ).map_err(|error| map_sqlite_error(error, deadline))?;
                     }
-                    for (ordinal, payload) in graph.edges.iter().enumerate() {
-                        let edge: Edge =
-                            serde_json::from_slice(payload).map_err(|_| CacheError::Corrupt)?;
-                        let from_id =
-                            serde_json::to_vec(&edge.from).map_err(|_| CacheError::Limits)?;
-                        let to_id = serde_json::to_vec(&edge.to).map_err(|_| CacheError::Limits)?;
-                        let role =
-                            serde_json::to_string(&edge.role).map_err(|_| CacheError::Limits)?;
-                        let confidence = serde_json::to_string(&edge.confidence)
-                            .map_err(|_| CacheError::Limits)?;
-                        let provenance = serde_json::to_string(&edge.provenance)
-                            .map_err(|_| CacheError::Limits)?;
-                        let confidence_rank = confidence_rank(edge.confidence);
-                        let edge_key =
-                            serde_json::to_vec(&edge.key()).map_err(|_| CacheError::Limits)?;
+                    for (ordinal, row) in graph.edges.iter().enumerate() {
                         self.connection.execute(
                             "INSERT INTO graph_edges (snapshot_id, ordinal, edge_key, from_id, to_id, role, confidence, confidence_rank, provenance, occurrence_file, occurrence_byte, edge) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-                            params![snapshot_id, i64::try_from(ordinal).map_err(|_| CacheError::Limits)?, edge_key, from_id.clone(), to_id.clone(), role, confidence, confidence_rank, provenance, edge.occ.file, i64::try_from(edge.occ.byte).map_err(|_| CacheError::Limits)?, payload],
+                            params![snapshot_id, i64::try_from(ordinal).map_err(|_| CacheError::Limits)?, row.edge_key, row.from_id, row.to_id, row.role, row.confidence, row.confidence_rank, row.provenance, row.occurrence_file, row.occurrence_byte, row.payload],
                         ).map_err(|error| map_sqlite_error(error, deadline))?;
                     }
                     snapshot_id
@@ -477,7 +446,17 @@ impl CacheStore {
             self.load_graph_payloads(snapshot_id, "graph_symbols", "symbol", deadline)?;
         let stored_edges =
             self.load_graph_payloads(snapshot_id, "graph_edges", "edge", deadline)?;
-        if stored_symbols != graph.symbols || stored_edges != graph.edges {
+        if stored_symbols.len() != graph.symbols.len()
+            || stored_edges.len() != graph.edges.len()
+            || stored_symbols
+                .iter()
+                .zip(&graph.symbols)
+                .any(|(stored, row)| *stored != row.payload)
+            || stored_edges
+                .iter()
+                .zip(&graph.edges)
+                .any(|(stored, row)| *stored != row.payload)
+        {
             return Err(CacheError::CandidateConflict);
         }
         Ok(())
@@ -1201,10 +1180,129 @@ struct PreparedFile {
     subgraph: Option<Vec<u8>>,
 }
 
+/// One deduped known-id row: the serialized `SymbolId` and its SCIP rendering,
+/// precomputed so the transaction never re-derives them.
+struct PreparedIdRow {
+    id: Vec<u8>,
+    scip: String,
+}
+
+/// One `graph_symbols` row with every derived column precomputed from the
+/// structured `Symbol`, plus the exact serialized payload persisted in `symbol`.
+struct PreparedSymbolRow {
+    id: Vec<u8>,
+    scip: String,
+    name: String,
+    file: String,
+    span_start: i64,
+    span_end: i64,
+    kind: String,
+    payload: Vec<u8>,
+}
+
+/// One `graph_edges` row with every derived column precomputed from the
+/// structured `Edge`, plus the exact serialized payload persisted in `edge`.
+struct PreparedEdgeRow {
+    edge_key: Vec<u8>,
+    from_id: Vec<u8>,
+    to_id: Vec<u8>,
+    role: String,
+    confidence: String,
+    confidence_rank: i64,
+    provenance: String,
+    occurrence_file: String,
+    occurrence_byte: i64,
+    payload: Vec<u8>,
+}
+
 struct PreparedGraph {
     tier: &'static str,
-    symbols: Vec<Vec<u8>>,
-    edges: Vec<Vec<u8>>,
+    ids: Vec<PreparedIdRow>,
+    symbols: Vec<PreparedSymbolRow>,
+    edges: Vec<PreparedEdgeRow>,
+}
+
+// A compile-time guard: the inputs the parallel precompute shares across scoped
+// threads must stay `Send + Sync`. If any of these regresses, this fails to build.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<Symbol>();
+    assert_send_sync::<Edge>();
+    assert_send_sync::<CandidateFileRecord>();
+    assert_send_sync::<FileFacts>();
+    assert_send_sync::<FileSubgraph>();
+};
+
+/// Runs `f` over `items` across a bounded pool of scoped threads
+/// (`available_parallelism`, capped by the item count; serial for tiny inputs),
+/// returning results in input order. The first error by index is propagated,
+/// matching a serial short-circuit; `ensure_time` is checked per item so a
+/// deadline still aborts. A poisoned result mutex degrades via `into_inner`
+/// rather than panicking.
+fn par_try_map<T, R>(
+    items: &[T],
+    deadline: &Deadline,
+    f: impl Fn(&T) -> Result<R, CacheError> + Sync,
+) -> Result<Vec<R>, CacheError>
+where
+    T: Sync,
+    R: Send,
+{
+    if items.is_empty() {
+        return Ok(Vec::new());
+    }
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(items.len())
+        .max(1);
+    if workers <= 1 {
+        let mut out = Vec::with_capacity(items.len());
+        for item in items {
+            ensure_time(deadline)?;
+            out.push(f(item)?);
+        }
+        return Ok(out);
+    }
+    // Static chunking: each worker owns one contiguous range and records its
+    // whole chunk with a SINGLE lock acquisition. A per-item lock (or per-item
+    // atomic cursor) convoys catastrophically on large graphs — hundreds of
+    // thousands of symbols/edges would each contend on the shared mutex. Chunks
+    // are processed in order, so the first-erroring chunk carries the
+    // lowest-index error, matching a serial short-circuit deterministically.
+    // (chunk index, that chunk's mapped items or the first error within it).
+    type ChunkResult<R> = (usize, Result<Vec<R>, CacheError>);
+    let chunk_size = items.len().div_ceil(workers);
+    let results: Mutex<Vec<ChunkResult<R>>> = Mutex::new(Vec::with_capacity(workers));
+    std::thread::scope(|scope| {
+        let results = &results;
+        let f = &f;
+        for (chunk_index, chunk) in items.chunks(chunk_size).enumerate() {
+            scope.spawn(move || {
+                let outcome = (|| {
+                    let mut local = Vec::with_capacity(chunk.len());
+                    for item in chunk {
+                        ensure_time(deadline)?;
+                        local.push(f(item)?);
+                    }
+                    Ok(local)
+                })();
+                results
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .push((chunk_index, outcome));
+            });
+        }
+    });
+    let mut results = results
+        .into_inner()
+        .unwrap_or_else(|poison| poison.into_inner());
+    results.sort_by_key(|(index, _)| *index);
+    let mut out = Vec::with_capacity(items.len());
+    for (_, outcome) in results {
+        out.extend(outcome?);
+    }
+    Ok(out)
 }
 
 struct PreparedCandidate {
@@ -1287,9 +1385,9 @@ impl PreparedCandidate {
         if has_scope_graph && candidate.files.iter().any(|file| file.subgraph.is_none()) {
             return Err(CacheError::InvalidCandidate);
         }
-        let mut files = Vec::with_capacity(candidate.files.len());
-        for file in &candidate.files {
-            ensure_time(deadline)?;
+        // The per-file work (validation + facts/subgraph encode) is independent per
+        // file. Run it across a bounded thread pool, preserving input order.
+        let files = par_try_map(&candidate.files, deadline, |file| {
             if file.path.is_empty()
                 || file.path.contains('\\')
                 || file.language.is_empty()
@@ -1307,16 +1405,10 @@ impl PreparedCandidate {
             let (mtime_seconds, mtime_nanoseconds) = encode_mtime(file.mtime)?;
             let facts = encode_file_facts(&file.facts)?;
             let subgraph = match &file.subgraph {
-                Some(subgraph) => {
-                    let mut check = IncrementalGraph::new();
-                    check
-                        .try_upsert_subgraph(file.path.clone(), subgraph.clone())
-                        .map_err(|_| CacheError::InvalidSubgraph)?;
-                    Some(encode_subgraph(subgraph)?)
-                }
+                Some(subgraph) => Some(encode_subgraph(subgraph)?),
                 None => None,
             };
-            files.push(PreparedFile {
+            Ok(PreparedFile {
                 path: file.path.clone(),
                 language: file.language.clone(),
                 content_hash: file.content_hash,
@@ -1326,11 +1418,12 @@ impl PreparedCandidate {
                 package_assignment: file.package_assignment.clone(),
                 facts,
                 subgraph,
-            });
-        }
+            })
+        })?;
         let mut graphs = Vec::with_capacity(candidate.tier_graphs.len());
         for (tier, graph) in &candidate.tier_graphs {
             ensure_time(deadline)?;
+            // Sort + dedup-check stay serial (they establish the persisted order).
             let mut ordered_symbols = graph.symbols.clone();
             ordered_symbols.sort_by(|left, right| left.id.cmp(&right.id));
             if ordered_symbols
@@ -1339,10 +1432,6 @@ impl PreparedCandidate {
             {
                 return Err(CacheError::InvalidCandidate);
             }
-            let symbols = ordered_symbols
-                .iter()
-                .map(|symbol| serde_json::to_vec(symbol).map_err(|_| CacheError::Limits))
-                .collect::<Result<Vec<_>, _>>()?;
             let mut ordered_edges = graph.edges.clone();
             ordered_edges.sort_by_key(Edge::key);
             if ordered_edges
@@ -1351,12 +1440,68 @@ impl PreparedCandidate {
             {
                 return Err(CacheError::InvalidCandidate);
             }
-            let edges = ordered_edges
-                .iter()
-                .map(|edge| serde_json::to_vec(edge).map_err(|_| CacheError::Limits))
-                .collect::<Result<Vec<_>, _>>()?;
+            // The known-id set: every symbol id plus every edge endpoint, sorted and
+            // deduped — reproducing the exact set the transaction used to derive.
+            let mut known_ids: Vec<&SymbolId> =
+                Vec::with_capacity(ordered_symbols.len() + ordered_edges.len() * 2);
+            for symbol in &ordered_symbols {
+                known_ids.push(&symbol.id);
+            }
+            for edge in &ordered_edges {
+                known_ids.push(&edge.from);
+                known_ids.push(&edge.to);
+            }
+            known_ids.sort();
+            known_ids.dedup();
+            // Per-item row derivation is independent — parallelize each map.
+            let ids = par_try_map(&known_ids, deadline, |id| {
+                Ok(PreparedIdRow {
+                    id: serde_json::to_vec(id).map_err(|_| CacheError::Limits)?,
+                    scip: id.to_scip_string(),
+                })
+            })?;
+            let symbols = par_try_map(&ordered_symbols, deadline, |symbol| {
+                let payload = serde_json::to_vec(symbol).map_err(|_| CacheError::Limits)?;
+                let id = serde_json::to_vec(&symbol.id).map_err(|_| CacheError::Limits)?;
+                let kind = serde_json::to_string(&symbol.kind).map_err(|_| CacheError::Limits)?;
+                Ok(PreparedSymbolRow {
+                    id,
+                    scip: symbol.id.to_scip_string(),
+                    name: symbol.name.clone(),
+                    file: symbol.file.clone(),
+                    span_start: i64::try_from(symbol.span.start).map_err(|_| CacheError::Limits)?,
+                    span_end: i64::try_from(symbol.span.end).map_err(|_| CacheError::Limits)?,
+                    kind,
+                    payload,
+                })
+            })?;
+            let edges = par_try_map(&ordered_edges, deadline, |edge| {
+                let payload = serde_json::to_vec(edge).map_err(|_| CacheError::Limits)?;
+                let from_id = serde_json::to_vec(&edge.from).map_err(|_| CacheError::Limits)?;
+                let to_id = serde_json::to_vec(&edge.to).map_err(|_| CacheError::Limits)?;
+                let role = serde_json::to_string(&edge.role).map_err(|_| CacheError::Limits)?;
+                let confidence =
+                    serde_json::to_string(&edge.confidence).map_err(|_| CacheError::Limits)?;
+                let provenance =
+                    serde_json::to_string(&edge.provenance).map_err(|_| CacheError::Limits)?;
+                let edge_key = serde_json::to_vec(&edge.key()).map_err(|_| CacheError::Limits)?;
+                Ok(PreparedEdgeRow {
+                    edge_key,
+                    from_id,
+                    to_id,
+                    role,
+                    confidence,
+                    confidence_rank: confidence_rank(edge.confidence),
+                    provenance,
+                    occurrence_file: edge.occ.file.clone(),
+                    occurrence_byte: i64::try_from(edge.occ.byte)
+                        .map_err(|_| CacheError::Limits)?,
+                    payload,
+                })
+            })?;
             graphs.push(PreparedGraph {
                 tier: tier.as_sql(),
+                ids,
                 symbols,
                 edges,
             });
