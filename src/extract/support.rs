@@ -366,6 +366,13 @@ pub(crate) fn mark_self_receiver_calls(
             let byte = cap.node.start_byte();
             if let Some(&idx) = call_ref_by_byte.get(&byte) {
                 references[idx].self_receiver = true;
+                // A `self`/`this` receiver is a keyword, not a resolvable type
+                // path. Some grammars' main call query captures it as a
+                // qualifier (e.g. Kotlin's `navigation_expression` receiver);
+                // clear it so self-receiver refs uniformly carry `qualifier =
+                // None`, matching the resolver invariant (the owning type is
+                // derived from the enclosing member, never from this receiver).
+                references[idx].qualifier = None;
             }
         }
     }

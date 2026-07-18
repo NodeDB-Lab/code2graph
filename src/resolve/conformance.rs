@@ -32,8 +32,9 @@
 //! # What it deliberately defers (the type-inference ceiling)
 //!
 //! - `this.method()` / `self.method()` for languages whose extractor has not
-//!   yet opted into `self_receiver` — Rust, Java, and TypeScript/JavaScript
-//!   mark it today; other languages fall back to the unqualified case above.
+//!   yet opted into `self_receiver` — Rust, Java, TypeScript/JavaScript, C++,
+//!   Swift, C#, Kotlin, and Dart mark it today; other languages fall back to
+//!   the unqualified case above.
 //! - chained `inner().method()` — needs the return type of `inner()`.
 //! - field-access chains (`a.b.method()`) — needs the field's type.
 //!
@@ -268,23 +269,35 @@ fn find_inherited(
         feature = "rust",
         feature = "typescript",
         feature = "cpp",
-        feature = "swift"
+        feature = "swift",
+        feature = "csharp",
+        feature = "kotlin",
+        feature = "dart"
     )
 ))]
 mod tests {
     use super::*;
+    #[cfg(feature = "csharp")]
+    use crate::extract::CSharpExtractor;
     #[cfg(feature = "cpp")]
     use crate::extract::CppExtractor;
+    #[cfg(feature = "dart")]
+    use crate::extract::DartExtractor;
     #[cfg(any(
         feature = "java",
         feature = "rust",
         feature = "typescript",
         feature = "cpp",
-        feature = "swift"
+        feature = "swift",
+        feature = "csharp",
+        feature = "kotlin",
+        feature = "dart"
     ))]
     use crate::extract::Extractor;
     #[cfg(feature = "java")]
     use crate::extract::JavaExtractor;
+    #[cfg(feature = "kotlin")]
+    use crate::extract::KotlinExtractor;
     #[cfg(feature = "rust")]
     use crate::extract::RustExtractor;
     #[cfg(feature = "swift")]
@@ -890,6 +903,156 @@ mod tests {
             conf_edges.len(),
             1,
             "expected exactly one conformance edge for the self.hello() site, got {:?}",
+            conf_edges
+                .iter()
+                .map(|e| format!("{} -> {}", e.from.to_scip_string(), e.to.to_scip_string()))
+                .collect::<Vec<_>>()
+        );
+
+        let e = conf_edges[0];
+        assert!(
+            e.to.to_scip_string().ends_with("Base#hello()."),
+            "edge `to` should be the inherited Base#hello(), got: {}",
+            e.to.to_scip_string()
+        );
+        assert!(
+            e.from.to_scip_string().ends_with("Sub#greetAll()."),
+            "edge `from` should be the enclosing Sub#greetAll(), got: {}",
+            e.from.to_scip_string()
+        );
+        assert_eq!(e.confidence, Confidence::Scoped);
+        assert_eq!(e.provenance, Provenance::Conformance);
+    }
+
+    /// C# variant: `Base` defines `Hello`, `Sub : Base` calls `this.Hello()`
+    /// from its own method without redefining it. Mirrors
+    /// `conformance_resolves_java_self_receiver_inherited_class_method_end_to_end`.
+    #[cfg(feature = "csharp")]
+    #[test]
+    fn conformance_resolves_csharp_self_receiver_inherited_class_method_end_to_end() {
+        let base = CSharpExtractor
+            .extract(
+                "public class Base { public void Hello() {} }",
+                "src/Base.cs",
+            )
+            .unwrap();
+        let sub = CSharpExtractor
+            .extract(
+                "public class Sub : Base { public void GreetAll() { this.Hello(); } }",
+                "src/Sub.cs",
+            )
+            .unwrap();
+
+        let graph = ConformanceResolver.resolve(&[base, sub]).unwrap();
+
+        let conf_edges: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.provenance == Provenance::Conformance)
+            .collect();
+
+        assert_eq!(
+            conf_edges.len(),
+            1,
+            "expected exactly one conformance edge for the this.Hello() site, got {:?}",
+            conf_edges
+                .iter()
+                .map(|e| format!("{} -> {}", e.from.to_scip_string(), e.to.to_scip_string()))
+                .collect::<Vec<_>>()
+        );
+
+        let e = conf_edges[0];
+        assert!(
+            e.to.to_scip_string().ends_with("Base#Hello()."),
+            "edge `to` should be the inherited Base#Hello(), got: {}",
+            e.to.to_scip_string()
+        );
+        assert!(
+            e.from.to_scip_string().ends_with("Sub#GreetAll()."),
+            "edge `from` should be the enclosing Sub#GreetAll(), got: {}",
+            e.from.to_scip_string()
+        );
+        assert_eq!(e.confidence, Confidence::Scoped);
+        assert_eq!(e.provenance, Provenance::Conformance);
+    }
+
+    /// Kotlin variant: `Base` defines `hello`, `Sub : Base()` calls
+    /// `this.hello()` from its own method without redefining it. Mirrors
+    /// `conformance_resolves_java_self_receiver_inherited_class_method_end_to_end`.
+    #[cfg(feature = "kotlin")]
+    #[test]
+    fn conformance_resolves_kotlin_self_receiver_inherited_class_method_end_to_end() {
+        let base = KotlinExtractor
+            .extract("open class Base { open fun hello() {} }", "src/Base.kt")
+            .unwrap();
+        let sub = KotlinExtractor
+            .extract(
+                "class Sub : Base() { fun greetAll() { this.hello() } }",
+                "src/Sub.kt",
+            )
+            .unwrap();
+
+        let graph = ConformanceResolver.resolve(&[base, sub]).unwrap();
+
+        let conf_edges: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.provenance == Provenance::Conformance)
+            .collect();
+
+        assert_eq!(
+            conf_edges.len(),
+            1,
+            "expected exactly one conformance edge for the this.hello() site, got {:?}",
+            conf_edges
+                .iter()
+                .map(|e| format!("{} -> {}", e.from.to_scip_string(), e.to.to_scip_string()))
+                .collect::<Vec<_>>()
+        );
+
+        let e = conf_edges[0];
+        assert!(
+            e.to.to_scip_string().ends_with("Base#hello()."),
+            "edge `to` should be the inherited Base#hello(), got: {}",
+            e.to.to_scip_string()
+        );
+        assert!(
+            e.from.to_scip_string().ends_with("Sub#greetAll()."),
+            "edge `from` should be the enclosing Sub#greetAll(), got: {}",
+            e.from.to_scip_string()
+        );
+        assert_eq!(e.confidence, Confidence::Scoped);
+        assert_eq!(e.provenance, Provenance::Conformance);
+    }
+
+    /// Dart variant: `Base` defines `hello`, `Sub extends Base` calls
+    /// `this.hello()` from its own method without redefining it. Mirrors
+    /// `conformance_resolves_java_self_receiver_inherited_class_method_end_to_end`.
+    #[cfg(feature = "dart")]
+    #[test]
+    fn conformance_resolves_dart_self_receiver_inherited_class_method_end_to_end() {
+        let base = DartExtractor
+            .extract("class Base { void hello() {} }", "lib/base.dart")
+            .unwrap();
+        let sub = DartExtractor
+            .extract(
+                "class Sub extends Base { void greetAll() { this.hello(); } }",
+                "lib/sub.dart",
+            )
+            .unwrap();
+
+        let graph = ConformanceResolver.resolve(&[base, sub]).unwrap();
+
+        let conf_edges: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.provenance == Provenance::Conformance)
+            .collect();
+
+        assert_eq!(
+            conf_edges.len(),
+            1,
+            "expected exactly one conformance edge for the this.hello() site, got {:?}",
             conf_edges
                 .iter()
                 .map(|e| format!("{} -> {}", e.from.to_scip_string(), e.to.to_scip_string()))

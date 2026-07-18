@@ -39,8 +39,8 @@ use crate::symbol::Descriptor;
 use super::{
     ExtractCtx, Extractor, MIN_REF_LEN, attach_reference_scopes, child_text,
     collect_call_references, definition_bindings, field_text, import_bindings, innermost_scope,
-    make_symbol, node_span, node_text, one_line_signature, push_binding, push_ref, push_scope,
-    push_type_ref,
+    make_symbol, mark_self_receiver_calls, node_span, node_text, one_line_signature, push_binding,
+    push_ref, push_scope, push_type_ref,
 };
 
 /// Tree-sitter query capturing call-callee identifiers.
@@ -58,6 +58,23 @@ const CALL_QUERY: &str = r#"
   (call_expression (identifier) @callee)
   (call_expression (navigation_expression (_) @qualifier (identifier) @callee))
 ]
+"#;
+
+/// Method calls whose receiver is written as the `this` keyword
+/// (`this.foo()`).
+///
+/// Deliberately a *separate* query from [`CALL_QUERY`] rather than an extra
+/// alternation branch there, mirroring the Rust extractor's `SELF_CALL_QUERY`:
+/// `navigation_expression (this_expression) (identifier) …` and the existing
+/// `navigation_expression (_) @qualifier (identifier) …` branch both
+/// structurally match the same `this.foo()` node, and tree-sitter's
+/// alternation explores every branch that fits — combining them in one `[ ]`
+/// would double-emit the reference. Run as a second pass and correlate back
+/// to [`CALL_QUERY`]'s output by the `identifier`'s byte offset (identical
+/// node in both queries). `this` is a named `this_expression` node in the
+/// Kotlin grammar (tree-sitter-kotlin-ng), not an anonymous token.
+const SELF_CALL_QUERY: &str = r#"
+(call_expression (navigation_expression (this_expression) (identifier) @callee))
 "#;
 
 /// Extracts Kotlin symbols and references.
@@ -111,6 +128,14 @@ impl Extractor for KotlinExtractor {
             Language::Kotlin,
             bytes,
             file,
+        )?;
+        mark_self_receiver_calls(
+            &root,
+            &ts_language,
+            SELF_CALL_QUERY,
+            Language::Kotlin,
+            bytes,
+            &mut references,
         )?;
         collect_inheritance(&root, bytes, file, &mut references);
         collect_imports(&root, bytes, file, &mut references, &module_id);
@@ -1958,6 +1983,40 @@ fun main() {
             !call_refs.iter().any(|r| r.name == "Service"),
             "receiver `Service` must NOT be a Call ref; got: {:?}",
             call_refs.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn this_receiver_call_marks_self_receiver() {
+        let src = "class C {\n    fun foo() {}\n    fun run() { this.foo() }\n}\n";
+        let facts = extract(src, "src/C.kt");
+        let foo_call = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Call && r.name == "foo")
+            .expect("expected a Call reference for 'foo'");
+        assert!(
+            foo_call.self_receiver,
+            "this.foo() should mark self_receiver = true"
+        );
+        assert_eq!(
+            foo_call.qualifier, None,
+            "self-call qualifier must stay None"
+        );
+    }
+
+    #[test]
+    fn non_self_receiver_call_does_not_mark_self_receiver() {
+        let src = "class C {\n    fun foo() {}\n    fun run(obj: C) { obj.foo() }\n}\n";
+        let facts = extract(src, "src/C.kt");
+        let foo_calls: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Call && r.name == "foo")
+            .collect();
+        assert!(
+            foo_calls.iter().any(|r| !r.self_receiver),
+            "obj.foo() must NOT mark self_receiver, got {foo_calls:?}"
         );
     }
 

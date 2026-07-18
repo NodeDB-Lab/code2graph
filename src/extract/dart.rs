@@ -25,9 +25,9 @@ use crate::symbol::Descriptor;
 
 use super::{
     ExtractCtx, Extractor, MIN_REF_LEN, attach_reference_scopes, collect_call_references,
-    definition_bindings, field_text, import_bindings, innermost_scope, make_symbol, node_span,
-    node_text, one_line_signature, push_binding, push_import_ref, push_ref, push_scope,
-    push_type_ref, simple_type_name,
+    definition_bindings, field_text, import_bindings, innermost_scope, make_symbol,
+    mark_self_receiver_calls, node_span, node_text, one_line_signature, push_binding,
+    push_import_ref, push_ref, push_scope, push_type_ref, simple_type_name,
 };
 
 /// Tree-sitter query capturing call-callee identifiers.
@@ -39,7 +39,26 @@ const CALL_QUERY: &str = r#"
 [
   (call_expression function: (identifier) @callee)
   (call_expression function: (member_expression object: (_) @qualifier property: (identifier) @callee))
+  (call_expression function: (member_expression object: "this" property: (identifier) @callee))
 ]
+"#;
+
+/// Method calls whose receiver is written as the `this` keyword
+/// (`this.foo()`).
+///
+/// Deliberately a *separate* query from [`CALL_QUERY`] rather than an extra
+/// alternation branch there, mirroring the Rust extractor's `SELF_CALL_QUERY`:
+/// `member_expression object: "this" property: (identifier) …` and the
+/// existing `member_expression object: (_) @qualifier property: (identifier)
+/// …` branch both structurally match the same `this.foo()` node, and
+/// tree-sitter's alternation explores every branch that fits — combining
+/// them in one `[ ]` would double-emit the reference. Run as a second pass
+/// and correlate back to [`CALL_QUERY`]'s output by the `identifier`'s byte
+/// offset (identical node in both queries). `this` is an anonymous token in
+/// the Dart grammar (not a named node), so it is matched as the literal
+/// `"this"`.
+const SELF_CALL_QUERY: &str = r#"
+(call_expression function: (member_expression object: "this" property: (identifier) @callee))
 "#;
 
 /// Extracts Dart symbols and references.
@@ -82,6 +101,14 @@ impl Extractor for DartExtractor {
 
         let mut references =
             collect_call_references(&root, &ts_language, CALL_QUERY, Language::Dart, bytes, file)?;
+        mark_self_receiver_calls(
+            &root,
+            &ts_language,
+            SELF_CALL_QUERY,
+            Language::Dart,
+            bytes,
+            &mut references,
+        )?;
         collect_inheritance(&root, bytes, file, &mut references);
         collect_imports(&root, bytes, file, &mut references, &module_id);
         collect_type_references(&root, bytes, file, &mut references);
@@ -1247,6 +1274,50 @@ class Client {
             process.qualifier.as_deref(),
             Some("svc"),
             "expected qualifier 'svc' on the process call ref",
+        );
+    }
+
+    #[test]
+    fn this_receiver_call_marks_self_receiver() {
+        let src = r#"
+class C {
+  void foo() {}
+  void run() { this.foo(); }
+}
+"#;
+        let facts = extract(src, "lib/c.dart");
+        let foo_call = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Call && r.name == "foo")
+            .expect("expected a Call reference for 'foo'");
+        assert!(
+            foo_call.self_receiver,
+            "this.foo() should mark self_receiver = true"
+        );
+        assert_eq!(
+            foo_call.qualifier, None,
+            "self-call qualifier must stay None"
+        );
+    }
+
+    #[test]
+    fn non_self_receiver_call_does_not_mark_self_receiver() {
+        let src = r#"
+class C {
+  void foo() {}
+  void run(C obj) { obj.foo(); }
+}
+"#;
+        let facts = extract(src, "lib/c.dart");
+        let foo_calls: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Call && r.name == "foo")
+            .collect();
+        assert!(
+            foo_calls.iter().any(|r| !r.self_receiver),
+            "obj.foo() must NOT mark self_receiver, got {foo_calls:?}"
         );
     }
 

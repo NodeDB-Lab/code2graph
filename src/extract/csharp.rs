@@ -27,9 +27,9 @@ use crate::symbol::Descriptor;
 
 use super::{
     ExtractCtx, Extractor, MIN_REF_LEN, attach_reference_scopes, collect_call_references,
-    definition_bindings, field_text, import_bindings, innermost_scope, make_symbol, node_span,
-    node_text, one_line_signature, push_binding, push_import_ref, push_ref, push_scope,
-    push_type_ref, simple_type_name,
+    definition_bindings, field_text, import_bindings, innermost_scope, make_symbol,
+    mark_self_receiver_calls, node_span, node_text, one_line_signature, push_binding,
+    push_import_ref, push_ref, push_scope, push_type_ref, simple_type_name,
 };
 
 /// Tree-sitter query capturing call-callee identifiers.
@@ -44,9 +44,37 @@ const CALL_QUERY: &str = r#"
   (invocation_expression function: (generic_name (identifier) @callee))
   (invocation_expression function: (member_access_expression expression: (_) @qualifier name: (identifier) @callee))
   (invocation_expression function: (member_access_expression expression: (_) @qualifier name: (generic_name (identifier) @callee)))
+  (invocation_expression function: (member_access_expression expression: "this" name: (identifier) @callee))
+  (invocation_expression function: (member_access_expression expression: "this" name: (generic_name (identifier) @callee)))
   (object_creation_expression type: (identifier) @callee)
   (object_creation_expression type: (qualified_name name: (identifier) @callee))
   (object_creation_expression type: (generic_name (identifier) @callee))
+]
+"#;
+
+/// Method calls whose receiver is written as the `this` keyword
+/// (`this.Foo()`).
+///
+/// Deliberately a *separate* query from [`CALL_QUERY`] rather than an extra
+/// alternation branch there, mirroring the Rust extractor's `SELF_CALL_QUERY`:
+/// `member_access_expression expression: "this" name: (identifier) …` and the
+/// existing `member_access_expression expression: (_) @qualifier name:
+/// (identifier) …` branch both structurally match the same `this.Foo()` node,
+/// and tree-sitter's alternation explores every branch that fits — combining
+/// them in one `[ ]` would double-emit the reference. Run as a second pass
+/// and correlate back to [`CALL_QUERY`]'s output by the `identifier`'s byte
+/// offset (identical node in both queries). `this` is an anonymous token in
+/// the C# grammar (not a named node), so it is matched as the literal `"this"`.
+const SELF_CALL_QUERY: &str = r#"
+[
+  (invocation_expression
+    function: (member_access_expression
+      expression: "this"
+      name: (identifier) @callee))
+  (invocation_expression
+    function: (member_access_expression
+      expression: "this"
+      name: (generic_name (identifier) @callee)))
 ]
 "#;
 
@@ -90,6 +118,14 @@ impl Extractor for CSharpExtractor {
             Language::CSharp,
             bytes,
             file,
+        )?;
+        mark_self_receiver_calls(
+            &root,
+            &ts_language,
+            SELF_CALL_QUERY,
+            Language::CSharp,
+            bytes,
+            &mut references,
         )?;
         collect_inheritance(&root, bytes, file, &mut references);
         collect_imports(&root, bytes, file, &mut references, &module_id);
@@ -1038,6 +1074,50 @@ public class Client {
             foo.qualifier.as_deref(),
             Some("obj"),
             "expected qualifier 'obj' on the Foo call ref",
+        );
+    }
+
+    #[test]
+    fn this_receiver_call_marks_self_receiver() {
+        let src = r#"
+public class C {
+    public void Foo() {}
+    public void Run() { this.Foo(); }
+}
+"#;
+        let facts = CSharpExtractor.extract(src, "src/C.cs").unwrap();
+        let foo_call = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Call && r.name == "Foo")
+            .expect("expected a Call reference for 'Foo'");
+        assert!(
+            foo_call.self_receiver,
+            "this.Foo() should mark self_receiver = true"
+        );
+        assert_eq!(
+            foo_call.qualifier, None,
+            "self-call qualifier must stay None"
+        );
+    }
+
+    #[test]
+    fn non_self_receiver_call_does_not_mark_self_receiver() {
+        let src = r#"
+public class C {
+    public void Foo() {}
+    public void Run(C obj) { obj.Foo(); }
+}
+"#;
+        let facts = CSharpExtractor.extract(src, "src/C.cs").unwrap();
+        let foo_calls: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Call && r.name == "Foo")
+            .collect();
+        assert!(
+            foo_calls.iter().any(|r| !r.self_receiver),
+            "obj.Foo() must NOT mark self_receiver, got {foo_calls:?}"
         );
     }
 
