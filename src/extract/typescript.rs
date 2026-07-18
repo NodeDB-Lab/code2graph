@@ -300,7 +300,13 @@ fn emit_declaration(
             }
         }
         "class_declaration" | "abstract_class_declaration" => {
-            emit_named(decl, ctx.bytes, SymbolKind::Class, out, &push)
+            emit_named(decl, ctx.bytes, SymbolKind::Class, out, &push);
+            // Members are only meaningful for a named class; an anonymous
+            // `export default class { ... }` has no `Type` descriptor to
+            // qualify them under, so it is skipped (mirrors `emit_named`'s guard).
+            if let Some(class_name) = child_text(decl, "type_identifier", ctx.bytes) {
+                collect_class_members(decl, ctx, namespaces, &class_name, out);
+            }
         }
         "interface_declaration" => emit_named(decl, ctx.bytes, SymbolKind::Interface, out, &push),
         "type_alias_declaration" => emit_named(decl, ctx.bytes, SymbolKind::TypeAlias, out, &push),
@@ -346,6 +352,94 @@ fn emit_named(
     if let Some(n) = child_text(decl, "type_identifier", bytes) {
         push(out, n.clone(), kind, Descriptor::Type(n));
     }
+}
+
+/// Build the descriptor path for a class member: namespaces + `Type(type_name)`
+/// + `leaf`. Mirrors the Rust/Java extractors' member-descriptor helper.
+fn member_descriptors(namespaces: &[String], type_name: &str, leaf: Descriptor) -> Vec<Descriptor> {
+    let mut descriptors: Vec<Descriptor> = namespaces
+        .iter()
+        .cloned()
+        .map(Descriptor::Namespace)
+        .collect();
+    descriptors.push(Descriptor::Type(type_name.to_owned()));
+    descriptors.push(leaf);
+    descriptors
+}
+
+/// Emit a [`SymbolKind::Method`] symbol for each `method_definition` in a
+/// class's body (static/async/get/set/`constructor` are all `method_definition`
+/// nodes and are handled uniformly).
+///
+/// Skips members whose name is not a plain identifier — `computed_property_name`
+/// (`[Symbol.iterator]()`), `string` (`"lit"()`), or `number` (`123()`) — since
+/// none of those produce a well-formed SCIP method descriptor.
+///
+/// Arrow-function class fields (`foo = () => {}`, a `public_field_definition`)
+/// and interface `method_signature` members are intentionally out of scope here;
+/// only real `method_definition` members are covered.
+///
+/// Visibility: an explicit `accessibility_modifier` child (`public`/`private`/
+/// `protected`) is honored; absent that, TS/JS members are public by default.
+fn collect_class_members(
+    class_decl: &Node,
+    ctx: &ExtractCtx,
+    namespaces: &[String],
+    class_name: &str,
+    out: &mut Vec<Symbol>,
+) {
+    let Some(body) = class_decl.child_by_field_name("body") else {
+        return;
+    };
+    for member in body.children(&mut body.walk()) {
+        if member.kind() != "method_definition" {
+            continue;
+        }
+        let Some(name_node) = member.child_by_field_name("name") else {
+            continue;
+        };
+        if !matches!(
+            name_node.kind(),
+            "property_identifier" | "private_property_identifier"
+        ) {
+            continue;
+        }
+        let name = node_text(&name_node, ctx.bytes).to_owned();
+        let visibility = member_visibility(&member, ctx.bytes);
+        let descriptors = member_descriptors(
+            namespaces,
+            class_name,
+            Descriptor::Method {
+                name: name.clone(),
+                disambiguator: crate::symbol::MethodDisambiguator::empty(),
+            },
+        );
+        let signature = one_line_signature(node_text(&member, ctx.bytes), &['{']);
+        out.push(make_symbol(
+            ctx,
+            &member,
+            name,
+            SymbolKind::Method,
+            visibility,
+            descriptors,
+            signature,
+        ));
+    }
+}
+
+/// Read a class member's visibility from its `accessibility_modifier` child, if
+/// any. TS/JS class members are public by default (unlike Java's package-private
+/// default), so an absent modifier maps to [`Visibility::Public`], not
+/// [`Visibility::Internal`].
+fn member_visibility(member: &Node, bytes: &[u8]) -> Visibility {
+    member
+        .children(&mut member.walk())
+        .find(|c| c.kind() == "accessibility_modifier")
+        .map_or(Visibility::Public, |m| match node_text(&m, bytes) {
+            "private" => Visibility::Private,
+            "protected" => Visibility::Protected,
+            _ => Visibility::Public,
+        })
 }
 
 /// Recursively walk `node` collecting `Inherit` references for every
@@ -1592,6 +1686,115 @@ export const Y = 2;
         assert!(
             !r.self_receiver,
             "x.foo() must not have self_receiver == true"
+        );
+    }
+
+    // ── Class member (method) symbol tests ───────────────────────────────────
+
+    #[test]
+    fn class_methods_emit_method_symbols() {
+        let src = "class Config { save() {} load() {} }";
+        let facts = TypeScriptExtractor.extract(src, "src/config.ts").unwrap();
+
+        let cfg = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "Config")
+            .expect("Config Type symbol must still be emitted");
+        assert_eq!(cfg.kind, SymbolKind::Class);
+
+        let save = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "save")
+            .expect("expected a 'save' Method symbol");
+        assert_eq!(save.kind, SymbolKind::Method);
+        assert_eq!(
+            save.id.to_scip_string(),
+            "codegraph . . . src/config/Config#save()."
+        );
+        assert_eq!(save.visibility, Visibility::Public);
+
+        let load = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "load")
+            .expect("expected a 'load' Method symbol");
+        assert_eq!(load.kind, SymbolKind::Method);
+        assert_eq!(
+            load.id.to_scip_string(),
+            "codegraph . . . src/config/Config#load()."
+        );
+    }
+
+    #[test]
+    fn js_class_method_emits_method_symbol() {
+        // JavaScript routes through the shared extract_ecmascript core.
+        use crate::extract::JavaScriptExtractor;
+
+        let src = "class C { m() {} }";
+        let facts = JavaScriptExtractor.extract(src, "src/c.js").unwrap();
+        let m = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "m")
+            .expect("expected an 'm' Method symbol via the JS extractor");
+        assert_eq!(m.kind, SymbolKind::Method);
+        assert_eq!(m.id.to_scip_string(), "codegraph . . . src/c/C#m().");
+    }
+
+    #[test]
+    fn class_static_and_accessor_methods_emit_method_symbols() {
+        let src = "class S { static make() {} get val() {} }";
+        let facts = TypeScriptExtractor.extract(src, "src/s.ts").unwrap();
+
+        let make = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "make")
+            .expect("expected a static 'make' Method symbol");
+        assert_eq!(make.kind, SymbolKind::Method);
+
+        let val = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "val")
+            .expect("expected a 'val' accessor Method symbol");
+        assert_eq!(val.kind, SymbolKind::Method);
+    }
+
+    #[test]
+    fn non_identifier_method_names_are_not_emitted() {
+        // Computed and literal member names must not leak in as malformed
+        // Method symbols.
+        let src = r#"class X { ["a"+"b"]() {} "lit"() {} }"#;
+        let facts = TypeScriptExtractor.extract(src, "src/x.ts").unwrap();
+
+        let method_count = facts
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Method)
+            .count();
+        assert_eq!(
+            method_count, 0,
+            "computed/string-named members must not be emitted as Method symbols"
+        );
+    }
+
+    #[test]
+    fn anonymous_default_class_emits_no_type_or_member_symbols() {
+        // `export default class { ... }` has no name — neither the class Type
+        // symbol nor its members can be emitted.
+        let src = "export default class { m() {} }";
+        let facts = TypeScriptExtractor.extract(src, "src/anon.ts").unwrap();
+
+        assert!(
+            !facts.symbols.iter().any(|s| s.kind == SymbolKind::Class),
+            "anonymous default class must not emit a Type symbol"
+        );
+        assert!(
+            !facts.symbols.iter().any(|s| s.kind == SymbolKind::Method),
+            "anonymous default class members must not be emitted"
         );
     }
 
