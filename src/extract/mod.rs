@@ -123,7 +123,7 @@ pub(crate) use support::emit_embedded_sql_refs;
 pub(crate) use support::{
     ExtractCtx, MIN_REF_LEN, attach_reference_scopes, byte_to_line_col, child_text,
     collect_call_references, definition_bindings, field_text, import_bindings, innermost_scope,
-    is_static, make_symbol, module_name, module_symbol, node_occurrence, node_span, node_text,
-    one_line_signature, push_binding, push_import_ref, push_ref, push_scope, push_type_ref,
-    shift_offsets, simple_type_name, unquote,
+    is_static, make_symbol, mark_self_receiver_calls, module_name, module_symbol, node_occurrence,
+    node_span, node_text, one_line_signature, push_binding, push_import_ref, push_ref, push_scope,
+    push_type_ref, shift_offsets, simple_type_name, unquote,
 };

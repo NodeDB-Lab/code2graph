@@ -27,8 +27,9 @@ use crate::symbol::Descriptor;
 use super::emit_embedded_sql_refs;
 use super::{
     BindingRules, ExtractCtx, Extractor, MIN_REF_LEN, attach_reference_scopes, child_text,
-    collect_call_references, definition_bindings, import_bindings, make_symbol, node_occurrence,
-    node_span, node_text, one_line_signature, push_binding, push_ref, push_scope,
+    collect_call_references, definition_bindings, import_bindings, make_symbol,
+    mark_self_receiver_calls, node_occurrence, node_span, node_text, one_line_signature,
+    push_binding, push_ref, push_scope,
 };
 
 /// Tree-sitter query capturing call-callee identifiers (and optional qualifier).
@@ -141,7 +142,14 @@ impl RustExtractor {
         symbols.push(mod_sym);
         let mut references =
             collect_call_references(&root, &ts_language, CALL_QUERY, Language::Rust, bytes, file)?;
-        mark_self_receiver_calls(&root, &ts_language, bytes, &mut references)?;
+        mark_self_receiver_calls(
+            &root,
+            &ts_language,
+            SELF_CALL_QUERY,
+            Language::Rust,
+            bytes,
+            &mut references,
+        )?;
         collect_inheritance(&root, bytes, file, &mut references);
         collect_module_decl_refs(&root, bytes, file, &mut references);
         collect_imports(&root, bytes, file, &mut references, &module_id);
@@ -1067,57 +1075,6 @@ fn collect_associated_call_type_references(
                 cross_artifact: false,
                 self_receiver: false,
             });
-        }
-    }
-    Ok(())
-}
-
-/// Run [`SELF_CALL_QUERY`] and mark every already-collected [`RefRole::Call`]
-/// reference whose occurrence byte matches a captured `self.<name>()` callee
-/// with `self_receiver = true`. A NEUTRAL SYNTACTIC FACT: it records that the
-/// receiver was written as the `self` keyword — the resolver, not this
-/// extractor, maps `self` to the enclosing type. `qualifier` is left untouched
-/// (already `None` for a field-expression callee).
-///
-/// Byte-offset correlation is exact: both this query and [`CALL_QUERY`]
-/// capture the identical `field_identifier` node, so a reference dropped by
-/// [`CALL_QUERY`]'s [`MIN_REF_LEN`] filter simply finds no match here — a
-/// harmless no-op, never a false mark.
-///
-/// Correlation goes through a `byte -> index` map built once up front (O(n))
-/// rather than a linear scan of `references` per self-call match, which would
-/// be O(self-calls × total references) on a file with many `self.foo()` sites.
-fn mark_self_receiver_calls(
-    root: &Node,
-    ts_lang: &TsLanguage,
-    bytes: &[u8],
-    references: &mut [Reference],
-) -> Result<()> {
-    let query = Query::new(ts_lang, SELF_CALL_QUERY).map_err(|e| CodegraphError::Query {
-        lang: "rust".to_owned(),
-        msg: e.to_string(),
-    })?;
-    let callee_idx =
-        query
-            .capture_index_for_name("callee")
-            .ok_or_else(|| CodegraphError::Query {
-                lang: "rust".to_owned(),
-                msg: "missing @callee capture".to_owned(),
-            })?;
-    let call_ref_by_byte: std::collections::HashMap<usize, usize> = references
-        .iter()
-        .enumerate()
-        .filter(|(_, r)| r.role == RefRole::Call)
-        .map(|(i, r)| (r.occ.byte, i))
-        .collect();
-    let mut cursor = QueryCursor::new();
-    let mut matches = cursor.matches(&query, *root, bytes);
-    while let Some(m) = matches.next() {
-        for cap in m.captures.iter().filter(|c| c.index == callee_idx) {
-            let byte = cap.node.start_byte();
-            if let Some(&idx) = call_ref_by_byte.get(&byte) {
-                references[idx].self_receiver = true;
-            }
         }
     }
     Ok(())

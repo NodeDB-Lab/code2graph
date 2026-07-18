@@ -318,6 +318,60 @@ pub(crate) fn is_static(node: &Node, bytes: &[u8]) -> bool {
 /// [`Reference`]s with [`RefRole::Call`]. The query must expose a capture named
 /// `callee`; captures shorter than [`MIN_REF_LEN`] are dropped. Shared by every
 /// extractor — only the query string and grammar differ per language.
+/// Run `self_call_query` and mark every already-collected [`RefRole::Call`]
+/// reference whose occurrence byte matches a captured `self.<name>()` /
+/// `this.<name>()` callee with `self_receiver = true`. A NEUTRAL SYNTACTIC
+/// FACT: it records that the receiver was written as the `self`/`this`
+/// keyword — the resolver, not the extractor, maps it to the enclosing type.
+/// `qualifier` is left untouched (already `None` for a field-expression
+/// callee).
+///
+/// Byte-offset correlation is exact: both `self_call_query` and the query
+/// that produced `references` capture the identical callee identifier node,
+/// so a reference dropped by the main call query's length filter simply
+/// finds no match here — a harmless no-op, never a false mark.
+///
+/// Correlation goes through a `byte -> index` map built once up front (O(n))
+/// rather than a linear scan of `references` per self-call match, which would
+/// be O(self-calls × total references) on a file with many `self.foo()` sites.
+pub(crate) fn mark_self_receiver_calls(
+    root: &Node,
+    ts_lang: &TsLanguage,
+    self_call_query: &str,
+    lang: Language,
+    bytes: &[u8],
+    references: &mut [Reference],
+) -> Result<()> {
+    let query = Query::new(ts_lang, self_call_query).map_err(|e| CodegraphError::Query {
+        lang: lang.as_str().to_owned(),
+        msg: e.to_string(),
+    })?;
+    let callee_idx =
+        query
+            .capture_index_for_name("callee")
+            .ok_or_else(|| CodegraphError::Query {
+                lang: lang.as_str().to_owned(),
+                msg: "missing @callee capture".to_owned(),
+            })?;
+    let call_ref_by_byte: std::collections::HashMap<usize, usize> = references
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.role == RefRole::Call)
+        .map(|(i, r)| (r.occ.byte, i))
+        .collect();
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(&query, *root, bytes);
+    while let Some(m) = matches.next() {
+        for cap in m.captures.iter().filter(|c| c.index == callee_idx) {
+            let byte = cap.node.start_byte();
+            if let Some(&idx) = call_ref_by_byte.get(&byte) {
+                references[idx].self_receiver = true;
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn collect_call_references(
     root: &Node,
     ts_lang: &TsLanguage,

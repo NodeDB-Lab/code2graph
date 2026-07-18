@@ -24,9 +24,9 @@ use crate::symbol::Descriptor;
 
 use super::{
     ExtractCtx, Extractor, MIN_REF_LEN, attach_reference_scopes, collect_call_references,
-    definition_bindings, field_text, import_bindings, innermost_scope, make_symbol, node_span,
-    node_text, one_line_signature, push_binding, push_ref, push_scope, push_type_ref,
-    simple_type_name,
+    definition_bindings, field_text, import_bindings, innermost_scope, make_symbol,
+    mark_self_receiver_calls, node_span, node_text, one_line_signature, push_binding, push_ref,
+    push_scope, push_type_ref, simple_type_name,
 };
 
 /// Tree-sitter query capturing call-callee identifiers.
@@ -35,6 +35,21 @@ const CALL_QUERY: &str = r#"
   (method_invocation name: (identifier) @callee)
   (object_creation_expression type: (type_identifier) @callee)
 ]
+"#;
+
+/// Method calls whose receiver is written as the `this` keyword (`this.foo()`).
+///
+/// Deliberately a *separate* query from [`CALL_QUERY`] rather than an extra
+/// alternation branch there, mirroring the Rust extractor's `SELF_CALL_QUERY`:
+/// combining `object: (this) …` into the same `[ ]` as the unqualified
+/// `method_invocation name: (identifier) @callee` branch would double-emit,
+/// since a `this.foo()` invocation still carries a `name:` field on its own.
+/// Run as a second pass and correlate back to [`CALL_QUERY`]'s output by the
+/// `name` identifier's byte offset (identical node in both queries).
+const SELF_CALL_QUERY: &str = r#"
+(method_invocation
+  object: (this)
+  name: (identifier) @callee)
 "#;
 
 /// Annotation simple-names that mark a definition as an HTTP route or controller
@@ -173,6 +188,14 @@ impl Extractor for JavaExtractor {
         symbols.push(mod_sym);
         let mut references =
             collect_call_references(&root, &ts_language, CALL_QUERY, Language::Java, bytes, file)?;
+        mark_self_receiver_calls(
+            &root,
+            &ts_language,
+            SELF_CALL_QUERY,
+            Language::Java,
+            bytes,
+            &mut references,
+        )?;
         collect_inheritance(&root, bytes, file, &mut references);
         collect_imports(&root, bytes, file, &mut references, &module_id);
         collect_jni_natives(&root, bytes, file, &namespaces, &mut references);
@@ -2159,6 +2182,44 @@ public class C {
             sym.entry_points.is_empty(),
             "non-static 'main' must not produce EntryPoint::Main; got [{}]",
             ep_str(&sym.entry_points)
+        );
+    }
+
+    #[test]
+    fn self_receiver_method_call_is_marked_self_receiver() {
+        // `this.foo()` — object: (this) arm → leaf "foo", qualifier None,
+        // self_receiver true.
+        let src = "class Person { void caller() { this.foo(); } }";
+        let facts = JavaExtractor.extract(src, "src/Person.java").unwrap();
+        let r = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Call && r.name == "foo")
+            .expect("expected a Call ref for 'foo'");
+        assert!(
+            r.self_receiver,
+            "this.foo() should have self_receiver == true"
+        );
+        assert_eq!(
+            r.qualifier, None,
+            "this.foo() should still have qualifier == None, got {:?}",
+            r.qualifier
+        );
+    }
+
+    #[test]
+    fn non_self_method_call_is_not_marked_self_receiver() {
+        // `x.foo()` on a local variable — must NOT be marked self_receiver.
+        let src = "class Person { void caller(Foo x) { x.foo(); } }";
+        let facts = JavaExtractor.extract(src, "src/Person.java").unwrap();
+        let r = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Call && r.name == "foo")
+            .expect("expected a Call ref for 'foo'");
+        assert!(
+            !r.self_receiver,
+            "x.foo() must not have self_receiver == true"
         );
     }
 }

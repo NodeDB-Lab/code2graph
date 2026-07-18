@@ -31,8 +31,9 @@ use crate::symbol::Descriptor;
 use super::emit_embedded_sql_refs;
 use super::{
     BindingRules, ExtractCtx, Extractor, MIN_REF_LEN, attach_reference_scopes, child_text,
-    collect_call_references, definition_bindings, import_bindings, make_symbol, node_span,
-    node_text, one_line_signature, push_binding, push_ref, push_scope, push_type_ref,
+    collect_call_references, definition_bindings, import_bindings, make_symbol,
+    mark_self_receiver_calls, node_span, node_text, one_line_signature, push_binding, push_ref,
+    push_scope, push_type_ref,
 };
 
 /// Tree-sitter query capturing call-callee identifiers.
@@ -43,6 +44,22 @@ const CALL_QUERY: &str = r#"
     (member_expression property: (property_identifier) @callee)
   ]
 )
+"#;
+
+/// Method calls whose receiver is written as the `this` keyword (`this.foo()`).
+///
+/// Deliberately a *separate* query from [`CALL_QUERY`] rather than an extra
+/// alternation branch there, mirroring the Rust extractor's `SELF_CALL_QUERY`:
+/// `member_expression object: (this) …` structurally matches the same
+/// `member_expression property: (property_identifier) @callee` branch
+/// [`CALL_QUERY`] already has, so folding it in would double-emit. Run as a
+/// second pass and correlate back to [`CALL_QUERY`]'s output by the
+/// `property_identifier`'s byte offset (identical node in both queries).
+const SELF_CALL_QUERY: &str = r#"
+(call_expression
+  function: (member_expression
+    object: (this)
+    property: (property_identifier) @callee))
 "#;
 
 /// Extracts TypeScript symbols and references.
@@ -106,6 +123,14 @@ pub(super) fn extract_ecmascript(
     symbols.push(mod_sym);
     let mut references =
         collect_call_references(&root, &ts_language, CALL_QUERY, lang, bytes, file)?;
+    mark_self_receiver_calls(
+        &root,
+        &ts_language,
+        SELF_CALL_QUERY,
+        lang,
+        bytes,
+        &mut references,
+    )?;
     collect_inheritance(&root, bytes, file, &mut references);
     collect_imports(&root, bytes, file, &mut references, &module_id);
     collect_type_references(&root, bytes, file, &mut references);
@@ -1529,6 +1554,63 @@ export const Y = 2;
         assert!(
             !facts_plain.references.iter().any(|r| r.cross_artifact),
             "plain extract() must yield no cross_artifact references"
+        );
+    }
+
+    #[test]
+    fn self_receiver_method_call_is_marked_self_receiver() {
+        // `this.foo()` — member_expression object: (this) arm → leaf "foo",
+        // qualifier None, self_receiver true.
+        let src = "class Person { caller() { this.foo(); } }";
+        let facts = TypeScriptExtractor.extract(src, "src/main.ts").unwrap();
+        let r = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Call && r.name == "foo")
+            .expect("expected a Call ref for 'foo'");
+        assert!(
+            r.self_receiver,
+            "this.foo() should have self_receiver == true"
+        );
+        assert_eq!(
+            r.qualifier, None,
+            "this.foo() should still have qualifier == None, got {:?}",
+            r.qualifier
+        );
+    }
+
+    #[test]
+    fn non_self_method_call_is_not_marked_self_receiver() {
+        // `x.foo()` on a local variable — must NOT be marked self_receiver.
+        let src = "class Person { caller(x) { x.foo(); } }";
+        let facts = TypeScriptExtractor.extract(src, "src/main.ts").unwrap();
+        let r = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Call && r.name == "foo")
+            .expect("expected a Call ref for 'foo'");
+        assert!(
+            !r.self_receiver,
+            "x.foo() must not have self_receiver == true"
+        );
+    }
+
+    #[test]
+    fn js_self_receiver_method_call_is_marked_self_receiver() {
+        // Same as the TS test above, but through the JavaScript extractor —
+        // proves the shared `extract_ecmascript` core covers JS too.
+        use crate::extract::JavaScriptExtractor;
+
+        let src = "class Person { caller() { this.foo(); } }";
+        let facts = JavaScriptExtractor.extract(src, "src/main.js").unwrap();
+        let r = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Call && r.name == "foo")
+            .expect("expected a Call ref for 'foo'");
+        assert!(
+            r.self_receiver,
+            "this.foo() should have self_receiver == true"
         );
     }
 }

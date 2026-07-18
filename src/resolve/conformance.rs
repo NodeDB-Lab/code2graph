@@ -31,8 +31,9 @@
 //!
 //! # What it deliberately defers (the type-inference ceiling)
 //!
-//! - `this.method()` (non-Rust languages) — not yet marked by any extractor;
-//!   deferred until an extractor opts into `self_receiver` for that language.
+//! - `this.method()` / `self.method()` for languages whose extractor has not
+//!   yet opted into `self_receiver` — Rust, Java, and TypeScript/JavaScript
+//!   mark it today; other languages fall back to the unqualified case above.
 //! - chained `inner().method()` — needs the return type of `inner()`.
 //! - field-access chains (`a.b.method()`) — needs the field's type.
 //!
@@ -260,10 +261,10 @@ fn find_inherited(
     None
 }
 
-#[cfg(all(test, any(feature = "java", feature = "rust")))]
+#[cfg(all(test, any(feature = "java", feature = "rust", feature = "typescript")))]
 mod tests {
     use super::*;
-    #[cfg(any(feature = "java", feature = "rust"))]
+    #[cfg(any(feature = "java", feature = "rust", feature = "typescript"))]
     use crate::extract::Extractor;
     #[cfg(feature = "java")]
     use crate::extract::JavaExtractor;
@@ -650,6 +651,65 @@ mod tests {
                 .collect::<Vec<_>>()
         );
     }
+
+    /// `Base` defines `hello`, `Sub extends Base` calls `this.hello()` from its
+    /// own method without redefining it — the only definition of `hello` is on
+    /// `Base`, so conformance must link the call there. Mirrors
+    /// `conformance_resolves_rust_self_receiver_inherited_trait_method_end_to_end`.
+    #[cfg(feature = "java")]
+    #[test]
+    fn conformance_resolves_java_self_receiver_inherited_class_method_end_to_end() {
+        let base = JavaExtractor
+            .extract(
+                "package p; public class Base { public void hello() {} }",
+                "src/p/Base.java",
+            )
+            .unwrap();
+        let sub = JavaExtractor
+            .extract(
+                "package p; public class Sub extends Base { public void greetAll() { this.hello(); } }",
+                "src/p/Sub.java",
+            )
+            .unwrap();
+
+        let graph = ConformanceResolver.resolve(&[base, sub]).unwrap();
+
+        let conf_edges: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.provenance == Provenance::Conformance)
+            .collect();
+
+        assert_eq!(
+            conf_edges.len(),
+            1,
+            "expected exactly one conformance edge for the this.hello() site, got {:?}",
+            conf_edges
+                .iter()
+                .map(|e| format!("{} -> {}", e.from.to_scip_string(), e.to.to_scip_string()))
+                .collect::<Vec<_>>()
+        );
+
+        let e = conf_edges[0];
+        assert!(
+            e.to.to_scip_string().ends_with("Base#hello()."),
+            "edge `to` should be the inherited Base#hello(), got: {}",
+            e.to.to_scip_string()
+        );
+        assert!(
+            e.from.to_scip_string().ends_with("Sub#greetAll()."),
+            "edge `from` should be the enclosing Sub#greetAll(), got: {}",
+            e.from.to_scip_string()
+        );
+        assert_eq!(e.confidence, Confidence::Scoped);
+        assert_eq!(e.provenance, Provenance::Conformance);
+    }
+
+    // NOTE: the TypeScript/JavaScript end-to-end self-receiver test lives with the
+    // TS class-member extraction work: `this.method()` is already marked by the TS
+    // extractor, but resolving it to an inherited member requires TS to emit
+    // per-method `Type#method` symbols (it currently emits only the class symbol),
+    // which is a separate extraction unit.
 
     /// An unqualified reference (no receiver type written) is deferred entirely:
     /// resolving it would need receiver-type inference, which v1 does not do.
