@@ -15,37 +15,45 @@ flatter.
 
 ## Method
 
-- **Subject:** [`dtolnay/anyhow`](https://github.com/dtolnay/anyhow) `1.0.104` —
-  a real, widely-used Rust crate (~3,900 LOC across 13 `src/` files).
-- **Oracle:** `rust-analyzer scip` (a type-aware, compiler-grade indexer) → an
-  `index.scip`, converted to location-only `ref:line → def:line` pairs by the
-  eval crate's `gen-oracle`.
-- **Scope:** intra-`src/` edges only (both endpoints under `src/`) — **784
-  ground-truth ref→def edges**. This measures resolution of the crate's own
-  symbols; references into `std`/deps are external (code2graph does not claim to
-  resolve them, and `score_oracle` ignores `External` edges).
+- **Subjects** (real, widely-used projects, pinned):
+  - [`dtolnay/anyhow`](https://github.com/dtolnay/anyhow) `1.0.104` — Rust crate,
+    ~3,900 LOC / 13 `src/` files. Oracle: `rust-analyzer scip`.
+  - [`sindresorhus/ky`](https://github.com/sindresorhus/ky) — TypeScript HTTP
+    client, ~4,000 LOC / 30 `source/` files. Oracle: `scip-typescript`.
+- **Oracle:** a type-aware, compiler-grade SCIP indexer → an `index.scip`,
+  converted to location-only `ref:line → def:line` pairs by the eval crate's
+  `gen-oracle`.
+- **Scope:** intra-source edges only (both endpoints under the project's source
+  root). This measures resolution of the project's **own** symbols; references
+  into `std`/deps are external (code2graph does not claim to resolve them, and
+  `score_oracle` ignores `External` edges).
 - **Matching:** a true positive requires code2graph's `(ref_file, ref_line,
   def_file, def_line)` to equal the oracle's exactly (1-based, role-agnostic).
-- **Reproduce:** `eval/scripts/gen-realrepo-oracle.sh` (needs `rust-analyzer` +
-  network; writes a gitignored `eval/corpus/rust_realrepo/anyhow/` case), then
-  `cargo run -p code2graph-eval` and read the `rust_realrepo` row.
+- **Reproduce:** `eval/scripts/gen-realrepo-oracle.sh` (needs `rust-analyzer`,
+  `npm`/`npx`, network; writes gitignored `eval/corpus/*_realrepo/` cases), then
+  `cargo run -p code2graph-eval` and read the `rust_realrepo` / `ts_realrepo` rows.
 
-## Result (anyhow 1.0.104, 784 oracle edges)
+## Results
 
-| Resolver | Precision | Recall | F1 |
-|---|---|---|---|
-| Tier-A (`SymbolTableResolver`, name) | 0.46 | 0.44 | 0.45 |
-| Tier-B (`ScopeGraphResolver`, scope) | 0.52 | 0.36 | 0.43 |
+| Project (oracle edges) | Resolver | Precision | Recall | F1 |
+|---|---|---|---|---|
+| **anyhow** — Rust (784) | Tier-A (name) | 0.46 | 0.44 | 0.45 |
+| | Tier-B (scope) | 0.52 | 0.36 | 0.43 |
+| **ky** — TypeScript (1995) | Tier-A (name) | 0.92 | 0.22 | 0.36 |
+| | Tier-B (scope) | 0.79 | 0.44 | 0.56 |
 
 Layered (dense), recall by minimum-confidence cutoff:
 
-| R@Heuristic | R@Name | R@Scoped | R@Exact | P@Exact |
-|---|---|---|---|---|
-| 0.45 | 0.45 | 0.41 | 0.09 | 0.27 |
+| Project | R@Heuristic | R@Name | R@Scoped | R@Exact | P@Exact |
+|---|---|---|---|---|---|
+| anyhow (Rust) | 0.45 | 0.45 | 0.41 | 0.09 | 0.27 |
+| ky (TypeScript) | 0.46 | 0.46 | 0.46 | 0.38 | 0.76 |
 
-For contrast, the toy `rust_oracle` fixtures score Tier-B **P=1.00, R=0.90** —
-the gap between that and the `0.52 / 0.36` here is exactly the illusion this
-scorecard exists to dispel.
+For contrast, the toy `rust_oracle` / `ts_oracle` fixtures score Tier-B
+**P=1.00** — the gap between that and the `0.52` / `0.79` here is exactly the
+illusion this scorecard exists to dispel. TypeScript's higher `P@Exact` (0.76 vs
+Rust's 0.27) reflects a language with far less macro/generic indirection for a
+build-free resolver to lose — the honest ceiling differs sharply by language.
 
 ## Honest reading
 
@@ -59,11 +67,12 @@ scorecard exists to dispel.
   claims. Read recall as "fraction of type-aware truth recovered syntactically."
 - **Precision is the actionable signal.** Line-exact, role-agnostic matching
   penalizes real divergences (a call attributed to a macro-expansion line vs the
-  written line; name-only fan-out counting `N−1` extra edges). Tier-B's 0.52
-  vs Tier-A's 0.46 confirms scope resolution helps, and the low `P@Exact` (0.27)
-  shows how little of anyhow resolves to a single `Exact` target syntactically —
-  a real crate leans heavily on macros, generics, and trait dispatch that a
-  build-free resolver cannot pin. That is the honest ceiling of the approach.
+  written line; name-only fan-out counting `N−1` extra edges). Scope resolution
+  helps where it can (ky Tier-B P 0.79), but the picture is language-dependent:
+  anyhow's low `P@Exact` (0.27) shows how little of a macro/generic/trait-heavy
+  Rust crate resolves to a single `Exact` target syntactically, whereas ky's
+  0.76 shows a straighter-line TypeScript codebase largely does. The build-free
+  ceiling is real and it is not the same height in every language.
 
 ## Extending
 

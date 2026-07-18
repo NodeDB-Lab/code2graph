@@ -56,7 +56,47 @@ gen_rust_case() {
   echo "== $name: $(($(wc -l < "$case_dir/oracle.edges") - 1)) intra-src oracle edges"
 }
 
+# ── Case: a real TypeScript project (indexed with scip-typescript) ───────────
+# `src_dir` is the project's TS source root (scip relative_path is project-root
+# relative, so we mirror it verbatim and scope the oracle to intra-<src_dir>).
+gen_ts_case() {
+  local name="$1" url="$2" ref="$3" src_dir="$4"
+  local case_dir="$corpus/ts_realrepo/$name"
+  echo "== ts_realrepo/$name : cloning $url @ $ref"
+  git clone --quiet "$url" "$work/$name"
+  git -C "$work/$name" checkout --quiet "$ref"
+
+  echo "== npm install (needed for scip-typescript cross-file resolution)"
+  ( cd "$work/$name" && npm install --no-audit --no-fund --silent >/dev/null 2>&1 )
+
+  echo "== indexing with scip-typescript"
+  ( cd "$work/$name" && npx --yes @sourcegraph/scip-typescript@latest index \
+      --output index.scip >/dev/null 2>&1 )
+
+  echo "== assembling corpus case ($src_dir/ only, paths matching SCIP)"
+  rm -rf "$case_dir"
+  mkdir -p "$case_dir/$src_dir"
+  ( cd "$work/$name/$src_dir" && find . -name '*.ts' -not -path '*/test*' -print0 \
+      | while IFS= read -r -d '' f; do
+          mkdir -p "$case_dir/$src_dir/$(dirname "$f")"
+          cp "$f" "$case_dir/$src_dir/$f"
+        done )
+  cp "$work/$name/index.scip" "$case_dir/index.scip"
+
+  echo "== deriving + scoping oracle to intra-$src_dir ref→def pairs"
+  ( cd "$repo_root" && cargo run -q -p code2graph-eval \
+      --features oracle-regen --bin gen-oracle -- "$case_dir" )
+  local hdr="# oracle: SCIP ($name $ref) — intra-$src_dir location pairs (ref -> def), role-agnostic"
+  { echo "$hdr"
+    awk -v d="^$src_dir/" 'NF==2 && $1 ~ d && $2 ~ d' "$case_dir/oracle.edges"
+  } > "$case_dir/oracle.edges.tmp"
+  mv "$case_dir/oracle.edges.tmp" "$case_dir/oracle.edges"
+  echo "== $name: $(($(wc -l < "$case_dir/oracle.edges") - 1)) intra-$src_dir oracle edges"
+}
+
 gen_rust_case anyhow https://github.com/dtolnay/anyhow.git 1.0.104
+gen_ts_case ky https://github.com/sindresorhus/ky.git \
+  3419113b48e034fdcf8fa6bd3be3da7b3d0d758f source
 
 echo
 echo "Done. Score with:  cargo run -p code2graph-eval"
