@@ -1097,18 +1097,35 @@ fn collect_bindings_dfs(node: &Node, bytes: &[u8], scopes: &[Scope], out: &mut V
             }
         }
         "local_variable_declaration" => {
-            // local_variable_declaration → initialized_identifier_list → initialized_identifier
+            // local_variable_declaration → initialized_variable_definition, which
+            // carries the primary declared identifier as its `name` field (plus an
+            // optional `type` child shared by every comma-separated identifier),
+            // and any further identifiers as sibling `initialized_identifier`
+            // children (each with its own `name`/`value` fields, no `type`).
             for child in node.children(&mut node.walk()) {
-                if child.kind() == "initialized_identifier_list" {
-                    for item in child.children(&mut child.walk()) {
-                        if item.kind() == "initialized_identifier" {
-                            if let Some(name) = field_text(&item, "name", bytes) {
-                                let intro = item.start_byte();
-                                if name.len() >= MIN_REF_LEN
-                                    && innermost_scope(intro, scopes) != Some(0)
-                                {
-                                    push_binding(out, name, intro, BindingKind::Local, scopes);
-                                }
+                if child.kind() == "initialized_variable_definition" {
+                    if let Some(name) = field_text(&child, "name", bytes) {
+                        let intro = child
+                            .child_by_field_name("name")
+                            .map(|n| n.start_byte())
+                            .unwrap_or_else(|| child.start_byte());
+                        if name.len() >= MIN_REF_LEN && innermost_scope(intro, scopes) != Some(0) {
+                            push_binding(out, name, intro, BindingKind::Local, scopes);
+                        }
+                    }
+                    for item in child
+                        .named_children(&mut child.walk())
+                        .filter(|c| c.kind() == "initialized_identifier")
+                    {
+                        if let Some(name) = field_text(&item, "name", bytes) {
+                            let intro = item
+                                .child_by_field_name("name")
+                                .map(|n| n.start_byte())
+                                .unwrap_or_else(|| item.start_byte());
+                            if name.len() >= MIN_REF_LEN
+                                && innermost_scope(intro, scopes) != Some(0)
+                            {
+                                push_binding(out, name, intro, BindingKind::Local, scopes);
                             }
                         }
                     }
