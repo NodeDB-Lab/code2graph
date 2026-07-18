@@ -25,7 +25,8 @@ use super::emit_embedded_sql_refs;
 use super::{
     BindingRules, ExtractCtx, Extractor, MIN_REF_LEN, attach_reference_scopes,
     collect_call_references, definition_bindings, field_text, import_bindings, make_symbol,
-    node_span, node_text, one_line_signature, push_binding, push_ref, push_scope, push_type_ref,
+    mark_self_receiver_calls, node_span, node_text, one_line_signature, push_binding, push_ref,
+    push_scope, push_type_ref,
 };
 
 /// Tree-sitter query capturing call-callee identifiers.
@@ -36,6 +37,22 @@ const CALL_QUERY: &str = r#"
     (attribute attribute: (identifier) @callee)
   ]
 )
+"#;
+
+/// Method calls whose receiver is written as the conventional `self` parameter
+/// (`self.foo()`).
+///
+/// Python has no `self` keyword — `self` is a plain `identifier` fixed only by
+/// the near-universal convention (PEP 8) that a method's first parameter is
+/// named `self`. It is therefore structurally indistinguishable from any other
+/// object receiver, so this query captures `@receiver` and
+/// [`mark_self_receiver_calls`] applies a text gate comparing it against the
+/// literal `"self"`. The resolver still fails closed unless the enclosing symbol
+/// is itself a type member, so a stray local named `self` outside a method never
+/// yields a false edge.
+const SELF_CALL_QUERY: &str = r#"
+(call
+  function: (attribute object: (identifier) @receiver attribute: (identifier) @callee))
 "#;
 
 /// Extracts Python symbols and references.
@@ -112,6 +129,15 @@ impl PythonExtractor {
             Language::Python,
             bytes,
             file,
+        )?;
+        mark_self_receiver_calls(
+            &root,
+            &ts_language,
+            SELF_CALL_QUERY,
+            Language::Python,
+            bytes,
+            &mut references,
+            Some("self"),
         )?;
         collect_inheritance(&root, bytes, file, &mut references);
         collect_imports(&root, bytes, file, &mut references, &module_id);
@@ -1115,6 +1141,41 @@ fn collect_params(params: &Node, bytes: &[u8], scopes: &[Scope], out: &mut Vec<B
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn self_receiver_call_marks_self_receiver() {
+        let src =
+            "class C:\n    def foo(self):\n        pass\n    def run(self):\n        self.foo()\n";
+        let facts = PythonExtractor.extract(src, "src/c.py").unwrap();
+        let foo_call = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Call && r.name == "foo")
+            .expect("expected a Call reference for 'foo'");
+        assert!(
+            foo_call.self_receiver,
+            "self.foo() should mark self_receiver = true"
+        );
+        assert_eq!(
+            foo_call.qualifier, None,
+            "self-call qualifier must stay None"
+        );
+    }
+
+    #[test]
+    fn non_self_receiver_call_does_not_mark_self_receiver() {
+        let src = "class C:\n    def foo(self):\n        pass\n    def run(self, obj):\n        obj.foo()\n";
+        let facts = PythonExtractor.extract(src, "src/c.py").unwrap();
+        let foo_calls: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Call && r.name == "foo")
+            .collect();
+        assert!(
+            foo_calls.iter().any(|r| !r.self_receiver),
+            "obj.foo() must NOT mark self_receiver, got {foo_calls:?}"
+        );
+    }
 
     #[test]
     fn extracts_defs_with_dotted_module() {

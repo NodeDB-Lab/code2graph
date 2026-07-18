@@ -275,7 +275,8 @@ fn find_inherited(
         feature = "dart",
         feature = "php",
         feature = "ruby",
-        feature = "scala"
+        feature = "scala",
+        feature = "python"
     )
 ))]
 mod tests {
@@ -297,7 +298,8 @@ mod tests {
         feature = "dart",
         feature = "php",
         feature = "ruby",
-        feature = "scala"
+        feature = "scala",
+        feature = "python"
     ))]
     use crate::extract::Extractor;
     #[cfg(feature = "java")]
@@ -306,6 +308,8 @@ mod tests {
     use crate::extract::KotlinExtractor;
     #[cfg(feature = "php")]
     use crate::extract::PhpExtractor;
+    #[cfg(feature = "python")]
+    use crate::extract::PythonExtractor;
     #[cfg(feature = "ruby")]
     use crate::extract::RubyExtractor;
     #[cfg(feature = "rust")]
@@ -1230,6 +1234,58 @@ mod tests {
         assert!(
             e.from.to_scip_string().ends_with("Sub#greetAll()."),
             "edge `from` should be the enclosing Sub#greetAll(), got: {}",
+            e.from.to_scip_string()
+        );
+        assert_eq!(e.confidence, Confidence::Scoped);
+        assert_eq!(e.provenance, Provenance::Conformance);
+    }
+
+    /// Python equivalent: `Base` defines `hello`, `Sub(Base)` calls `self.hello()`
+    /// from its own method. Python's `self` is a naming convention (a plain
+    /// identifier), resolved via the text-gated self-receiver query.
+    #[cfg(feature = "python")]
+    #[test]
+    fn conformance_resolves_python_self_receiver_inherited_class_method_end_to_end() {
+        let base = PythonExtractor
+            .extract(
+                "class Base:\n    def hello(self):\n        pass\n",
+                "src/base.py",
+            )
+            .unwrap();
+        let sub = PythonExtractor
+            .extract(
+                "from base import Base\n\nclass Sub(Base):\n    def greet_all(self):\n        self.hello()\n",
+                "src/sub.py",
+            )
+            .unwrap();
+
+        let graph = ConformanceResolver.resolve(&[base, sub]).unwrap();
+
+        let conf_edges: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.provenance == Provenance::Conformance)
+            .collect();
+
+        assert_eq!(
+            conf_edges.len(),
+            1,
+            "expected exactly one conformance edge for the self.hello() site, got {:?}",
+            conf_edges
+                .iter()
+                .map(|e| format!("{} -> {}", e.from.to_scip_string(), e.to.to_scip_string()))
+                .collect::<Vec<_>>()
+        );
+
+        let e = conf_edges[0];
+        assert!(
+            e.to.to_scip_string().ends_with("Base#hello()."),
+            "edge `to` should be the inherited Base#hello(), got: {}",
+            e.to.to_scip_string()
+        );
+        assert!(
+            e.from.to_scip_string().ends_with("Sub#greet_all()."),
+            "edge `from` should be the enclosing Sub#greet_all(), got: {}",
             e.from.to_scip_string()
         );
         assert_eq!(e.confidence, Confidence::Scoped);
