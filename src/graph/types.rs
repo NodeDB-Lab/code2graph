@@ -339,6 +339,12 @@ pub struct Binding {
     pub kind: BindingKind,
     /// What the binding resolves to.
     pub target: BindingTarget,
+    /// The declared/constructed type of a local/param, as bare written text
+    /// (e.g. `Repo` for `let r: Repo = …` or `fn f(r: Repo)`) — the resolver
+    /// maps it to a type symbol; `None` when unknown. A purely syntactic fact,
+    /// never inferred.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub type_name: Option<String>,
 }
 
 // ── Confidence / Edge ────────────────────────────────────────────────────────
@@ -411,6 +417,11 @@ pub enum Provenance {
     /// Always paired with [`Confidence::NameOnly`] — a bare embedded name is
     /// inherently ambiguous, never type/scope-precise.
     CrossArtifact,
+    /// Derived from a call on a local variable or parameter whose declared or
+    /// constructed type (a syntactic [`Binding::type_name`] fact) owns the
+    /// called member. Defeasible by reassignment, unlike [`Conformance`](Self::Conformance)
+    /// (which reads the owning type off the enclosing symbol, never a binding).
+    LocalType,
 }
 
 // ── FFI / cross-language boundary facts ──────────────────────────────────────
@@ -720,6 +731,7 @@ mod confidence_tests {
             Provenance::NormalizedName,
             Provenance::External,
             Provenance::CrossArtifact,
+            Provenance::LocalType,
         ];
         assert!(provenances.windows(2).all(|pair| pair[0] < pair[1]));
     }

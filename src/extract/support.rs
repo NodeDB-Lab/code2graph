@@ -553,6 +553,8 @@ pub(crate) fn attach_reference_scopes(refs: &mut [Reference], scopes: &[Scope]) 
 
 /// Push a single [`Binding`] with `target = BindingTarget::Local`, computing its
 /// `scope` via [`innermost_scope`] (defaulting to the file root, scope 0).
+/// `type_name` is left `None`; use [`push_typed_binding`] when the extractor
+/// knows the binding's declared/constructed type.
 #[inline]
 pub(crate) fn push_binding(
     out: &mut Vec<Binding>,
@@ -561,6 +563,21 @@ pub(crate) fn push_binding(
     kind: BindingKind,
     scopes: &[Scope],
 ) {
+    push_typed_binding(out, name, intro, kind, scopes, None);
+}
+
+/// Like [`push_binding`], but also records the binding's declared/constructed
+/// type as bare written text (see [`Binding::type_name`]) — a purely syntactic
+/// fact the resolver maps to a type symbol.
+#[inline]
+pub(crate) fn push_typed_binding(
+    out: &mut Vec<Binding>,
+    name: String,
+    intro: usize,
+    kind: BindingKind,
+    scopes: &[Scope],
+    type_name: Option<String>,
+) {
     let scope = innermost_scope(intro, scopes).unwrap_or(0);
     out.push(Binding {
         scope,
@@ -568,6 +585,7 @@ pub(crate) fn push_binding(
         intro,
         kind,
         target: BindingTarget::Local,
+        type_name,
     });
 }
 
@@ -583,6 +601,7 @@ pub(crate) fn definition_bindings(defs: &[Symbol]) -> Vec<Binding> {
             intro: d.span.start,
             kind: BindingKind::Definition,
             target: BindingTarget::Def(d.id.clone()),
+            type_name: None,
         })
         .collect()
 }
@@ -601,6 +620,7 @@ pub(crate) fn import_bindings(refs: &[Reference], scopes: &[Scope]) -> Vec<Bindi
             intro: r.occ.byte,
             kind: BindingKind::Import,
             target: BindingTarget::Import(r.from_path.clone().unwrap_or_default()),
+            type_name: None,
         })
         .collect()
 }

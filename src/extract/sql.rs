@@ -492,6 +492,7 @@ fn collect_cte_bindings_dfs<'a>(
                     intro: name_node.start_byte(),
                     kind: BindingKind::Definition,
                     target: BindingTarget::Def(sym.id.clone()),
+                    type_name: None,
                 });
             }
         }

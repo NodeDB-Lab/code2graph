@@ -193,6 +193,7 @@ mod tests {
                     intro: 0,
                     kind: BindingKind::Definition,
                     target: BindingTarget::Def(def_id),
+                    type_name: None,
                 },
                 // Non-Def binding — must remain untouched
                 Binding {
@@ -201,6 +202,7 @@ mod tests {
                     intro: 5,
                     kind: BindingKind::Local,
                     target: BindingTarget::Local,
+                    type_name: None,
                 },
             ],
             ffi_exports: vec![FfiExport {

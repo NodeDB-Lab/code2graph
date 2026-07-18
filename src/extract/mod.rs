@@ -125,5 +125,6 @@ pub(crate) use support::{
     collect_call_references, definition_bindings, field_text, import_bindings, innermost_scope,
     is_static, make_symbol, mark_self_receiver_calls, member_descriptors, module_name,
     module_symbol, node_occurrence, node_span, node_text, one_line_signature, push_binding,
-    push_import_ref, push_ref, push_scope, push_type_ref, shift_offsets, simple_type_name, unquote,
+    push_import_ref, push_ref, push_scope, push_type_ref, push_typed_binding, shift_offsets,
+    simple_type_name, unquote,
 };

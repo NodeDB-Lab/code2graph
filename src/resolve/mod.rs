@@ -19,6 +19,7 @@ pub mod external;
 pub mod ffi_bridge;
 mod incremental;
 pub mod layered;
+pub mod local_typed_call;
 pub mod normalized_name;
 mod resolver;
 pub mod scope_graph;
@@ -33,6 +34,7 @@ pub use incremental::{
     ScopeSnapshotToken, TrackedIncrementalGraph,
 };
 pub use layered::LayeredResolver;
+pub use local_typed_call::LocalTypedCallResolver;
 pub use normalized_name::NormalizedNameResolver;
 pub use resolver::Resolver;
 pub use scope_graph::ScopeGraphResolver;

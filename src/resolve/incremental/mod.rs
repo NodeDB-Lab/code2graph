@@ -23,6 +23,6 @@ mod tracked;
 pub use delta::{FileChange, ScopeGraphDelta, ScopeSnapshotToken};
 pub(crate) use stitch::{GlobalIndex, stitch};
 pub use store::IncrementalGraph;
-pub(crate) use subgraph::build_subgraph;
 pub use subgraph::{FILE_SUBGRAPH_SCHEMA_VERSION, FileSubgraph};
+pub(crate) use subgraph::{build_subgraph, scope_walk};
 pub use tracked::TrackedIncrementalGraph;

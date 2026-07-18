@@ -29,7 +29,7 @@ use super::{
     BindingRules, ExtractCtx, Extractor, MIN_REF_LEN, attach_reference_scopes, child_text,
     collect_call_references, definition_bindings, import_bindings, make_symbol,
     mark_self_receiver_calls, member_descriptors, node_occurrence, node_span, node_text,
-    one_line_signature, push_binding, push_ref, push_scope,
+    one_line_signature, push_binding, push_ref, push_scope, push_typed_binding, simple_type_name,
 };
 
 /// Tree-sitter query capturing call-callee identifiers (and optional qualifier).
@@ -65,6 +65,26 @@ const SELF_CALL_QUERY: &str = r#"
 (call_expression
   function: (field_expression
     value: (self)
+    field: (field_identifier) @callee))
+"#;
+
+/// Method calls whose receiver is written as a bare local identifier
+/// (`x.foo()`), captured to populate [`Reference::qualifier`] with the
+/// receiver's name — the fact [`crate::resolve::LocalTypedCallResolver`] needs
+/// to map the receiver to its binding's declared type.
+///
+/// Deliberately a *separate* query from [`CALL_QUERY`], for the same
+/// double-emission reason documented on [`SELF_CALL_QUERY`]: combining this
+/// into `CALL_QUERY`'s alternation would match the same `field_expression`
+/// node twice. `value: (identifier)` structurally excludes both the `self`
+/// keyword (a distinct `(self)` node kind — [`SELF_CALL_QUERY`] stays the
+/// receiver-free path for it) and any non-identifier receiver (method chains
+/// `a().foo()`, nested field access `a.b.foo()`), so only a bare local/param
+/// name is ever captured.
+const RECEIVER_CALL_QUERY: &str = r#"
+(call_expression
+  function: (field_expression
+    value: (identifier) @receiver
     field: (field_identifier) @callee))
 "#;
 
@@ -151,6 +171,7 @@ impl RustExtractor {
             &mut references,
             None,
         )?;
+        mark_receiver_qualifier_calls(&root, &ts_language, bytes, &mut references)?;
         collect_inheritance(&root, bytes, file, &mut references);
         collect_module_decl_refs(&root, bytes, file, &mut references);
         collect_imports(&root, bytes, file, &mut references, &module_id);
@@ -1064,6 +1085,61 @@ fn collect_associated_call_type_references(
     Ok(())
 }
 
+/// Run [`RECEIVER_CALL_QUERY`] and set `qualifier` on the matching, already
+/// collected `Call` references (correlated by the `@callee` byte offset — the
+/// same technique [`mark_self_receiver_calls`] uses). Never creates new
+/// references, so this cannot double-emit.
+fn mark_receiver_qualifier_calls(
+    root: &Node,
+    ts_lang: &TsLanguage,
+    bytes: &[u8],
+    references: &mut [Reference],
+) -> Result<()> {
+    let query = Query::new(ts_lang, RECEIVER_CALL_QUERY).map_err(|e| CodegraphError::Query {
+        lang: "rust".to_owned(),
+        msg: e.to_string(),
+    })?;
+    let callee_idx =
+        query
+            .capture_index_for_name("callee")
+            .ok_or_else(|| CodegraphError::Query {
+                lang: "rust".to_owned(),
+                msg: "missing @callee capture".to_owned(),
+            })?;
+    let receiver_idx =
+        query
+            .capture_index_for_name("receiver")
+            .ok_or_else(|| CodegraphError::Query {
+                lang: "rust".to_owned(),
+                msg: "missing @receiver capture".to_owned(),
+            })?;
+    let call_ref_by_byte: std::collections::HashMap<usize, usize> = references
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.role == RefRole::Call)
+        .map(|(i, r)| (r.occ.byte, i))
+        .collect();
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(&query, *root, bytes);
+    while let Some(m) = matches.next() {
+        let Some(receiver_text) = m
+            .captures
+            .iter()
+            .find(|c| c.index == receiver_idx)
+            .and_then(|c| c.node.utf8_text(bytes).ok())
+        else {
+            continue;
+        };
+        for cap in m.captures.iter().filter(|c| c.index == callee_idx) {
+            let byte = cap.node.start_byte();
+            if let Some(&idx) = call_ref_by_byte.get(&byte) {
+                references[idx].qualifier = Some(receiver_text.to_owned());
+            }
+        }
+    }
+    Ok(())
+}
+
 fn collect_type_references(
     root: &Node,
     ts_lang: &TsLanguage,
@@ -1475,7 +1551,8 @@ fn collect_bindings_dfs(node: &Node, bytes: &[u8], scopes: &[Scope], out: &mut V
                 if let Some(ident_node) = resolve_pattern_ident(&pattern_node) {
                     let intro = ident_node.start_byte();
                     let name = node_text(&ident_node, bytes).to_owned();
-                    push_binding(out, name, intro, BindingKind::Local, scopes);
+                    let type_name = let_declaration_type_name(node, bytes);
+                    push_typed_binding(out, name, intro, BindingKind::Local, scopes, type_name);
                 }
                 // NOTE: destructuring patterns (tuple, struct, slice, …) are
                 // not handled in this unit — see `resolve_pattern_ident`.
@@ -1494,6 +1571,34 @@ fn collect_bindings_dfs(node: &Node, bytes: &[u8], scopes: &[Scope], out: &mut V
     }
 }
 
+/// The declared/constructed type of a `let_declaration`, as bare written text
+/// (see [`Binding::type_name`]) — a purely syntactic fact, never guessed.
+/// Prefers an explicit type annotation (`let r: Repo = …`); else, when the
+/// value is a trivial constructor whose type is written directly — a struct
+/// literal (`Repo { .. }`) or a path-qualified call (`Repo::new()`) — the
+/// constructed type's leaf name. Any other value shape (a bare identifier, a
+/// method chain, …) yields `None`.
+fn let_declaration_type_name(let_decl: &Node, bytes: &[u8]) -> Option<String> {
+    if let Some(type_node) = let_decl.child_by_field_name("type") {
+        return Some(simple_type_name(node_text(&type_node, bytes), "::").to_owned());
+    }
+    let value_node = let_decl.child_by_field_name("value")?;
+    match value_node.kind() {
+        "struct_expression" => {
+            let name_node = value_node.child_by_field_name("name")?;
+            Some(simple_type_name(node_text(&name_node, bytes), "::").to_owned())
+        }
+        "call_expression" => {
+            let function_node = value_node.child_by_field_name("function")?;
+            (function_node.kind() == "scoped_identifier")
+                .then(|| function_node.child_by_field_name("path"))
+                .flatten()
+                .map(|path_node| simple_type_name(node_text(&path_node, bytes), "::").to_owned())
+        }
+        _ => None,
+    }
+}
+
 /// Emit a [`Binding`] for each parameter in a `parameters` or
 /// `closure_parameters` node.
 fn collect_params(params_node: &Node, bytes: &[u8], scopes: &[Scope], out: &mut Vec<Binding>) {
@@ -1509,7 +1614,10 @@ fn collect_params(params_node: &Node, bytes: &[u8], scopes: &[Scope], out: &mut 
                     } else if let Some(ident_node) = resolve_pattern_ident(&pattern_node) {
                         let intro = ident_node.start_byte();
                         let name = node_text(&ident_node, bytes).to_owned();
-                        push_binding(out, name, intro, BindingKind::Param, scopes);
+                        let type_name = child
+                            .child_by_field_name("type")
+                            .map(|t| simple_type_name(node_text(&t, bytes), "::").to_owned());
+                        push_typed_binding(out, name, intro, BindingKind::Param, scopes, type_name);
                     }
                     // NOTE: destructuring patterns in params not handled — see
                     // `resolve_pattern_ident`.
@@ -2504,6 +2612,86 @@ impl std::fmt::Display for Point {
         );
     }
 
+    // ── Receiver qualifier / binding type-name tests ────────────────────────────
+
+    #[test]
+    fn field_expression_call_captures_receiver_as_qualifier() {
+        // `r.save()` → exactly one Call ref for "save", with qualifier = "r"
+        // (the receiver identifier) and self_receiver = false.
+        let src = "fn f() { let r: Repo = Repo; r.save(); }";
+        let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
+
+        let save_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Call && r.name == "save")
+            .collect();
+        assert_eq!(
+            save_refs.len(),
+            1,
+            "expected exactly one Call ref for 'save', got {save_refs:?}"
+        );
+        assert_eq!(save_refs[0].qualifier.as_deref(), Some("r"));
+        assert!(!save_refs[0].self_receiver);
+    }
+
+    #[test]
+    fn self_receiver_call_keeps_qualifier_none() {
+        // `self.hello()` must remain self_receiver = true, qualifier = None —
+        // the bare-identifier receiver query must not match the `self` node.
+        let src = "impl Person { fn greet(&self) { self.hello(); } }";
+        let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
+
+        let hello_ref = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Call && r.name == "hello")
+            .expect("expected a Call ref for 'hello'");
+        assert!(hello_ref.self_receiver);
+        assert_eq!(hello_ref.qualifier, None);
+    }
+
+    #[test]
+    fn let_with_type_annotation_sets_binding_type_name() {
+        let src = "fn f() { let r: Repo = Repo; r.save(); }";
+        let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
+
+        let r_binding = facts
+            .bindings
+            .iter()
+            .find(|b| b.kind == BindingKind::Local && b.name == "r")
+            .expect("expected a Local binding for 'r'");
+        assert_eq!(r_binding.type_name.as_deref(), Some("Repo"));
+    }
+
+    #[test]
+    fn param_type_sets_binding_type_name() {
+        let src = "fn f(r: Repo) {}";
+        let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
+
+        let r_binding = facts
+            .bindings
+            .iter()
+            .find(|b| b.kind == BindingKind::Param && b.name == "r")
+            .expect("expected a Param binding for 'r'");
+        assert_eq!(r_binding.type_name.as_deref(), Some("Repo"));
+    }
+
+    #[test]
+    fn let_without_annotation_or_recognized_constructor_leaves_type_name_none() {
+        // Bare-value `let r = Repo;` (no type annotation, no `{}`/`()`
+        // constructor) is not a recognized shape — fail closed.
+        let src = "fn f() { let r = Repo; r.save(); }";
+        let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
+
+        let r_binding = facts
+            .bindings
+            .iter()
+            .find(|b| b.kind == BindingKind::Local && b.name == "r")
+            .expect("expected a Local binding for 'r'");
+        assert_eq!(r_binding.type_name, None);
+    }
+
     // ── Definition binding tests ──────────────────────────────────────────────
 
     #[test]
@@ -2648,9 +2836,11 @@ impl std::fmt::Display for Point {
     }
 
     #[test]
-    fn method_call_via_field_expression_has_no_qualifier() {
-        // `obj.method()` — field_expression arm → leaf "method", qualifier None
-        // (obj is the receiver, not a qualifier)
+    fn method_call_via_field_expression_captures_receiver_as_qualifier() {
+        // `obj.method()` — field_expression arm captures the receiver identifier
+        // `obj` as the `qualifier` (a receiver, resolved by the local-typed-call
+        // resolver to `obj`'s binding type; the resolver, not the extractor,
+        // decides whether the qualifier is a type path or a local variable).
         let src = "pub fn caller(obj: Foo) { obj.method(); }";
         let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
         let r = facts
@@ -2659,9 +2849,14 @@ impl std::fmt::Display for Point {
             .find(|r| r.role == RefRole::Call && r.name == "method")
             .expect("expected a Call ref for 'method'");
         assert_eq!(
-            r.qualifier, None,
-            "method call via field_expression should have qualifier == None, got {:?}",
+            r.qualifier.as_deref(),
+            Some("obj"),
+            "method call via field_expression should capture the receiver `obj` as qualifier, got {:?}",
             r.qualifier
+        );
+        assert!(
+            !r.self_receiver,
+            "a non-self receiver must not be marked self_receiver"
         );
     }
 

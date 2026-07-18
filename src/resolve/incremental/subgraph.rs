@@ -456,7 +456,7 @@ fn collect_reexports(facts: &FileFacts, symbols: &[Symbol]) -> Vec<ReExport> {
         .collect()
 }
 
-fn scope_walk<'b>(
+pub(crate) fn scope_walk<'b>(
     name: &str,
     ref_byte: usize,
     start: ScopeId,

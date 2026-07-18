@@ -65,7 +65,7 @@ pub struct ConformanceResolver;
 /// `SymbolId` exposes descriptor *names* but not descriptor *kinds*, so the
 /// symbol's own [`SymbolKind`] is the cleanest available signal that the
 /// penultimate descriptor is a type (a member always renders under `Type#`).
-fn member_of_type(sym: &Symbol) -> Option<(String /* type */, String /* member */)> {
+pub(crate) fn member_of_type(sym: &Symbol) -> Option<(String /* type */, String /* member */)> {
     if !matches!(
         sym.kind,
         SymbolKind::Method | SymbolKind::Const | SymbolKind::Static
@@ -230,7 +230,7 @@ impl Resolver for ConformanceResolver {
 /// [`SymbolId`] at the first ancestor type that defines `member`. Cycle-safe via
 /// a visited-name set; order-stable because the supertype vectors preserve
 /// insertion order and the recursion is left-to-right.
-fn find_inherited(
+pub(crate) fn find_inherited(
     type_name: &str,
     member: &str,
     members: &HashMap<String, HashMap<String, SymbolId>>,

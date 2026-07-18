@@ -387,6 +387,7 @@ mod tests {
                 intro: 0,
                 kind: BindingKind::Definition,
                 target: BindingTarget::Def(id()),
+                type_name: None,
             }],
             ffi_exports: vec![],
         }
@@ -576,6 +577,7 @@ mod tests {
             intro: 1,
             kind: BindingKind::Import,
             target: BindingTarget::Import("third-party/package".into()),
+            type_name: None,
         });
         assert!(validate_file_facts_with_context(&value, context()).is_ok());
     }
