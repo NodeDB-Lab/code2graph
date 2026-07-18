@@ -1,0 +1,21 @@
+# FluxBench configuration for code2graph.
+# Run the pipeline benchmarks with: cargo bench --features rust,typescript,python
+# (bench bodies are feature-gated on the languages they exercise).
+
+[runner]
+warmup_time = "2s"
+measurement_time = "3s"
+timeout = "60s"
+isolation = "process"       # crash-safe: a panicking bench never sinks the suite
+
+[allocator]
+track = true                # per-iteration heap bytes/count, useful for the extractors
+
+[output]
+format = "human"
+directory = "target/fluxbench"
+
+[ci]
+regression_threshold = 25.0 # CI has 10-40% noise; only flag real regressions
+github_annotations = true
+fail_on_critical = true

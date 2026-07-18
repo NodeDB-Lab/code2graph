@@ -35,6 +35,12 @@ keywords = ["code-graph", "tree-sitter", "static-analysis", "symbols", "cpg"]
 categories = ["development-tools", "parsing"]
 readme.workspace = true
 
+# Disable the default libtest bench harness on the library target so `cargo
+# bench` runs only the fluxbench `pipeline` benchmark (the libtest harness does
+# not understand fluxbench's CLI flags).
+[lib]
+bench = false
+
 [features]
 default = ["rust","python","typescript","go","java","c","cpp","ruby","php","shell","swift","kotlin","solidity","sql","hcl","csharp","scala","dart","lua","luau","pascal","svelte"]
 manifest = ["dep:toml", "dep:serde_json", "serde"]
@@ -95,6 +101,15 @@ tree-sitter-svelte-ng = { version = "1.0.2", optional = true }
 
 [dev-dependencies]
 serde_json = "1"
+fluxbench = "0.1"
+
+# Performance benchmarks (fluxbench harness). Run the meaningful pipeline hot
+# paths — extraction throughput, per-tier resolution cost, end-to-end index —
+# with `cargo bench --features rust,typescript,python` (bench bodies are
+# feature-gated on the languages they exercise).
+[[bench]]
+name = "pipeline"
+harness = false
 
 [profile.release]
 opt-level = 3
