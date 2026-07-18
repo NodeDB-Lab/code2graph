@@ -153,8 +153,10 @@ pub struct Symbol {
     pub signature: String,
 }
 
-/// The role a reference plays. `Call`, `IsImplementation`, `Import`, `TypeRef`,
-/// and `ModuleRef` are live; `Read`/`Write` arrive with richer extractors.
+/// The role a reference plays. All variants are live — `Call`,
+/// `IsImplementation`, `Import`, `ModuleRef`, `TypeRef`, and `Read`/`Write`
+/// (variable read/write bindings) — though which roles a given file yields
+/// depends on what its language extractor captures.
 ///
 /// Declaration order is the stable structural sort order used by [`EdgeKey`].
 /// New variants must be appended rather than reordered.

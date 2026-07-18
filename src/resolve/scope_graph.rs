@@ -3,8 +3,10 @@
 //! Tier-B scope-aware resolver — precise resolution via lexical scopes.
 //!
 //! The resolver itself is language-agnostic; it resolves whatever scope/binding
-//! facts an extractor emits. Scope-aware extractors today: Rust, Python, and
-//! TypeScript/JavaScript.
+//! facts an extractor emits. Most language extractors emit scope and binding
+//! facts today (see `src/extract/` for the current set — any extractor calling
+//! `attach_reference_scopes` participates); a reference from an extractor that
+//! does not emit scopes simply arrives with `scope: None` and falls through.
 //!
 //! This resolver walks each file's lexical scopes to bind references the way the
 //! language's name-resolution rules would. It resolves four binding kinds:

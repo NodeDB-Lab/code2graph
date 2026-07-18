@@ -6,8 +6,9 @@
 //! [`CodeGraph`]. The trait is the **tier seam**: every resolver emits the same
 //! schema, tagging each edge with a [`Confidence`]. code2graph ships a fast,
 //! broad [`SymbolTableResolver`] (Tier A — name/scope matching across all
-//! languages); a precise stack-graphs resolver (Tier B) can slot in behind the
-//! same trait per language without changing the output shape.
+//! languages) and a precise, hand-rolled lexical [`ScopeGraphResolver`] (Tier B
+//! — scope-aware path resolution). Further resolvers slot in behind the same
+//! trait without changing the output shape.
 //!
 //! [`Confidence`]: crate::graph::Confidence
 //! [`FileFacts`]: crate::graph::FileFacts
