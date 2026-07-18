@@ -20,6 +20,8 @@ flatter.
     ~3,900 LOC / 13 `src/` files. Oracle: `rust-analyzer scip`.
   - [`sindresorhus/ky`](https://github.com/sindresorhus/ky) — TypeScript HTTP
     client, ~4,000 LOC / 30 `source/` files. Oracle: `scip-typescript`.
+  - [`pallets/click`](https://github.com/pallets/click) — Python CLI framework,
+    ~12,500 LOC / 17 `src/click/` files. Oracle: `scip-python`.
 - **Oracle:** a type-aware, compiler-grade SCIP indexer → an `index.scip`,
   converted to location-only `ref:line → def:line` pairs by the eval crate's
   `gen-oracle`.
@@ -41,6 +43,8 @@ flatter.
 | | Tier-B (scope) | 0.52 | 0.36 | 0.43 |
 | **ky** — TypeScript (1995) | Tier-A (name) | 0.92 | 0.22 | 0.36 |
 | | Tier-B (scope) | 0.79 | 0.44 | 0.56 |
+| **click** — Python (6819) | Tier-A (name) | 0.33 | 0.19 | 0.24 |
+| | Tier-B (scope) | 0.73 | 0.53 | 0.61 |
 
 Layered (dense), recall by minimum-confidence cutoff:
 
@@ -48,12 +52,20 @@ Layered (dense), recall by minimum-confidence cutoff:
 |---|---|---|---|---|---|
 | anyhow (Rust) | 0.45 | 0.45 | 0.41 | 0.09 | 0.27 |
 | ky (TypeScript) | 0.46 | 0.46 | 0.46 | 0.38 | 0.76 |
+| click (Python) | 0.55 | 0.55 | 0.54 | 0.43 | 0.71 |
 
-For contrast, the toy `rust_oracle` / `ts_oracle` fixtures score Tier-B
-**P=1.00** — the gap between that and the `0.52` / `0.79` here is exactly the
-illusion this scorecard exists to dispel. TypeScript's higher `P@Exact` (0.76 vs
-Rust's 0.27) reflects a language with far less macro/generic indirection for a
-build-free resolver to lose — the honest ceiling differs sharply by language.
+For contrast, the toy `*_oracle` fixtures score Tier-B **P=1.00** — the gap
+between that and the `0.52` / `0.79` / `0.73` here is exactly the illusion this
+scorecard exists to dispel. Two real signals emerge across the three:
+
+- **Tier-B (scope) is consistently the more precise tier, and matters most where
+  name fan-out is worst.** On Python, Tier-A precision collapses to `0.33` (many
+  same-named methods), while Tier-B holds `0.73` — the single clearest
+  demonstration that scope resolution earns its keep on real code.
+- **The build-free ceiling is language-shaped.** `P@Exact` runs `0.27` (Rust) →
+  `0.71` (Python) → `0.76` (TypeScript): a macro/generic/trait-heavy Rust crate
+  resolves to a unique `Exact` target far less often than straighter-line Python
+  or TypeScript. Same resolver, honestly different ceilings.
 
 ## Honest reading
 

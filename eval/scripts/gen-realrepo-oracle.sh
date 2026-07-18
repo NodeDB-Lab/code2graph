@@ -94,9 +94,46 @@ gen_ts_case() {
   echo "== $name: $(($(wc -l < "$case_dir/oracle.edges") - 1)) intra-$src_dir oracle edges"
 }
 
+# ── Case: a real Python project (indexed with scip-python) ───────────────────
+# `src_dir` is the package source root (e.g. `src/click`); scip-python's
+# relative_path is cwd-relative, so we mirror it and scope to intra-<src_dir>.
+gen_py_case() {
+  local name="$1" url="$2" ref="$3" src_dir="$4"
+  local case_dir="$corpus/py_realrepo/$name"
+  echo "== py_realrepo/$name : cloning $url @ $ref"
+  git clone --quiet "$url" "$work/$name"
+  git -C "$work/$name" checkout --quiet "$ref"
+
+  echo "== indexing with scip-python"
+  ( cd "$work/$name" && scip-python index --project-name "$name" \
+      --output index.scip >/dev/null 2>&1 )
+
+  echo "== assembling corpus case ($src_dir/ only, paths matching SCIP)"
+  rm -rf "$case_dir"
+  mkdir -p "$case_dir/$src_dir"
+  ( cd "$work/$name" && find "$src_dir" -name '*.py' -print0 \
+      | while IFS= read -r -d '' f; do
+          mkdir -p "$case_dir/$(dirname "$f")"
+          cp "$f" "$case_dir/$f"
+        done )
+  cp "$work/$name/index.scip" "$case_dir/index.scip"
+
+  echo "== deriving + scoping oracle to intra-$src_dir ref→def pairs"
+  ( cd "$repo_root" && cargo run -q -p code2graph-eval \
+      --features oracle-regen --bin gen-oracle -- "$case_dir" )
+  local hdr="# oracle: SCIP ($name $ref) — intra-$src_dir location pairs (ref -> def), role-agnostic"
+  { echo "$hdr"
+    awk -v d="^$src_dir/" 'NF==2 && $1 ~ d && $2 ~ d' "$case_dir/oracle.edges"
+  } > "$case_dir/oracle.edges.tmp"
+  mv "$case_dir/oracle.edges.tmp" "$case_dir/oracle.edges"
+  echo "== $name: $(($(wc -l < "$case_dir/oracle.edges") - 1)) intra-$src_dir oracle edges"
+}
+
 gen_rust_case anyhow https://github.com/dtolnay/anyhow.git 1.0.104
 gen_ts_case ky https://github.com/sindresorhus/ky.git \
   3419113b48e034fdcf8fa6bd3be3da7b3d0d758f source
+gen_py_case click https://github.com/pallets/click.git \
+  333c28d79cd982990ee98eef61ec20ab1a4f38ba src/click
 
 echo
 echo "Done. Score with:  cargo run -p code2graph-eval"
