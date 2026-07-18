@@ -128,6 +128,7 @@ mod tests {
             scope: None,
             type_ref_ctx: Some(TypeRefContext::GenericArg),
             cross_artifact: false,
+            self_receiver: false,
         };
         let output = reference_output(&reference);
         assert_eq!(output.name, "Type");
@@ -167,6 +168,7 @@ mod tests {
             scope: None,
             type_ref_ctx: None,
             cross_artifact: false,
+            self_receiver: false,
         });
         let json = serde_json::to_value(output).unwrap();
         assert_eq!(json["occurrence"]["file"], "src/a.rs");

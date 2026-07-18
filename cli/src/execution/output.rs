@@ -327,6 +327,7 @@ fn provenance(value: crate::ProvenanceOutput) -> &'static str {
         crate::ProvenanceOutput::ScopeGraph => "scope-graph",
         crate::ProvenanceOutput::FfiBridge => "ffi-bridge",
         crate::ProvenanceOutput::Conformance => "conformance",
+        crate::ProvenanceOutput::LocalType => "local-type",
         crate::ProvenanceOutput::NormalizedName => "normalized-name",
         crate::ProvenanceOutput::External => "external",
         crate::ProvenanceOutput::CrossArtifact => "cross-artifact",

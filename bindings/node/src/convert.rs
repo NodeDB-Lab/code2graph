@@ -78,12 +78,13 @@ pub(crate) fn edge_filter(
         Some("ScopeGraph") => Some(Provenance::ScopeGraph),
         Some("FfiBridge") => Some(Provenance::FfiBridge),
         Some("Conformance") => Some(Provenance::Conformance),
+        Some("LocalType") => Some(Provenance::LocalType),
         Some("NormalizedName") => Some(Provenance::NormalizedName),
         Some("External") => Some(Provenance::External),
         Some("CrossArtifact") => Some(Provenance::CrossArtifact),
         Some(value) => {
             return Err(napi::Error::from_reason(format!(
-                "invalid provenance {value:?}; expected SymbolTable, ScopeGraph, FfiBridge, Conformance, NormalizedName, External, or CrossArtifact"
+                "invalid provenance {value:?}; expected SymbolTable, ScopeGraph, FfiBridge, Conformance, LocalType, NormalizedName, External, or CrossArtifact"
             )));
         }
     };

@@ -220,6 +220,7 @@ pub struct ReferenceWire {
     pub scope: Option<u64>,
     pub type_ref_ctx: Option<u8>,
     pub cross_artifact: Option<bool>,
+    pub self_receiver: Option<bool>,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScopeWire {
@@ -237,6 +238,7 @@ pub struct BindingWire {
     pub target_tag: u8,
     pub target_value: Option<String>,
     pub target_id: Option<SymbolIdWireDto>,
+    pub type_name: Option<String>,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FfiExportWire {
@@ -363,7 +365,7 @@ impl_numeric_map_codec!(OccurrenceWire {
 });
 impl_numeric_map_codec!(ReferenceWire {
     required { 0 => name: String, 1 => occ: OccurrenceWire, 2 => role: u8 }
-    optional { 3 => source_module: Option<String>, 4 => from_path: Option<String>, 5 => qualifier: Option<String>, 6 => scope: Option<u64>, 7 => type_ref_ctx: Option<u8>, 8 => is_reexport: Option<bool>, 9 => imported_name: Option<String>, 10 => cross_artifact: Option<bool> }
+    optional { 3 => source_module: Option<String>, 4 => from_path: Option<String>, 5 => qualifier: Option<String>, 6 => scope: Option<u64>, 7 => type_ref_ctx: Option<u8>, 8 => is_reexport: Option<bool>, 9 => imported_name: Option<String>, 10 => cross_artifact: Option<bool>, 11 => self_receiver: Option<bool> }
 });
 impl ToMessagePack for ScopeWire {
     fn write<W: Write>(&self, writer: &mut W) -> zerompk::Result<()> {
@@ -421,7 +423,7 @@ impl<'a> FromMessagePack<'a> for ScopeWire {
 }
 impl_numeric_map_codec!(BindingWire {
     required { 0 => scope: u64, 1 => name: String, 2 => intro: u64, 3 => kind: u8, 4 => target_tag: u8 }
-    optional { 5 => target_value: Option<String>, 6 => target_id: Option<SymbolIdWireDto> }
+    optional { 5 => target_value: Option<String>, 6 => target_id: Option<SymbolIdWireDto>, 7 => type_name: Option<String> }
 });
 impl_numeric_map_codec!(FfiExportWire {
     required { 0 => symbol: SymbolIdWireDto, 1 => abi: u8, 2 => export_name: String }
@@ -938,6 +940,7 @@ impl From<&Reference> for ReferenceWire {
             scope: r.scope.map(|v| v as u64),
             type_ref_ctx: r.type_ref_ctx.map(type_ref_context_tag),
             cross_artifact: Some(r.cross_artifact),
+            self_receiver: Some(r.self_receiver),
         }
     }
 }
@@ -994,6 +997,7 @@ impl TryFrom<ReferenceWire> for Reference {
             scope: r.scope.map(usize_from).transpose()?,
             type_ref_ctx: r.type_ref_ctx.map(|v| tag(v, &ctx).copied()).transpose()?,
             cross_artifact: r.cross_artifact.unwrap_or(false),
+            self_receiver: r.self_receiver.unwrap_or(false),
         })
     }
 }
@@ -1042,6 +1046,7 @@ impl From<&Binding> for BindingWire {
             target_tag,
             target_value,
             target_id,
+            type_name: b.type_name.clone(),
         }
     }
 }
@@ -1050,6 +1055,7 @@ impl TryFrom<BindingWire> for Binding {
     fn try_from(b: BindingWire) -> Result<Self, Self::Error> {
         cap(&b.name)?;
         cap_option(&b.target_value)?;
+        cap_option(&b.type_name)?;
         let kinds = [
             BindingKind::Local,
             BindingKind::Param,
@@ -1068,6 +1074,7 @@ impl TryFrom<BindingWire> for Binding {
             intro: usize_from(b.intro)?,
             kind: *tag(b.kind, &kinds)?,
             target,
+            type_name: b.type_name,
         })
     }
 }
@@ -1150,6 +1157,7 @@ mod tests {
                     scope: Some(0),
                     type_ref_ctx: Some(TypeRefContext::ReturnType),
                     cross_artifact: false,
+                    self_receiver: false,
                 },
                 Reference {
                     name: "dependency".into(),
@@ -1168,6 +1176,7 @@ mod tests {
                     scope: None,
                     type_ref_ctx: None,
                     cross_artifact: false,
+                    self_receiver: false,
                 },
             ],
             scopes: vec![Scope {
@@ -1182,6 +1191,7 @@ mod tests {
                     intro: 0,
                     kind: BindingKind::Definition,
                     target: BindingTarget::Def(id.clone()),
+                    type_name: None,
                 },
                 Binding {
                     scope: 0,
@@ -1189,6 +1199,7 @@ mod tests {
                     intro: 1,
                     kind: BindingKind::Param,
                     target: BindingTarget::Local,
+                    type_name: Some("Repo".into()),
                 },
                 Binding {
                     scope: 0,
@@ -1196,6 +1207,7 @@ mod tests {
                     intro: 2,
                     kind: BindingKind::Import,
                     target: BindingTarget::Import("dependency::module".into()),
+                    type_name: None,
                 },
             ],
             ffi_exports: vec![FfiExport {
