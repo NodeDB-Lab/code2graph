@@ -92,6 +92,11 @@ impl PythonExtractor {
         let defs = collect_symbols(&root, &ctx, &namespaces);
         let def_bindings = definition_bindings(&defs);
         let mut symbols = defs;
+        // Class methods are gathered separately and appended AFTER `def_bindings`
+        // is computed from the method-free `defs`. Python's LEGB rule means class
+        // body names are not visible in module scope, so method symbols must never
+        // flow through `definition_bindings` (which hard-codes `scope: 0`).
+        symbols.extend(collect_class_method_symbols(&root, &ctx, &namespaces));
         let mut mod_sym = super::module_symbol(Language::Python, &namespaces, file, source.len());
         let module_id = mod_sym.id.to_scip_string();
         // Idiomatic Python entry point: a module-level `if __name__ == "__main__"`
@@ -380,6 +385,110 @@ fn collect_symbols(root: &Node, ctx: &ExtractCtx, namespaces: &[String]) -> Vec<
         out.push(sym);
     }
     out
+}
+
+/// Find the first DIRECT child of `node` whose kind is `kind`.
+fn find_child_kind<'a>(node: &Node<'a>, kind: &str) -> Option<Node<'a>> {
+    node.children(&mut node.walk()).find(|c| c.kind() == kind)
+}
+
+/// Collect [`SymbolKind::Method`] symbols for every top-level class's DIRECT
+/// method members (`class_definition` / `decorated_definition` wrapping a
+/// `class_definition`, found among `root`'s direct children — same scope as
+/// `collect_symbols`). Nested classes are deliberately not descended into.
+///
+/// Kept as a separate pass so these symbols never flow through
+/// `definition_bindings`: see the call site in `extract_impl` for why.
+fn collect_class_method_symbols(
+    root: &Node,
+    ctx: &ExtractCtx,
+    namespaces: &[String],
+) -> Vec<Symbol> {
+    let mut out = Vec::new();
+    for child in root.children(&mut root.walk()) {
+        let class_node = match child.kind() {
+            "class_definition" => child,
+            "decorated_definition" => {
+                let Some(inner) = find_child_kind(&child, "class_definition") else {
+                    continue;
+                };
+                inner
+            }
+            _ => continue,
+        };
+        let Some(class_name) = class_node
+            .children(&mut class_node.walk())
+            .find(|c| c.kind() == "identifier")
+            .map(|c| node_text(&c, ctx.bytes).to_owned())
+        else {
+            continue;
+        };
+        collect_class_methods(&class_node, ctx, namespaces, &class_name, &mut out);
+    }
+    out
+}
+
+/// Emit a `Type(class_name).Method(method_name)` symbol for each DIRECT
+/// `function_definition` (bare or decorated, incl. `async def`) in a class
+/// body block. One level only: nested `def`s inside a method body are local
+/// functions, not methods, and are not descended into.
+fn collect_class_methods(
+    class_node: &Node,
+    ctx: &ExtractCtx,
+    namespaces: &[String],
+    class_name: &str,
+    out: &mut Vec<Symbol>,
+) {
+    let Some(body) = class_node.child_by_field_name("body") else {
+        return;
+    };
+    for member in body.children(&mut body.walk()) {
+        let (span_node, sig_node) = match member.kind() {
+            "function_definition" => (member, member),
+            "decorated_definition" => {
+                let Some(inner) = find_child_kind(&member, "function_definition") else {
+                    continue;
+                };
+                (member, inner)
+            }
+            _ => continue,
+        };
+        let Some(name) = sig_node
+            .children(&mut sig_node.walk())
+            .find(|c| c.kind() == "identifier")
+            .map(|c| node_text(&c, ctx.bytes).to_owned())
+        else {
+            continue;
+        };
+        // Same sentinel skip as `def_of`: drop pure-underscore names, keep real
+        // dunders like `__init__`.
+        if name.chars().all(|c| c == '_') {
+            continue;
+        }
+
+        let mut descriptors: Vec<Descriptor> = namespaces
+            .iter()
+            .cloned()
+            .map(Descriptor::Namespace)
+            .collect();
+        descriptors.push(Descriptor::Type(class_name.to_owned()));
+        descriptors.push(Descriptor::Method {
+            name: name.clone(),
+            disambiguator: crate::symbol::MethodDisambiguator::empty(),
+        });
+
+        let signature = one_line_signature(node_text(&sig_node, ctx.bytes), &[':']);
+        let sym = make_symbol(
+            ctx,
+            &span_node,
+            name,
+            SymbolKind::Method,
+            Visibility::Public,
+            descriptors,
+            signature,
+        );
+        out.push(sym);
+    }
 }
 
 /// Build a function/class definition tuple from a def node.
@@ -1087,6 +1196,100 @@ MAX_RETRIES = 3
             fn_scopes[0].parent,
             Some(0),
             "method's enclosing scope is the module (class skipped)"
+        );
+    }
+
+    #[test]
+    fn class_methods_emit_method_symbols() {
+        let src = "class Base:\n    def hello(self):\n        pass\n";
+        let facts = PythonExtractor.extract(src, "src/m.py").unwrap();
+        let hello = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "hello")
+            .expect("expected a 'hello' symbol");
+        assert_eq!(hello.kind, SymbolKind::Method);
+        assert!(
+            hello.id.to_scip_string().ends_with("Base#hello()."),
+            "unexpected scip string: {}",
+            hello.id.to_scip_string()
+        );
+        assert!(
+            facts
+                .symbols
+                .iter()
+                .any(|s| s.name == "Base" && s.kind == SymbolKind::Class),
+            "expected Base Class symbol to still be present"
+        );
+    }
+
+    #[test]
+    fn dunder_init_is_emitted_as_method() {
+        let src = "class Base:\n    def __init__(self):\n        pass\n";
+        let facts = PythonExtractor.extract(src, "src/m.py").unwrap();
+        let init =
+            facts.symbols.iter().find(|s| s.name == "__init__").expect(
+                "expected '__init__' to be emitted (only pure-underscore names are skipped)",
+            );
+        assert_eq!(init.kind, SymbolKind::Method);
+    }
+
+    #[test]
+    fn decorated_and_async_methods_are_emitted() {
+        let src = "\
+class Base:
+    @staticmethod
+    def s():
+        pass
+
+    @classmethod
+    def c(cls):
+        pass
+
+    async def a(self):
+        pass
+";
+        let facts = PythonExtractor.extract(src, "src/m.py").unwrap();
+        for name in ["s", "c", "a"] {
+            let sym = facts
+                .symbols
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("expected method '{name}' to be emitted"));
+            assert_eq!(sym.kind, SymbolKind::Method, "method '{name}' wrong kind");
+        }
+    }
+
+    #[test]
+    fn nested_def_inside_method_is_not_a_symbol() {
+        let src = "\
+class Base:
+    def outer(self):
+        def inner():
+            pass
+        return inner
+";
+        let facts = PythonExtractor.extract(src, "src/m.py").unwrap();
+        assert!(
+            !facts.symbols.iter().any(|s| s.name == "inner"),
+            "nested `def inner` must not be emitted as a symbol"
+        );
+        assert!(facts.symbols.iter().any(|s| s.name == "outer"));
+    }
+
+    #[test]
+    fn class_methods_do_not_leak_module_scope_bindings() {
+        // Guards the risk that method symbols flow through `definition_bindings`
+        // (which hard-codes `scope: 0`), which would wrongly make `hello()`
+        // resolvable as a bare module-scope call anywhere in the file.
+        let src = "class Base:\n    def hello(self):\n        pass\n";
+        let facts = PythonExtractor.extract(src, "src/m.py").unwrap();
+        assert!(
+            !facts
+                .bindings
+                .iter()
+                .any(|b| b.name == "hello" && b.kind == BindingKind::Definition && b.scope == 0),
+            "method 'hello' must not have a module-scope Definition binding"
         );
     }
 
