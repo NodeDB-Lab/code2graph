@@ -48,14 +48,14 @@ Cross-language **FFI** is a property of language _pairs_, so it lives in its own
 | Python          | `.py` `.pyi`                            |   ⭐   |   ✓   |    ✓    |    ✓    |    ✓     |     ✓      |     ✓     |                                                                       |
 | Go              | `.go`                                   |   ⭐   |   ✓   |    ✓    |    —    |    ✓     |     ✓      |     ✓     | structural interfaces → no class inheritance                          |
 | Java            | `.java`                                 |   ⭐   |   ✓   |    ✓    |    ✓    |    ✓     |     ✓      |     ✓     |                                                                       |
-| C               | `.c` `.h`                               |   ⭐   |   ✓   |    —    |    —    |    ✓     |     ✓      |           | no import graph                                                       |
-| C++             | `.cc` `.cpp` `.cxx` `.hh` `.hpp` `.hxx` |   ⭐   |   ✓   |    —    |    ✓    |    ✓     |     ✓      |           |                                                                       |
-| Kotlin          | `.kt` `.kts`                            |   ⭐   |   ✓   |    ✓    |    ✓    |    ✓     |     ✓      |           |                                                                       |
+| C               | `.c` `.h`                               |   ⭐   |   ✓   |    —    |    —    |    ✓     |     ✓      |     ✓     | no import graph                                                       |
+| C++             | `.cc` `.cpp` `.cxx` `.hh` `.hpp` `.hxx` |   ⭐   |   ✓   |    —    |    ✓    |    ✓     |     ✓      |     ✓     |                                                                       |
+| Kotlin          | `.kt` `.kts`                            |   ⭐   |   ✓   |    ✓    |    ✓    |    ✓     |     ✓      |     ✓     |                                                                       |
 | Ruby            | `.rb`                                   |   ⭐   |   ✓   |    —    |    ✓    |    —     |     ✓      |           | no type-refs / import graph                                           |
 | PHP             | `.php`                                  |   🟢   |   ✓   |    ✓    |    ✓    |    ✓     |     ✓      |           |                                                                       |
-| Swift           | `.swift`                                |   🟢   |   ✓   |    ✓    |    ✓    |    ✓     |     ✓      |           |                                                                       |
-| C#              | `.cs`                                   |   🟢   |   ✓   |    ✓    |    ✓    |    ✓     |     ✓      |           |                                                                       |
-| Scala           | `.scala` `.sc`                          |   🟢   |   ✓   |    ✓    |    ✓    |    ✓     |     ✓      |           |                                                                       |
+| Swift           | `.swift`                                |   🟢   |   ✓   |    ✓    |    ✓    |    ✓     |     ✓      |     ✓     |                                                                       |
+| C#              | `.cs`                                   |   🟢   |   ✓   |    ✓    |    ✓    |    ✓     |     ✓      |     ✓     |                                                                       |
+| Scala           | `.scala` `.sc`                          |   🟢   |   ✓   |    ✓    |    ✓    |    ✓     |     ✓      |     ✓     |                                                                       |
 | Dart            | `.dart`                                 |   🟢   |   ✓   |    ✓    |    ✓    |    ✓     |     ✓      |           |                                                                       |
 | Solidity        | `.sol`                                  |   🟢   |   ✓   |    ✓    |    ✓    |    ✓     |     ✓      |           |                                                                       |
 | Lua             | `.lua`                                  |   🟢   |   ✓   |    ✓    |    —    |    —     |     ✓      |           |                                                                       |
@@ -107,6 +107,10 @@ carrying the raw framework marker as written (e.g. `app.get`, `GetMapping`) — 
 unambiguous syntax only; the consumer decides what counts as attack surface. Per-language status is
 the column above (✓ where a detector ships · blank = open contribution); the detector follows the
 same marker-walk pattern as FFI-export detection.
+
+**As of the current extractors:** `Main` ships for Rust, Python, Go, Java, C, C++, Kotlin, Swift,
+C#, and Scala. `HttpRoute` ships only for Rust, Python, Go, and Java (framework marker walks). A
+blank cell means neither ships yet — not that the language is out of scope.
 
 ## Honest limitations
 
