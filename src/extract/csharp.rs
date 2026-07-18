@@ -29,7 +29,7 @@ use super::{
     ExtractCtx, Extractor, MIN_REF_LEN, attach_reference_scopes, collect_call_references,
     definition_bindings, field_text, import_bindings, innermost_scope, make_symbol,
     mark_self_receiver_calls, node_span, node_text, one_line_signature, push_binding,
-    push_import_ref, push_ref, push_scope, push_type_ref, simple_type_name,
+    push_import_ref, push_ref, push_scope, push_type_ref, push_typed_binding, simple_type_name,
 };
 
 /// Tree-sitter query capturing call-callee identifiers.
@@ -835,12 +835,15 @@ fn collect_bindings_dfs(node: &Node, bytes: &[u8], scopes: &[Scope], out: &mut V
                                     if name.len() >= MIN_REF_LEN
                                         && innermost_scope(intro, scopes) != Some(0)
                                     {
-                                        push_binding(
+                                        let type_name =
+                                            local_declarator_type_name(&child, &decl, bytes);
+                                        push_typed_binding(
                                             out,
                                             name.to_owned(),
                                             intro,
                                             BindingKind::Local,
                                             scopes,
+                                            type_name,
                                         );
                                     }
                                     break;
@@ -884,10 +887,43 @@ fn collect_params(params: &Node, bytes: &[u8], scopes: &[Scope], out: &mut Vec<B
             if let Some(name_node) = child.child_by_field_name("name") {
                 let name = node_text(&name_node, bytes);
                 let intro = name_node.start_byte();
-                push_binding(out, name.to_owned(), intro, BindingKind::Param, scopes);
+                let type_name = child
+                    .child_by_field_name("type")
+                    .map(|t| simple_type_name(node_text(&t, bytes), ".").to_owned());
+                push_typed_binding(
+                    out,
+                    name.to_owned(),
+                    intro,
+                    BindingKind::Param,
+                    scopes,
+                    type_name,
+                );
             }
         }
     }
+}
+
+/// The declared/constructed type of a `variable_declarator`, as bare written
+/// text (see [`Binding::type_name`]) — a purely syntactic fact, never guessed.
+///
+/// Prefers the `variable_declaration`'s explicit type annotation (`Repo r = …`);
+/// for an implicitly-typed local (`var y = …`), only trusts a directly-written
+/// constructor initializer (`var y = new Repo();`) and takes its constructed
+/// type. Any other `var` initializer shape (a bare call, a method chain, …)
+/// yields `None` rather than guessing.
+fn local_declarator_type_name(var_decl: &Node, declarator: &Node, bytes: &[u8]) -> Option<String> {
+    let type_node = var_decl.child_by_field_name("type")?;
+    if type_node.kind() != "implicit_type" {
+        return Some(simple_type_name(node_text(&type_node, bytes), ".").to_owned());
+    }
+    let name_id = declarator.child_by_field_name("name").map(|n| n.id());
+    let value_node = declarator
+        .named_children(&mut declarator.walk())
+        .find(|c| Some(c.id()) != name_id)?;
+    (value_node.kind() == "object_creation_expression")
+        .then(|| value_node.child_by_field_name("type"))
+        .flatten()
+        .map(|t| simple_type_name(node_text(&t, bytes), ".").to_owned())
 }
 
 #[cfg(test)]
@@ -1076,6 +1112,57 @@ public class Client {
             Some("obj"),
             "expected qualifier 'obj' on the Foo call ref",
         );
+    }
+
+    #[test]
+    fn typed_local_with_constructor_sets_binding_type_name() {
+        let src = r#"
+class C {
+    void M() { Foo obj = new Foo(); }
+}
+"#;
+        let facts = CSharpExtractor.extract(src, "src/C.cs").unwrap();
+        let obj_binding = facts
+            .bindings
+            .iter()
+            .find(|b| b.kind == BindingKind::Local && b.name == "obj")
+            .expect("expected a Local binding for 'obj'");
+        assert_eq!(obj_binding.type_name.as_deref(), Some("Foo"));
+    }
+
+    #[test]
+    fn param_type_sets_binding_type_name() {
+        let src = r#"
+class C {
+    void M(Foo p) {}
+}
+"#;
+        let facts = CSharpExtractor.extract(src, "src/C.cs").unwrap();
+        let p_binding = facts
+            .bindings
+            .iter()
+            .find(|b| b.kind == BindingKind::Param && b.name == "p")
+            .expect("expected a Param binding for 'p'");
+        assert_eq!(p_binding.type_name.as_deref(), Some("Foo"));
+    }
+
+    #[test]
+    fn var_local_with_non_constructor_initializer_leaves_type_name_none() {
+        // `var y = SomethingElse();` is a call, not a directly-written
+        // constructor — the declared type isn't syntactically knowable, so
+        // fail closed rather than guess.
+        let src = r#"
+class C {
+    void M() { var val = SomethingElse(); }
+}
+"#;
+        let facts = CSharpExtractor.extract(src, "src/C.cs").unwrap();
+        let val_binding = facts
+            .bindings
+            .iter()
+            .find(|b| b.kind == BindingKind::Local && b.name == "val")
+            .expect("expected a Local binding for 'val'");
+        assert_eq!(val_binding.type_name, None);
     }
 
     #[test]

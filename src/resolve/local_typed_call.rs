@@ -287,3 +287,66 @@ mod tests {
         assert_eq!(edges[0].confidence, Confidence::Scoped);
     }
 }
+
+#[cfg(all(test, feature = "csharp"))]
+mod csharp_tests {
+    use super::*;
+    use crate::extract::{CSharpExtractor, Extractor};
+
+    /// `class Repo { public void Save(){} } class C { void Run(){ Repo repo = new Repo(); repo.Save(); } }`
+    /// → exactly one edge, from the enclosing `Run` to `...Repo#Save().`, Scoped/LocalType.
+    ///
+    /// Uses a 4-char receiver name because the C# extractor's binding
+    /// collector applies `MIN_REF_LEN` (3) to local-variable names.
+    #[test]
+    fn resolves_typed_local_method_call_end_to_end() {
+        let facts = CSharpExtractor
+            .extract(
+                "class Repo { public void Save(){} } class C { void Run(){ Repo repo = new Repo(); repo.Save(); } }",
+                "src/C.cs",
+            )
+            .unwrap();
+
+        let graph = LocalTypedCallResolver.resolve(&[facts]).unwrap();
+        let edges: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.provenance == Provenance::LocalType)
+            .collect();
+
+        assert_eq!(
+            edges.len(),
+            1,
+            "expected exactly one LocalType edge, got {:?}",
+            edges
+                .iter()
+                .map(|e| format!("{} -> {}", e.from.to_scip_string(), e.to.to_scip_string()))
+                .collect::<Vec<_>>()
+        );
+        let e = edges[0];
+        assert!(e.to.to_scip_string().ends_with("Repo#Save()."));
+        assert_eq!(e.confidence, Confidence::Scoped);
+        assert_eq!(e.provenance, Provenance::LocalType);
+        assert!(e.from.to_scip_string().ends_with("Run()."));
+    }
+
+    /// The receiver's type has no such member — no edge.
+    #[test]
+    fn wrong_member_yields_no_edge() {
+        let facts = CSharpExtractor
+            .extract(
+                "class Repo { public void Save(){} } class C { void Run(){ Repo repo = new Repo(); repo.Missing(); } }",
+                "src/C.cs",
+            )
+            .unwrap();
+
+        let graph = LocalTypedCallResolver.resolve(&[facts]).unwrap();
+        assert!(
+            graph
+                .edges
+                .iter()
+                .all(|e| e.provenance != Provenance::LocalType),
+            "Repo has no Missing() member — must not emit a LocalType edge"
+        );
+    }
+}
