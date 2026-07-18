@@ -130,6 +130,7 @@ pub(super) fn extract_ecmascript(
         lang,
         bytes,
         &mut references,
+        None,
     )?;
     collect_inheritance(&root, bytes, file, &mut references);
     collect_imports(&root, bytes, file, &mut references, &module_id);

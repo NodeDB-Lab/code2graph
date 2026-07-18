@@ -24,9 +24,9 @@ use crate::symbol::Descriptor;
 
 use super::{
     ExtractCtx, Extractor, MIN_REF_LEN, attach_reference_scopes, collect_call_references,
-    definition_bindings, field_text, import_bindings, innermost_scope, make_symbol, node_span,
-    node_text, one_line_signature, push_binding, push_import_ref, push_ref, push_scope,
-    push_type_ref, simple_type_name,
+    definition_bindings, field_text, import_bindings, innermost_scope, make_symbol,
+    mark_self_receiver_calls, node_span, node_text, one_line_signature, push_binding,
+    push_import_ref, push_ref, push_scope, push_type_ref, simple_type_name,
 };
 
 /// Tree-sitter query capturing call-callee identifiers.
@@ -43,6 +43,16 @@ const CALL_QUERY: &str = r#"
   (call_expression function: (field_expression value: (_) @qualifier field: (identifier) @callee))
   (call_expression function: (generic_function function: (field_expression value: (_) @qualifier field: (identifier) @callee)))
 ]
+"#;
+
+/// Method calls whose receiver is written as the `this` keyword (`this.foo()`).
+///
+/// Scala's `this` parses as a plain `identifier` node (text `"this"`),
+/// structurally indistinguishable from any other value receiver, so this
+/// query captures `@receiver` and [`mark_self_receiver_calls`] applies a text
+/// gate comparing it against the literal `"this"`.
+const SELF_CALL_QUERY: &str = r#"
+(call_expression function: (field_expression value: (identifier) @receiver field: (identifier) @callee))
 "#;
 
 /// Extracts Scala symbols and references.
@@ -90,6 +100,15 @@ impl Extractor for ScalaExtractor {
             Language::Scala,
             bytes,
             file,
+        )?;
+        mark_self_receiver_calls(
+            &root,
+            &ts_language,
+            SELF_CALL_QUERY,
+            Language::Scala,
+            bytes,
+            &mut references,
+            Some("this"),
         )?;
         collect_inheritance(&root, bytes, file, &mut references);
         collect_imports(&root, bytes, file, &mut references, &module_id);
@@ -1038,6 +1057,52 @@ type Id = Int
         let id = by_name(&facts, "Id").unwrap();
         assert_eq!(id.kind, SymbolKind::TypeAlias);
         assert_eq!(id.id.to_scip_string(), "codegraph . . . myapp/Id#");
+    }
+
+    // ── Self-receiver tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn this_receiver_call_marks_self_receiver() {
+        let src = r#"
+class C {
+  def foo(): Unit = {}
+  def run(): Unit = { this.foo() }
+}
+"#;
+        let facts = extract(src, "src/C.scala");
+        let foo_call = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Call && r.name == "foo")
+            .expect("expected a Call reference for 'foo'");
+        assert!(
+            foo_call.self_receiver,
+            "this.foo() should mark self_receiver = true"
+        );
+        assert_eq!(
+            foo_call.qualifier, None,
+            "self-call qualifier must stay None"
+        );
+    }
+
+    #[test]
+    fn non_self_receiver_call_does_not_mark_self_receiver() {
+        let src = r#"
+class C {
+  def foo(): Unit = {}
+  def run(obj: C): Unit = { obj.foo() }
+}
+"#;
+        let facts = extract(src, "src/C.scala");
+        let foo_calls: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Call && r.name == "foo")
+            .collect();
+        assert!(
+            foo_calls.iter().any(|r| !r.self_receiver),
+            "obj.foo() must NOT mark self_receiver, got {foo_calls:?}"
+        );
     }
 
     // ── References ───────────────────────────────────────────────────────────

@@ -115,6 +115,7 @@ impl Extractor for CppExtractor {
             Language::Cpp,
             bytes,
             &mut references,
+            None,
         )?;
         collect_inheritance(&root, bytes, file, &mut references);
         collect_read_references(&root, bytes, file, &mut references);

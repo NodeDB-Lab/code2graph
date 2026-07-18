@@ -33,8 +33,8 @@ use crate::symbol::Descriptor;
 
 use super::{
     ExtractCtx, Extractor, MIN_REF_LEN, attach_reference_scopes, collect_call_references,
-    definition_bindings, field_text, innermost_scope, make_symbol, node_span, node_text,
-    one_line_signature, push_binding, push_ref, push_scope,
+    definition_bindings, field_text, innermost_scope, make_symbol, mark_self_receiver_calls,
+    node_span, node_text, one_line_signature, push_binding, push_ref, push_scope,
 };
 
 /// Tree-sitter query capturing explicit call-callee identifiers.
@@ -50,6 +50,19 @@ const CALL_QUERY: &str = r#"
   (call !receiver method: (identifier) @callee)
   (call receiver: (_) @qualifier method: (identifier) @callee)
 ]
+"#;
+
+/// Method calls whose receiver is the explicit `self` keyword (`self.foo`).
+///
+/// `self` is a dedicated named node in the Ruby grammar, so this match is
+/// purely structural (no text gate needed). Deliberately narrow: only
+/// EXPLICIT `self.foo` receivers are marked. Bare receiver-less calls
+/// (`foo`) are NOT marked here — treating every unqualified call as an
+/// implicit self-call is a broader, riskier semantic choice (it would also
+/// swallow local top-level/free-function calls) and is out of scope for this
+/// pass.
+const SELF_CALL_QUERY: &str = r#"
+(call receiver: (self) method: (identifier) @callee)
 "#;
 
 /// Extracts Ruby symbols and references.
@@ -103,6 +116,15 @@ impl Extractor for RubyExtractor {
 
         let mut references =
             collect_call_references(&root, &ts_language, CALL_QUERY, Language::Ruby, bytes, file)?;
+        mark_self_receiver_calls(
+            &root,
+            &ts_language,
+            SELF_CALL_QUERY,
+            Language::Ruby,
+            bytes,
+            &mut references,
+            None,
+        )?;
         collect_inheritance(&root, bytes, file, &mut references);
         collect_read_references(&root, bytes, file, &mut references);
         collect_write_references(&root, bytes, file, &mut references);
@@ -740,6 +762,58 @@ end
         assert!(
             inherit.is_empty(),
             "expected no Inherit refs, got {inherit:?}"
+        );
+    }
+
+    // ── Self-receiver tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn self_receiver_call_marks_self_receiver() {
+        let src = r#"
+class C
+  def foo
+  end
+  def run
+    self.foo
+  end
+end
+"#;
+        let facts = RubyExtractor.extract(src, "lib/c.rb").unwrap();
+        let foo_call = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Call && r.name == "foo")
+            .expect("expected a Call reference for 'foo'");
+        assert!(
+            foo_call.self_receiver,
+            "self.foo should mark self_receiver = true"
+        );
+        assert_eq!(
+            foo_call.qualifier, None,
+            "self-call qualifier must stay None"
+        );
+    }
+
+    #[test]
+    fn non_self_receiver_call_does_not_mark_self_receiver() {
+        let src = r#"
+class C
+  def foo
+  end
+  def run(obj)
+    obj.foo
+  end
+end
+"#;
+        let facts = RubyExtractor.extract(src, "lib/c.rb").unwrap();
+        let foo_calls: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Call && r.name == "foo")
+            .collect();
+        assert!(
+            foo_calls.iter().any(|r| !r.self_receiver),
+            "obj.foo must NOT mark self_receiver, got {foo_calls:?}"
         );
     }
 

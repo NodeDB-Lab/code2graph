@@ -35,8 +35,8 @@ use crate::symbol::Descriptor;
 use super::{
     ExtractCtx, Extractor, MIN_REF_LEN, attach_reference_scopes, child_text,
     collect_call_references, definition_bindings, field_text, import_bindings, innermost_scope,
-    make_symbol, node_span, node_text, one_line_signature, push_binding, push_ref, push_scope,
-    push_type_ref,
+    make_symbol, mark_self_receiver_calls, node_span, node_text, one_line_signature, push_binding,
+    push_ref, push_scope, push_type_ref,
 };
 
 /// Tree-sitter query capturing call-callee identifiers.
@@ -47,6 +47,17 @@ const CALL_QUERY: &str = r#"
   (member_call_expression
     name: (name) @callee)
 ]
+"#;
+
+/// Method calls whose receiver is written as the `$this` variable
+/// (`$this->foo()`).
+///
+/// PHP's `$this` is a plain `variable_name` node (text `"$this"`), structurally
+/// indistinguishable from any other object-variable receiver, so this query
+/// captures `@receiver` and [`mark_self_receiver_calls`] applies a text gate
+/// comparing it against the literal `"$this"`.
+const SELF_CALL_QUERY: &str = r#"
+(member_call_expression object: (variable_name) @receiver name: (name) @callee)
 "#;
 
 /// Extracts PHP symbols and references.
@@ -93,6 +104,15 @@ impl Extractor for PhpExtractor {
 
         let mut references =
             collect_call_references(&root, &ts_language, CALL_QUERY, Language::Php, bytes, file)?;
+        mark_self_receiver_calls(
+            &root,
+            &ts_language,
+            SELF_CALL_QUERY,
+            Language::Php,
+            bytes,
+            &mut references,
+            Some("$this"),
+        )?;
         collect_inheritance(&root, bytes, file, &mut references);
         collect_imports(&root, bytes, file, &mut references);
         collect_type_references(&root, bytes, file, &mut references);
@@ -1155,6 +1175,52 @@ function run() {
         assert!(
             names.contains(&"process"),
             "expected 'process' in {names:?}"
+        );
+    }
+
+    // ── Self-receiver tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn this_receiver_call_marks_self_receiver() {
+        let src = r#"<?php
+class C {
+    public function foo() {}
+    public function run() { $this->foo(); }
+}
+"#;
+        let facts = PhpExtractor.extract(src, "src/C.php").unwrap();
+        let foo_call = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Call && r.name == "foo")
+            .expect("expected a Call reference for 'foo'");
+        assert!(
+            foo_call.self_receiver,
+            "$this->foo() should mark self_receiver = true"
+        );
+        assert_eq!(
+            foo_call.qualifier, None,
+            "self-call qualifier must stay None"
+        );
+    }
+
+    #[test]
+    fn non_self_receiver_call_does_not_mark_self_receiver() {
+        let src = r#"<?php
+class C {
+    public function foo() {}
+    public function run($o) { $o->foo(); }
+}
+"#;
+        let facts = PhpExtractor.extract(src, "src/C.php").unwrap();
+        let foo_calls: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Call && r.name == "foo")
+            .collect();
+        assert!(
+            foo_calls.iter().any(|r| !r.self_receiver),
+            "$o->foo() must NOT mark self_receiver, got {foo_calls:?}"
         );
     }
 

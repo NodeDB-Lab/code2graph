@@ -334,6 +334,16 @@ pub(crate) fn is_static(node: &Node, bytes: &[u8]) -> bool {
 /// Correlation goes through a `byte -> index` map built once up front (O(n))
 /// rather than a linear scan of `references` per self-call match, which would
 /// be O(self-calls × total references) on a file with many `self.foo()` sites.
+///
+/// `expected_receiver_text` gates the mark by the *text* of an `@receiver`
+/// capture: some grammars parse the receiver keyword as a plain node
+/// indistinguishable from an ordinary receiver (PHP's `$this` is a
+/// `variable_name`; Scala's `this` is an `identifier`), so the query cannot
+/// select it structurally. Pass `Some("$this")` / `Some("this")` there and have
+/// the query capture the receiver node as `@receiver`; only matches whose
+/// `@receiver` text equals the expected string are marked. Pass `None` for
+/// grammars with a dedicated receiver-keyword node (Rust `self`, Ruby `self`,
+/// C++/Swift/…), where the query is already structurally exact.
 pub(crate) fn mark_self_receiver_calls(
     root: &Node,
     ts_lang: &TsLanguage,
@@ -341,6 +351,7 @@ pub(crate) fn mark_self_receiver_calls(
     lang: Language,
     bytes: &[u8],
     references: &mut [Reference],
+    expected_receiver_text: Option<&str>,
 ) -> Result<()> {
     let query = Query::new(ts_lang, self_call_query).map_err(|e| CodegraphError::Query {
         lang: lang.as_str().to_owned(),
@@ -353,6 +364,14 @@ pub(crate) fn mark_self_receiver_calls(
                 lang: lang.as_str().to_owned(),
                 msg: "missing @callee capture".to_owned(),
             })?;
+    let receiver_idx = query.capture_index_for_name("receiver");
+    // A text gate requires the query to actually capture the receiver.
+    if expected_receiver_text.is_some() && receiver_idx.is_none() {
+        return Err(CodegraphError::Query {
+            lang: lang.as_str().to_owned(),
+            msg: "expected_receiver_text set but query has no @receiver capture".to_owned(),
+        });
+    }
     let call_ref_by_byte: std::collections::HashMap<usize, usize> = references
         .iter()
         .enumerate()
@@ -362,6 +381,19 @@ pub(crate) fn mark_self_receiver_calls(
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(&query, *root, bytes);
     while let Some(m) = matches.next() {
+        // When a text gate is set, the `@receiver` node's text must match
+        // exactly, else this match is an ordinary receiver, not the keyword.
+        if let Some(expected) = expected_receiver_text {
+            let receiver_matches = m
+                .captures
+                .iter()
+                .find(|c| Some(c.index) == receiver_idx)
+                .and_then(|c| c.node.utf8_text(bytes).ok())
+                == Some(expected);
+            if !receiver_matches {
+                continue;
+            }
+        }
         for cap in m.captures.iter().filter(|c| c.index == callee_idx) {
             let byte = cap.node.start_byte();
             if let Some(&idx) = call_ref_by_byte.get(&byte) {

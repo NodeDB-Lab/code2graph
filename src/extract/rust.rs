@@ -149,6 +149,7 @@ impl RustExtractor {
             Language::Rust,
             bytes,
             &mut references,
+            None,
         )?;
         collect_inheritance(&root, bytes, file, &mut references);
         collect_module_decl_refs(&root, bytes, file, &mut references);

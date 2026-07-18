@@ -126,6 +126,7 @@ impl Extractor for CSharpExtractor {
             Language::CSharp,
             bytes,
             &mut references,
+            None,
         )?;
         collect_inheritance(&root, bytes, file, &mut references);
         collect_imports(&root, bytes, file, &mut references, &module_id);
