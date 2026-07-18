@@ -757,6 +757,67 @@ mod cpp_tests {
     }
 }
 
+#[cfg(all(test, feature = "go"))]
+mod go_tests {
+    use super::*;
+    use crate::extract::{Extractor, GoExtractor};
+
+    /// `type Repo struct{}; func (r *Repo) Save(){}` + `func run(){ var repo Repo; repo.Save() }`
+    /// → exactly one edge, from `run` to `...Repo#Save().`, Scoped/LocalType. Passes only now
+    /// that Go methods nest under their receiver type (`Repo#Save`).
+    #[test]
+    fn resolves_typed_local_method_call_end_to_end() {
+        let facts = GoExtractor
+            .extract(
+                "package p\n\ntype Repo struct{}\n\nfunc (r *Repo) Save() {}\n\nfunc run() {\n\tvar repo Repo\n\trepo.Save()\n}\n",
+                "src/p.go",
+            )
+            .unwrap();
+
+        let graph = LocalTypedCallResolver.resolve(&[facts]).unwrap();
+        let edges: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.provenance == Provenance::LocalType)
+            .collect();
+
+        assert_eq!(
+            edges.len(),
+            1,
+            "expected exactly one LocalType edge, got {:?}",
+            edges
+                .iter()
+                .map(|e| format!("{} -> {}", e.from.to_scip_string(), e.to.to_scip_string()))
+                .collect::<Vec<_>>()
+        );
+        let e = edges[0];
+        assert!(e.to.to_scip_string().ends_with("Repo#Save()."));
+        assert_eq!(e.confidence, Confidence::Scoped);
+        assert_eq!(e.provenance, Provenance::LocalType);
+        assert!(e.from.to_scip_string().ends_with("run()."));
+    }
+
+    /// The receiver's type has no such member — no edge.
+    #[test]
+    fn wrong_member_yields_no_edge() {
+        let facts = GoExtractor
+            .extract(
+                "package p\n\ntype Repo struct{}\n\nfunc (r *Repo) Save() {}\n\nfunc run() {\n\tvar repo Repo\n\trepo.Missing()\n}\n",
+                "src/p.go",
+            )
+            .unwrap();
+
+        let graph = LocalTypedCallResolver.resolve(&[facts]).unwrap();
+        assert!(
+            graph
+                .edges
+                .iter()
+                .all(|e| e.provenance != Provenance::LocalType),
+            "Repo has no Missing() member — must not emit a LocalType edge"
+        );
+    }
+}
+
 #[cfg(all(test, feature = "scala"))]
 mod scala_tests {
     use super::*;

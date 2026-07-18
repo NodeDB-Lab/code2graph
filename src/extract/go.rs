@@ -277,11 +277,29 @@ fn collect_symbols(
                     continue;
                 };
                 let vis = name_visibility(&name);
+                // Nest the method under its receiver type so it renders as
+                // `pkg/Recv#method().` (SCIP-aligned, consistent with every
+                // other language). `member_of_type` keys members by this
+                // penultimate `Type` descriptor, so this is what lets the
+                // resolvers treat the method as a member of `Recv`. Fail closed:
+                // an anonymous/unreadable receiver type leaves the method at
+                // namespace level (its prior shape), never guessed.
+                let recv_type = child
+                    .child_by_field_name("receiver")
+                    .and_then(|recv| {
+                        recv.named_children(&mut recv.walk())
+                            .find(|c| c.kind() == "parameter_declaration")
+                    })
+                    .and_then(|pd| pd.child_by_field_name("type"))
+                    .and_then(|t| go_type_leaf_name(&t, ctx.bytes));
                 let mut descriptors: Vec<Descriptor> = namespaces
                     .iter()
                     .cloned()
                     .map(Descriptor::Namespace)
                     .collect();
+                if let Some(ty) = recv_type {
+                    descriptors.push(Descriptor::Type(ty));
+                }
                 descriptors.push(Descriptor::Method {
                     name: name.clone(),
                     disambiguator: crate::symbol::MethodDisambiguator::empty(),
@@ -1093,7 +1111,12 @@ func (s *Server) Start() { }
         let facts = GoExtractor.extract(src, "src/run.go").unwrap();
         let start = facts.symbols.iter().find(|s| s.name == "Start").unwrap();
         assert_eq!(start.kind, SymbolKind::Method);
-        assert_eq!(start.id.to_scip_string(), "codegraph . . . run/Start().");
+        // The method nests under its receiver type (`Server#`), SCIP-aligned and
+        // consistent with every other language's `Type#method` identity.
+        assert_eq!(
+            start.id.to_scip_string(),
+            "codegraph . . . run/Server#Start()."
+        );
     }
 
     #[test]
