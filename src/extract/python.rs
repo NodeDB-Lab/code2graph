@@ -25,8 +25,8 @@ use super::emit_embedded_sql_refs;
 use super::{
     BindingRules, ExtractCtx, Extractor, MIN_REF_LEN, attach_reference_scopes,
     collect_call_references, definition_bindings, field_text, import_bindings, make_symbol,
-    mark_self_receiver_calls, member_descriptors, node_span, node_text, one_line_signature,
-    push_binding, push_ref, push_scope, push_type_ref,
+    mark_receiver_qualifier_calls, mark_self_receiver_calls, member_descriptors, node_span,
+    node_text, one_line_signature, push_ref, push_scope, push_type_ref, push_typed_binding,
 };
 
 /// Tree-sitter query capturing call-callee identifiers.
@@ -51,6 +51,20 @@ const CALL_QUERY: &str = r#"
 /// is itself a type member, so a stray local named `self` outside a method never
 /// yields a false edge.
 const SELF_CALL_QUERY: &str = r#"
+(call
+  function: (attribute object: (identifier) @receiver attribute: (identifier) @callee))
+"#;
+
+/// Member calls whose receiver is a bare local/parameter identifier
+/// (`x.foo()`), captured as `@receiver` so [`mark_receiver_qualifier_calls`]
+/// can set the call's `qualifier` for [`crate::resolve::LocalTypedCallResolver`].
+///
+/// Only a bare `(identifier)` object is matched — chained (`a.b.foo()`) and
+/// call (`a().foo()`) receivers are deliberately excluded, since their type is
+/// not a scope-resolvable binding. Structurally this also matches `self.foo()`;
+/// [`mark_self_receiver_calls`] runs AFTER and clears the qualifier it set for
+/// the `self` receiver, so self-calls uniformly carry `qualifier = None`.
+const RECEIVER_CALL_QUERY: &str = r#"
 (call
   function: (attribute object: (identifier) @receiver attribute: (identifier) @callee))
 "#;
@@ -129,6 +143,17 @@ impl PythonExtractor {
             Language::Python,
             bytes,
             file,
+        )?;
+        // General receiver capture MUST run BEFORE the self-mark: it also matches
+        // `self.foo()` (setting qualifier = "self"), and the self-mark that runs
+        // next clears that qualifier for the `self` receiver.
+        mark_receiver_qualifier_calls(
+            &root,
+            &ts_language,
+            RECEIVER_CALL_QUERY,
+            Language::Python,
+            bytes,
+            &mut references,
         )?;
         mark_self_receiver_calls(
             &root,
@@ -1099,7 +1124,15 @@ fn collect_bindings_dfs(node: &Node, bytes: &[u8], scopes: &[Scope], out: &mut V
                 if left.kind() == "identifier" {
                     let intro = left.start_byte();
                     let name = node_text(&left, bytes).to_owned();
-                    push_binding(out, name, intro, BindingKind::Local, scopes);
+                    // An explicit annotation `name: Foo` / `name: Foo = …` (the
+                    // `type:` field) records the declared type. A plain
+                    // `name = Foo()` leaves it `None`: Python is dynamic and PEP8
+                    // capitalization is too weak a signal to infer a constructor
+                    // type, so we fail closed rather than guess.
+                    let type_name = node
+                        .child_by_field_name("type")
+                        .map(|t| super::simple_type_name(node_text(&t, bytes), ".").to_owned());
+                    push_typed_binding(out, name, intro, BindingKind::Local, scopes, type_name);
                 }
             }
             for child in node.children(&mut node.walk()) {
@@ -1130,7 +1163,14 @@ fn collect_params(params: &Node, bytes: &[u8], scopes: &[Scope], out: &mut Vec<B
             if id.kind() == "identifier" {
                 let intro = id.start_byte();
                 let name = node_text(&id, bytes).to_owned();
-                push_binding(out, name, intro, BindingKind::Param, scopes);
+                // Parameter type hints (`def f(x: Foo)`) live on the `type:`
+                // field of `typed_parameter` / `typed_default_parameter`.
+                // Untyped forms (bare identifier, `default_parameter`, splats)
+                // have no `type:` field → `None`.
+                let type_name = child
+                    .child_by_field_name("type")
+                    .map(|t| super::simple_type_name(node_text(&t, bytes), ".").to_owned());
+                push_typed_binding(out, name, intro, BindingKind::Param, scopes, type_name);
             }
         }
     }
@@ -1173,6 +1213,68 @@ mod tests {
             foo_calls.iter().any(|r| !r.self_receiver),
             "obj.foo() must NOT mark self_receiver, got {foo_calls:?}"
         );
+    }
+
+    #[test]
+    fn local_receiver_call_sets_qualifier() {
+        // `obj.foo()` where `obj` is a plain identifier → the callee Call ref
+        // carries `qualifier = Some("obj")` for the local-typed-call resolver.
+        let src = "def run(obj):\n    obj.foo()\n";
+        let facts = PythonExtractor.extract(src, "src/c.py").unwrap();
+        let foo_call = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Call && r.name == "foo")
+            .expect("expected a Call reference for 'foo'");
+        assert_eq!(
+            foo_call.qualifier.as_deref(),
+            Some("obj"),
+            "expected qualifier 'obj' on the foo call ref"
+        );
+        assert!(
+            !foo_call.self_receiver,
+            "obj.foo() must not be marked self_receiver"
+        );
+    }
+
+    #[test]
+    fn param_type_hint_sets_binding_type_name() {
+        // `def f(r: Repo)` → the param binding `r` records type_name Some("Repo").
+        let src = "def f(r: Repo):\n    pass\n";
+        let facts = PythonExtractor.extract(src, "src/c.py").unwrap();
+        let r_binding = facts
+            .bindings
+            .iter()
+            .find(|b| b.kind == BindingKind::Param && b.name == "r")
+            .expect("expected a Param binding for 'r'");
+        assert_eq!(r_binding.type_name.as_deref(), Some("Repo"));
+    }
+
+    #[test]
+    fn annotated_local_sets_binding_type_name() {
+        // `x: Foo = make()` → the local binding `x` records type_name Some("Foo").
+        let src = "def f():\n    x: Foo = make()\n    return x\n";
+        let facts = PythonExtractor.extract(src, "src/c.py").unwrap();
+        let x_binding = facts
+            .bindings
+            .iter()
+            .find(|b| b.kind == BindingKind::Local && b.name == "x")
+            .expect("expected a Local binding for 'x'");
+        assert_eq!(x_binding.type_name.as_deref(), Some("Foo"));
+    }
+
+    #[test]
+    fn bare_constructor_local_leaves_type_name_none() {
+        // `x = Foo()` — no annotation. Python is dynamic; we fail closed rather
+        // than infer a type from PEP8 capitalization.
+        let src = "def f():\n    xyz = Foo()\n    return xyz\n";
+        let facts = PythonExtractor.extract(src, "src/c.py").unwrap();
+        let x_binding = facts
+            .bindings
+            .iter()
+            .find(|b| b.kind == BindingKind::Local && b.name == "xyz")
+            .expect("expected a Local binding for 'xyz'");
+        assert_eq!(x_binding.type_name, None);
     }
 
     #[test]

@@ -35,8 +35,8 @@ use crate::symbol::Descriptor;
 use super::{
     ExtractCtx, Extractor, MIN_REF_LEN, attach_reference_scopes, child_text,
     collect_call_references, definition_bindings, field_text, import_bindings, innermost_scope,
-    make_symbol, mark_self_receiver_calls, node_span, node_text, one_line_signature, push_binding,
-    push_ref, push_scope, push_type_ref,
+    make_symbol, mark_receiver_qualifier_calls, mark_self_receiver_calls, node_span, node_text,
+    one_line_signature, push_binding, push_ref, push_scope, push_type_ref, push_typed_binding,
 };
 
 /// Tree-sitter query capturing call-callee identifiers.
@@ -58,6 +58,20 @@ const CALL_QUERY: &str = r#"
 /// comparing it against the literal `"$this"`.
 const SELF_CALL_QUERY: &str = r#"
 (member_call_expression object: (variable_name) @receiver name: (name) @callee)
+"#;
+
+/// Member calls whose receiver is a bare variable (`$obj->foo()`), captured so
+/// [`mark_receiver_qualifier_calls`] can set the call's `qualifier` for
+/// [`crate::resolve::LocalTypedCallResolver`].
+///
+/// The `@receiver` capture targets the inner `name` node of the `variable_name`
+/// (not the whole `$obj` node), so the qualifier is the bare variable name
+/// (`obj`, no leading `$`) — matching how PHP variable bindings store their
+/// names, which the resolver's `scope_walk` looks up by. Structurally this also
+/// matches `$this->foo()`; [`mark_self_receiver_calls`] runs AFTER and clears
+/// the qualifier it set for the `$this` receiver.
+const RECEIVER_CALL_QUERY: &str = r#"
+(member_call_expression object: (variable_name (name) @receiver) name: (name) @callee)
 "#;
 
 /// Extracts PHP symbols and references.
@@ -104,6 +118,17 @@ impl Extractor for PhpExtractor {
 
         let mut references =
             collect_call_references(&root, &ts_language, CALL_QUERY, Language::Php, bytes, file)?;
+        // General receiver capture MUST run BEFORE the self-mark: it also matches
+        // `$this->foo()` (setting qualifier = "this"), and the self-mark that runs
+        // next clears that qualifier for the `$this` receiver.
+        mark_receiver_qualifier_calls(
+            &root,
+            &ts_language,
+            RECEIVER_CALL_QUERY,
+            Language::Php,
+            bytes,
+            &mut references,
+        )?;
         mark_self_receiver_calls(
             &root,
             &ts_language,
@@ -896,7 +921,14 @@ fn collect_params(params: &Node, bytes: &[u8], scopes: &[Scope], out: &mut Vec<B
                     continue;
                 }
                 let intro = var.start_byte();
-                push_binding(out, name, intro, BindingKind::Param, scopes);
+                // A typed parameter (`function f(Foo $x)`) records its declared
+                // type on the `type:` field. Untyped params leave it `None`.
+                // The leaf name is taken (namespace-stripped); a primitive like
+                // `int` simply matches no class symbol, so it fails closed.
+                let type_name = child
+                    .child_by_field_name("type")
+                    .map(|t| super::simple_type_name(node_text(&t, bytes), "\\").to_owned());
+                push_typed_binding(out, name, intro, BindingKind::Param, scopes, type_name);
             }
             _ => {}
         }
@@ -1222,6 +1254,73 @@ class C {
             foo_calls.iter().any(|r| !r.self_receiver),
             "$o->foo() must NOT mark self_receiver, got {foo_calls:?}"
         );
+    }
+
+    #[test]
+    fn local_receiver_call_sets_bare_qualifier() {
+        // `$obj->foo()` → the callee Call ref carries `qualifier = Some("obj")`
+        // (bare name, no leading `$`) so it matches the param/local binding name
+        // the resolver looks up.
+        let src = r#"<?php
+class C {
+    public function foo() {}
+    public function run($obj) { $obj->foo(); }
+}
+"#;
+        let facts = PhpExtractor.extract(src, "src/C.php").unwrap();
+        let foo_call = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Call && r.name == "foo")
+            .expect("expected a Call reference for 'foo'");
+        assert_eq!(
+            foo_call.qualifier.as_deref(),
+            Some("obj"),
+            "expected bare qualifier 'obj' on the foo call ref"
+        );
+        assert!(
+            !foo_call.self_receiver,
+            "$obj->foo() must not be marked self_receiver"
+        );
+    }
+
+    #[test]
+    fn param_type_sets_binding_type_name() {
+        // `function f(Foo $x) {}` → the param binding `x` records type_name Some("Foo").
+        let src = "<?php\nfunction f(Foo $x) {}\n";
+        let facts = PhpExtractor.extract(src, "src/f.php").unwrap();
+        let x_binding = facts
+            .bindings
+            .iter()
+            .find(|b| b.kind == BindingKind::Param && b.name == "x")
+            .expect("expected a Param binding for 'x'");
+        assert_eq!(x_binding.type_name.as_deref(), Some("Foo"));
+    }
+
+    #[test]
+    fn namespaced_param_type_records_leaf_name() {
+        // `function f(App\Models\User $u) {}` → type_name Some("User") (leaf).
+        let src = "<?php\nfunction f(App\\Models\\User $u) {}\n";
+        let facts = PhpExtractor.extract(src, "src/f.php").unwrap();
+        let u_binding = facts
+            .bindings
+            .iter()
+            .find(|b| b.kind == BindingKind::Param && b.name == "u")
+            .expect("expected a Param binding for 'u'");
+        assert_eq!(u_binding.type_name.as_deref(), Some("User"));
+    }
+
+    #[test]
+    fn untyped_param_leaves_type_name_none() {
+        // `function f($val) {}` → no type → type_name None.
+        let src = "<?php\nfunction f($val) {}\n";
+        let facts = PhpExtractor.extract(src, "src/f.php").unwrap();
+        let v_binding = facts
+            .bindings
+            .iter()
+            .find(|b| b.kind == BindingKind::Param && b.name == "val")
+            .expect("expected a Param binding for 'val'");
+        assert_eq!(v_binding.type_name, None);
     }
 
     // ── Tier-B scope / binding tests ─────────────────────────────────────────

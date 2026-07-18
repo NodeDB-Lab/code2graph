@@ -7,8 +7,9 @@
 //! inference. It reuses two existing facts:
 //!
 //! - [`Reference::qualifier`](crate::graph::types::Reference::qualifier) set to
-//!   the bare receiver identifier for a field-expression call (`x.foo()`),
-//!   populated only for languages/extractors that opt in (Rust today).
+//!   the bare receiver identifier for a member call (`x.foo()`), populated by the
+//!   extractors that capture a receiver (most do — some via their main call
+//!   query, others via a dedicated receiver-capture pass).
 //! - [`Binding::type_name`](crate::graph::types::Binding::type_name) — the
 //!   local/param binding's declared or constructed type, as written text.
 //!
@@ -859,6 +860,118 @@ mod scala_tests {
     fn wrong_member_yields_no_edge() {
         let src = "class Repo { def save(): Unit = {} } class C { def run(): Unit = { val repo: Repo = new Repo(); repo.missing() } }";
         let facts = ScalaExtractor.extract(src, "src/C.scala").unwrap();
+
+        let graph = LocalTypedCallResolver.resolve(&[facts]).unwrap();
+        assert!(
+            graph
+                .edges
+                .iter()
+                .all(|e| e.provenance != Provenance::LocalType),
+            "Repo has no missing() member — must not emit a LocalType edge"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "python"))]
+mod python_tests {
+    use super::*;
+    use crate::extract::{Extractor, PythonExtractor};
+
+    /// A method + a top-level function taking a type-hinted param of that class
+    /// calling the method → exactly one edge to `Repo#save().`, Scoped/LocalType.
+    ///
+    /// Python is dynamic, so this relies on the param type hint (`r: Repo`), not
+    /// constructor inference.
+    #[test]
+    fn resolves_annotated_param_method_call_end_to_end() {
+        let src =
+            "class Repo:\n    def save(self):\n        pass\n\ndef run(r: Repo):\n    r.save()\n";
+        let facts = PythonExtractor.extract(src, "src/c.py").unwrap();
+
+        let graph = LocalTypedCallResolver.resolve(&[facts]).unwrap();
+        let edges: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.provenance == Provenance::LocalType)
+            .collect();
+
+        assert_eq!(
+            edges.len(),
+            1,
+            "expected exactly one LocalType edge, got {:?}",
+            edges
+                .iter()
+                .map(|e| format!("{} -> {}", e.from.to_scip_string(), e.to.to_scip_string()))
+                .collect::<Vec<_>>()
+        );
+        let e = edges[0];
+        assert!(e.to.to_scip_string().ends_with("Repo#save()."));
+        assert_eq!(e.confidence, Confidence::Scoped);
+        assert_eq!(e.provenance, Provenance::LocalType);
+        assert!(e.from.to_scip_string().ends_with("run()."));
+    }
+
+    /// The receiver's type has no such member — no edge.
+    #[test]
+    fn wrong_member_yields_no_edge() {
+        let src = "class Repo:\n    def save(self):\n        pass\n\ndef run(r: Repo):\n    r.missing()\n";
+        let facts = PythonExtractor.extract(src, "src/c.py").unwrap();
+
+        let graph = LocalTypedCallResolver.resolve(&[facts]).unwrap();
+        assert!(
+            graph
+                .edges
+                .iter()
+                .all(|e| e.provenance != Provenance::LocalType),
+            "Repo has no missing() member — must not emit a LocalType edge"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "php"))]
+mod php_tests {
+    use super::*;
+    use crate::extract::{Extractor, PhpExtractor};
+
+    /// A method + a function taking a typed param of that class calling the
+    /// method → exactly one edge to `Repo#save().`, Scoped/LocalType.
+    ///
+    /// Relies on the PHP parameter type (`Repo $r`); the receiver qualifier is
+    /// normalized to the bare variable name (`r`, no `$`) so it matches the
+    /// param binding's name.
+    #[test]
+    fn resolves_typed_param_method_call_end_to_end() {
+        let src = "<?php class Repo { function save(){} } function run(Repo $r){ $r->save(); }";
+        let facts = PhpExtractor.extract(src, "src/c.php").unwrap();
+
+        let graph = LocalTypedCallResolver.resolve(&[facts]).unwrap();
+        let edges: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.provenance == Provenance::LocalType)
+            .collect();
+
+        assert_eq!(
+            edges.len(),
+            1,
+            "expected exactly one LocalType edge, got {:?}",
+            edges
+                .iter()
+                .map(|e| format!("{} -> {}", e.from.to_scip_string(), e.to.to_scip_string()))
+                .collect::<Vec<_>>()
+        );
+        let e = edges[0];
+        assert!(e.to.to_scip_string().ends_with("Repo#save()."));
+        assert_eq!(e.confidence, Confidence::Scoped);
+        assert_eq!(e.provenance, Provenance::LocalType);
+        assert!(e.from.to_scip_string().ends_with("run()."));
+    }
+
+    /// The receiver's type has no such member — no edge.
+    #[test]
+    fn wrong_member_yields_no_edge() {
+        let src = "<?php class Repo { function save(){} } function run(Repo $r){ $r->missing(); }";
+        let facts = PhpExtractor.extract(src, "src/c.php").unwrap();
 
         let graph = LocalTypedCallResolver.resolve(&[facts]).unwrap();
         assert!(
