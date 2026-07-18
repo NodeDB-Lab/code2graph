@@ -35,8 +35,9 @@ use crate::symbol::Descriptor;
 use super::{
     ExtractCtx, Extractor, MIN_REF_LEN, attach_reference_scopes, collect_call_references,
     definition_bindings, field_text, import_bindings, innermost_scope, make_symbol,
-    mark_self_receiver_calls, node_span, node_text, one_line_signature, push_binding, push_ref,
-    push_scope, push_type_ref,
+    mark_receiver_qualifier_calls, mark_self_receiver_calls, node_span, node_text,
+    one_line_signature, push_binding, push_ref, push_scope, push_type_ref, push_typed_binding,
+    simple_type_name,
 };
 
 /// Tree-sitter query capturing call-callee identifiers.
@@ -66,6 +67,23 @@ const SELF_CALL_QUERY: &str = r#"
 (call_expression
   (navigation_expression
     target: (self_expression)
+    suffix: (navigation_suffix suffix: (simple_identifier) @callee)))
+"#;
+
+/// Method calls whose receiver is written as a bare local identifier
+/// (`x.foo()`), captured to populate [`Reference::qualifier`] with the
+/// receiver's name — the fact [`crate::resolve::LocalTypedCallResolver`] needs
+/// to map the receiver to its binding's declared type.
+///
+/// Mirrors [`SELF_CALL_QUERY`] with the `self_expression` target swapped for a
+/// bare `(simple_identifier) @receiver`, which structurally excludes both the
+/// `self` keyword and any chained/complex receiver (`a.b.foo()`, where the
+/// target is itself a `navigation_expression`). Correlated back to
+/// [`CALL_QUERY`]'s output by the callee `simple_identifier`'s byte offset.
+const RECEIVER_CALL_QUERY: &str = r#"
+(call_expression
+  (navigation_expression
+    target: (simple_identifier) @receiver
     suffix: (navigation_suffix suffix: (simple_identifier) @callee)))
 "#;
 
@@ -132,6 +150,14 @@ impl Extractor for SwiftExtractor {
             bytes,
             &mut references,
             None,
+        )?;
+        mark_receiver_qualifier_calls(
+            &root,
+            &ts_language,
+            RECEIVER_CALL_QUERY,
+            Language::Swift,
+            bytes,
+            &mut references,
         )?;
         collect_inheritance(&root, bytes, file, &mut references);
         collect_imports(&root, bytes, file, &mut references);
@@ -1019,6 +1045,21 @@ fn collect_bindings(root: &Node, bytes: &[u8], scopes: &[Scope]) -> Vec<Binding>
     out
 }
 
+/// The declared type of a Swift `property_declaration`, as bare written text
+/// (see [`Binding::type_name`]) — a purely syntactic fact, never guessed.
+///
+/// Reads only an explicit `type_annotation` child (`let x: Foo = …`). A Swift
+/// constructor call (`let x = Foo()`) is syntactically indistinguishable from
+/// any other function call, so an un-annotated `let`/`var` yields `None` rather
+/// than guessing that the callee is a type.
+fn swift_property_type_name(node: &Node, bytes: &[u8]) -> Option<String> {
+    let annotation = node
+        .children(&mut node.walk())
+        .find(|c| c.kind() == "type_annotation")?;
+    let type_node = annotation.child_by_field_name("type")?;
+    Some(simple_type_name(node_text(&type_node, bytes), ".").to_owned())
+}
+
 fn collect_bindings_dfs(node: &Node, bytes: &[u8], scopes: &[Scope], out: &mut Vec<Binding>) {
     match node.kind() {
         "function_declaration" | "init_declaration" => {
@@ -1079,7 +1120,15 @@ fn collect_bindings_dfs(node: &Node, bytes: &[u8], scopes: &[Scope], out: &mut V
                     let sid = innermost_scope(intro, scopes).unwrap_or(0);
                     if matches!(scopes[sid].kind, ScopeKind::Function | ScopeKind::Block) {
                         let name = node_text(&bi, bytes);
-                        push_binding(out, name.to_owned(), intro, BindingKind::Local, scopes);
+                        let type_name = swift_property_type_name(node, bytes);
+                        push_typed_binding(
+                            out,
+                            name.to_owned(),
+                            intro,
+                            BindingKind::Local,
+                            scopes,
+                            type_name,
+                        );
                     }
                 }
             }
@@ -1145,7 +1194,17 @@ fn collect_params_dfs(
             if name_node.kind() == "simple_identifier" {
                 let name = node_text(&name_node, bytes);
                 let intro = name_node.start_byte();
-                push_binding(out, name.to_owned(), intro, BindingKind::Param, scopes);
+                let type_name = node
+                    .child_by_field_name("type")
+                    .map(|t| simple_type_name(node_text(&t, bytes), ".").to_owned());
+                push_typed_binding(
+                    out,
+                    name.to_owned(),
+                    intro,
+                    BindingKind::Param,
+                    scopes,
+                    type_name,
+                );
             }
         }
         // No need to recurse into a parameter node's children.
@@ -2116,5 +2175,54 @@ public class Service {
         let fileprivate_op =
             by_name(&facts, "fileprivateOp").expect("fileprivateOp must be emitted");
         assert_eq!(fileprivate_op.visibility, Visibility::Private);
+    }
+
+    // ── Local-typed-call facts: receiver qualifier + binding type_name ───────
+
+    #[test]
+    fn bare_receiver_call_sets_qualifier() {
+        // `repo.save()` on a local — the `save` Call ref carries qualifier `repo`.
+        let src = "class C {\n    func run() {\n        let repo: Repo = Repo()\n        repo.save()\n    }\n}\n";
+        let facts = extract(src, "Sources/C.swift");
+        let r = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Call && r.name == "save")
+            .expect("expected a Call ref for 'save'");
+        assert_eq!(r.qualifier.as_deref(), Some("repo"));
+        assert!(!r.self_receiver);
+    }
+
+    #[test]
+    fn self_call_unaffected_by_receiver_query() {
+        // `self.save()` — still marked self_receiver, qualifier stays None.
+        let src =
+            "class C {\n    func save() {}\n    func run() {\n        self.save()\n    }\n}\n";
+        let facts = extract(src, "Sources/C.swift");
+        let r = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Call && r.name == "save")
+            .expect("expected a Call ref for 'save'");
+        assert!(r.self_receiver, "self.save() should stay self_receiver");
+        assert_eq!(r.qualifier, None);
+    }
+
+    #[test]
+    fn annotated_local_and_param_set_binding_type_name() {
+        // Annotated local `let x: Foo` and param `p: Baz` carry their types;
+        // an un-annotated `let y = Bar()` stays None (no constructor guessing).
+        let src = "class C {\n    func run(p: Baz) {\n        let x: Foo = Foo()\n        let y = Bar()\n        x.a()\n        y.b()\n        p.c()\n    }\n}\n";
+        let facts = extract(src, "Sources/C.swift");
+        let ty = |n: &str| {
+            facts
+                .bindings
+                .iter()
+                .find(|b| b.name == n)
+                .and_then(|b| b.type_name.clone())
+        };
+        assert_eq!(ty("x").as_deref(), Some("Foo"), "annotated local type");
+        assert_eq!(ty("p").as_deref(), Some("Baz"), "param type");
+        assert_eq!(ty("y"), None, "un-annotated let must not guess a type");
     }
 }

@@ -30,7 +30,7 @@ use super::{
     ExtractCtx, Extractor, MIN_REF_LEN, attach_reference_scopes, child_text,
     collect_call_references, definition_bindings, field_text, import_bindings, innermost_scope,
     make_symbol, node_span, node_text, one_line_signature, push_binding, push_ref, push_scope,
-    push_type_ref, simple_type_name,
+    push_type_ref, push_typed_binding, simple_type_name,
 };
 
 /// Tree-sitter query capturing call-callee identifiers.
@@ -786,12 +786,21 @@ fn collect_bindings_dfs(node: &Node, bytes: &[u8], scopes: &[Scope], out: &mut V
             }
         }
         "short_var_declaration" => {
-            // LHS is the `left` field — an `expression_list`.
+            // LHS is the `left` field — an `expression_list`; RHS is `right`.
+            // A composite literal on the RHS (`x := Foo{}`) names the local's
+            // type; align LHS/RHS by position so `a, b := Foo{}, Bar{}` works.
             if let Some(left) = node.child_by_field_name("left") {
+                let rights: Vec<Node> = node
+                    .child_by_field_name("right")
+                    .map(|r| r.named_children(&mut r.walk()).collect())
+                    .unwrap_or_default();
+                let mut pos = 0usize;
                 for ident in left.children(&mut left.walk()) {
                     if ident.kind() != "identifier" {
                         continue;
                     }
+                    let idx = pos;
+                    pos += 1;
                     let name = node_text(&ident, bytes);
                     if name == "_" {
                         continue;
@@ -800,7 +809,17 @@ fn collect_bindings_dfs(node: &Node, bytes: &[u8], scopes: &[Scope], out: &mut V
                     // Always inside a function — no root-scope guard needed,
                     // but apply it defensively anyway.
                     if innermost_scope(intro, scopes) != Some(0) {
-                        push_binding(out, name.to_owned(), intro, BindingKind::Local, scopes);
+                        let type_name = rights
+                            .get(idx)
+                            .and_then(|r| go_composite_type_name(r, bytes));
+                        push_typed_binding(
+                            out,
+                            name.to_owned(),
+                            intro,
+                            BindingKind::Local,
+                            scopes,
+                            type_name,
+                        );
                     }
                 }
             }
@@ -811,13 +830,37 @@ fn collect_bindings_dfs(node: &Node, bytes: &[u8], scopes: &[Scope], out: &mut V
         "var_spec" => {
             // Single pass: emit Local bindings for identifier children and recurse.
             // Skip `_` and top-level (scope 0, already a Definition binding).
+            // An explicit `type` (`var x Foo`) applies to every name; otherwise a
+            // composite-literal value (`var x = Foo{}`) is aligned by position.
+            let decl_type = node
+                .child_by_field_name("type")
+                .and_then(|t| go_type_leaf_name(&t, bytes));
+            let values: Vec<Node> = node
+                .child_by_field_name("value")
+                .map(|v| v.named_children(&mut v.walk()).collect())
+                .unwrap_or_default();
+            let mut pos = 0usize;
             for child in node.children(&mut node.walk()) {
                 if child.kind() == "identifier" {
+                    let idx = pos;
+                    pos += 1;
                     let name = node_text(&child, bytes);
                     if name != "_" {
                         let intro = child.start_byte();
                         if innermost_scope(intro, scopes) != Some(0) {
-                            push_binding(out, name.to_owned(), intro, BindingKind::Local, scopes);
+                            let type_name = decl_type.clone().or_else(|| {
+                                values
+                                    .get(idx)
+                                    .and_then(|v| go_composite_type_name(v, bytes))
+                            });
+                            push_typed_binding(
+                                out,
+                                name.to_owned(),
+                                intro,
+                                BindingKind::Local,
+                                scopes,
+                                type_name,
+                            );
                         }
                     }
                 } else {
@@ -881,6 +924,11 @@ fn collect_params(params: &Node, bytes: &[u8], scopes: &[Scope], out: &mut Vec<B
             child.kind(),
             "parameter_declaration" | "variadic_parameter_declaration"
         ) {
+            // The `type:` field is shared by every name in one declaration
+            // (`a, b int`); `*Server` unwraps to `Server`, primitives stay None.
+            let type_name = child
+                .child_by_field_name("type")
+                .and_then(|t| go_type_leaf_name(&t, bytes));
             for ident in child.children(&mut child.walk()) {
                 if ident.kind() != "identifier" {
                     continue;
@@ -890,10 +938,52 @@ fn collect_params(params: &Node, bytes: &[u8], scopes: &[Scope], out: &mut Vec<B
                     continue;
                 }
                 let intro = ident.start_byte();
-                push_binding(out, name.to_owned(), intro, BindingKind::Param, scopes);
+                push_typed_binding(
+                    out,
+                    name.to_owned(),
+                    intro,
+                    BindingKind::Param,
+                    scopes,
+                    type_name.clone(),
+                );
             }
         }
     }
+}
+
+/// The leaf type name of a Go type node, as bare written text (see
+/// [`Binding::type_name`]) — a purely syntactic fact, never guessed.
+///
+/// Unwraps pointers (`*Foo` → `Foo`), takes the leaf of a qualified type
+/// (`pkg.Foo` → `Foo`) and the base of a generic instantiation (`Foo[T]` →
+/// `Foo`). Builtin/primitive `type_identifier`s (`int`, `string`, …) are
+/// returned verbatim but harmlessly resolve to no definition. Anonymous
+/// composite types (structs, interfaces, maps, slices, funcs) yield `None`.
+fn go_type_leaf_name(node: &Node, bytes: &[u8]) -> Option<String> {
+    match node.kind() {
+        "type_identifier" => Some(node_text(node, bytes).to_owned()),
+        "qualified_type" => node
+            .child_by_field_name("name")
+            .and_then(|n| go_type_leaf_name(&n, bytes)),
+        "pointer_type" => node
+            .named_children(&mut node.walk())
+            .find_map(|c| go_type_leaf_name(&c, bytes)),
+        "generic_type" => node
+            .child_by_field_name("type")
+            .and_then(|t| go_type_leaf_name(&t, bytes)),
+        _ => None,
+    }
+}
+
+/// The constructed type of a composite-literal initializer (`Foo{}` → `Foo`),
+/// used to type a `:=` / `var` local. Any other expression shape (a call, a
+/// literal, an identifier) yields `None` rather than guessing.
+fn go_composite_type_name(expr: &Node, bytes: &[u8]) -> Option<String> {
+    if expr.kind() != "composite_literal" {
+        return None;
+    }
+    expr.child_by_field_name("type")
+        .and_then(|t| go_type_leaf_name(&t, bytes))
 }
 
 /// Map a Go identifier to its [`Visibility`].
@@ -1742,5 +1832,31 @@ func main() {
             "func main in non-main package must have no entry points; got {:?}",
             sym.entry_points
         );
+    }
+
+    // ── Local-typed-call facts: binding type_name ────────────────────────────
+    //
+    // The selector-call receiver is already captured as `qualifier` by
+    // `CALL_QUERY` (see `selector_call_captures_package_qualifier`), so Go needs
+    // no receiver query — only these declared/constructed-type facts.
+
+    #[test]
+    fn typed_bindings_carry_type_name() {
+        // Param `c Config`, pointer receiver `s *Server`, composite locals
+        // `x := Foo{}` and `var y Bar`, and an inferred `z := g()` (None).
+        let src = "package p\ntype Foo struct{}\ntype Bar struct{}\nfunc g() int { return 0 }\nfunc (s *Server) run(c Config) {\n\tx := Foo{}\n\tvar y Bar\n\tz := g()\n\t_ = x\n\t_ = y\n\t_ = z\n}\n";
+        let facts = GoExtractor.extract(src, "src/p.go").unwrap();
+        let ty = |n: &str| {
+            facts
+                .bindings
+                .iter()
+                .find(|b| b.name == n)
+                .and_then(|b| b.type_name.clone())
+        };
+        assert_eq!(ty("c").as_deref(), Some("Config"), "param type");
+        assert_eq!(ty("s").as_deref(), Some("Server"), "pointer receiver type");
+        assert_eq!(ty("x").as_deref(), Some("Foo"), "composite literal local");
+        assert_eq!(ty("y").as_deref(), Some("Bar"), "var-typed local");
+        assert_eq!(ty("z"), None, "call-inferred local must not guess a type");
     }
 }

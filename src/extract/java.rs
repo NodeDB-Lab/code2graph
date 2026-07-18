@@ -25,8 +25,9 @@ use crate::symbol::Descriptor;
 use super::{
     ExtractCtx, Extractor, MIN_REF_LEN, attach_reference_scopes, collect_call_references,
     definition_bindings, field_text, import_bindings, innermost_scope, make_symbol,
-    mark_self_receiver_calls, member_descriptors, node_span, node_text, one_line_signature,
-    push_binding, push_ref, push_scope, push_type_ref, simple_type_name,
+    mark_receiver_qualifier_calls, mark_self_receiver_calls, member_descriptors, node_span,
+    node_text, one_line_signature, push_binding, push_ref, push_scope, push_type_ref,
+    push_typed_binding, simple_type_name,
 };
 
 /// Tree-sitter query capturing call-callee identifiers.
@@ -49,6 +50,23 @@ const CALL_QUERY: &str = r#"
 const SELF_CALL_QUERY: &str = r#"
 (method_invocation
   object: (this)
+  name: (identifier) @callee)
+"#;
+
+/// Method calls whose receiver is written as a bare local identifier
+/// (`x.foo()`), captured to populate [`Reference::qualifier`] with the
+/// receiver's name — the fact [`crate::resolve::LocalTypedCallResolver`] needs
+/// to map the receiver to its binding's declared type.
+///
+/// Deliberately a *separate* query from [`CALL_QUERY`], mirroring
+/// [`SELF_CALL_QUERY`]: `object: (identifier)` structurally excludes the `this`
+/// keyword (a distinct `(this)` node kind) and any non-identifier receiver
+/// (method chains `a().foo()`, nested field access `a.b.foo()`), so only a bare
+/// local/param name is ever captured. Correlated back to [`CALL_QUERY`]'s output
+/// by the `name` identifier's byte offset (identical node in both queries).
+const RECEIVER_CALL_QUERY: &str = r#"
+(method_invocation
+  object: (identifier) @receiver
   name: (identifier) @callee)
 "#;
 
@@ -196,6 +214,14 @@ impl Extractor for JavaExtractor {
             bytes,
             &mut references,
             None,
+        )?;
+        mark_receiver_qualifier_calls(
+            &root,
+            &ts_language,
+            RECEIVER_CALL_QUERY,
+            Language::Java,
+            bytes,
+            &mut references,
         )?;
         collect_inheritance(&root, bytes, file, &mut references);
         collect_imports(&root, bytes, file, &mut references, &module_id);
@@ -1045,7 +1071,15 @@ fn collect_bindings_dfs(node: &Node, bytes: &[u8], scopes: &[Scope], out: &mut V
                     // local_variable_declarations inside a method body will never
                     // be at scope 0 unless the parser emits something unusual.
                     if innermost_scope(intro, scopes) != Some(0) {
-                        push_binding(out, name.to_owned(), intro, BindingKind::Local, scopes);
+                        let type_name = java_local_type_name(node, &declarator, bytes);
+                        push_typed_binding(
+                            out,
+                            name.to_owned(),
+                            intro,
+                            BindingKind::Local,
+                            scopes,
+                            type_name,
+                        );
                     }
                 }
             }
@@ -1096,7 +1130,17 @@ fn collect_params(params: &Node, bytes: &[u8], scopes: &[Scope], out: &mut Vec<B
                 if let Some(name_node) = child.child_by_field_name("name") {
                     let name = node_text(&name_node, bytes);
                     let intro = name_node.start_byte();
-                    push_binding(out, name.to_owned(), intro, BindingKind::Param, scopes);
+                    let type_name = child
+                        .child_by_field_name("type")
+                        .map(|t| simple_type_name(node_text(&t, bytes), ".").to_owned());
+                    push_typed_binding(
+                        out,
+                        name.to_owned(),
+                        intro,
+                        BindingKind::Param,
+                        scopes,
+                        type_name,
+                    );
                 }
             }
             "spread_parameter" => {
@@ -1115,6 +1159,35 @@ fn collect_params(params: &Node, bytes: &[u8], scopes: &[Scope], out: &mut Vec<B
             _ => {}
         }
     }
+}
+
+/// The declared/constructed type of a Java `local_variable_declaration`
+/// declarator, as bare written text (see [`Binding::type_name`]) — a purely
+/// syntactic fact, never guessed.
+///
+/// Prefers the declaration's explicit `type:` field (`Foo x = …`). An implicit
+/// `var` local (whose `type:` field is the `type_identifier` `var`) is not a
+/// declared type, so it falls back to a directly-written `new Foo()`
+/// initializer and takes its constructed type. Primitive/array/other type
+/// shapes and any non-constructor initializer yield `None`.
+fn java_local_type_name(decl: &Node, declarator: &Node, bytes: &[u8]) -> Option<String> {
+    if let Some(type_node) = decl.child_by_field_name("type") {
+        match type_node.kind() {
+            // `var x = …` — reserved-type inference marker, not a real type.
+            "type_identifier" if node_text(&type_node, bytes) == "var" => {}
+            "type_identifier" | "scoped_type_identifier" | "generic_type" => {
+                return Some(simple_type_name(node_text(&type_node, bytes), ".").to_owned());
+            }
+            // Primitives, `void`, arrays, … — never a user type.
+            _ => {}
+        }
+    }
+    // Implicit `var` → trust only a directly-written `new Foo()` constructor.
+    let value = declarator.child_by_field_name("value")?;
+    (value.kind() == "object_creation_expression")
+        .then(|| value.child_by_field_name("type"))
+        .flatten()
+        .map(|t| simple_type_name(node_text(&t, bytes), ".").to_owned())
 }
 
 #[cfg(test)]
@@ -2218,5 +2291,48 @@ public class C {
             !r.self_receiver,
             "x.foo() must not have self_receiver == true"
         );
+    }
+
+    // ── Local-typed-call facts: receiver qualifier + binding type_name ───────
+
+    #[test]
+    fn bare_receiver_call_sets_qualifier() {
+        // `repo.save()` on a local — the `save` Call ref carries qualifier `repo`.
+        let src = "class C { void run() { Repo repo = new Repo(); repo.save(); } }";
+        let facts = JavaExtractor.extract(src, "src/C.java").unwrap();
+        let r = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Call && r.name == "save")
+            .expect("expected a Call ref for 'save'");
+        assert_eq!(r.qualifier.as_deref(), Some("repo"));
+        assert!(!r.self_receiver);
+    }
+
+    #[test]
+    fn typed_local_and_param_set_binding_type_name() {
+        // Declared local `Foo x`, constructor `var y = new Bar()`, and param `Baz p`.
+        let src =
+            "class C { void run(Baz p) { Foo x = null; var y = new Bar(); x.a(); y.b(); p.c(); } }";
+        let facts = JavaExtractor.extract(src, "src/C.java").unwrap();
+        let ty = |n: &str| {
+            facts
+                .bindings
+                .iter()
+                .find(|b| b.name == n)
+                .and_then(|b| b.type_name.clone())
+        };
+        assert_eq!(ty("x").as_deref(), Some("Foo"), "declared local type");
+        assert_eq!(ty("y").as_deref(), Some("Bar"), "var + new Bar() type");
+        assert_eq!(ty("p").as_deref(), Some("Baz"), "param type");
+    }
+
+    #[test]
+    fn primitive_local_has_no_type_name() {
+        // `int n = 1;` — a primitive is not a user type; type_name must be None.
+        let src = "class C { void run() { int n = 1; } }";
+        let facts = JavaExtractor.extract(src, "src/C.java").unwrap();
+        let n = facts.bindings.iter().find(|b| b.name == "n").unwrap();
+        assert_eq!(n.type_name, None);
     }
 }

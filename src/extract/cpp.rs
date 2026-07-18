@@ -28,8 +28,8 @@ use crate::symbol::Descriptor;
 use super::{
     ExtractCtx, Extractor, MIN_REF_LEN, attach_reference_scopes, collect_call_references,
     definition_bindings, field_text, innermost_scope, is_static, make_symbol,
-    mark_self_receiver_calls, node_span, node_text, one_line_signature, push_binding, push_ref,
-    push_scope, push_type_ref,
+    mark_receiver_qualifier_calls, mark_self_receiver_calls, node_span, node_text,
+    one_line_signature, push_binding, push_ref, push_scope, push_type_ref, push_typed_binding,
 };
 
 // NOTE: SymbolKind has no Union variant; unions map to Struct. Preprocessor
@@ -62,6 +62,24 @@ const SELF_CALL_QUERY: &str = r#"
 (call_expression
   function: (field_expression
     argument: (this)
+    field: (field_identifier) @callee))
+"#;
+
+/// Method calls whose receiver is written as a bare local identifier — both the
+/// dot form (`x.foo()`) and the arrow form (`x->foo()`), which the C++ grammar
+/// parses as the same `field_expression` node kind — captured to populate
+/// [`Reference::qualifier`] with the receiver's name for
+/// [`crate::resolve::LocalTypedCallResolver`].
+///
+/// Mirrors [`SELF_CALL_QUERY`] with `argument: (this)` swapped for a bare
+/// `(identifier) @receiver`, which structurally excludes the `this` keyword (a
+/// distinct `(this)` node kind) and any chained/complex receiver (`a.b.foo()`,
+/// whose argument is itself a `field_expression`). Correlated back to
+/// [`CALL_QUERY`]'s output by the callee `field_identifier`'s byte offset.
+const RECEIVER_CALL_QUERY: &str = r#"
+(call_expression
+  function: (field_expression
+    argument: (identifier) @receiver
     field: (field_identifier) @callee))
 "#;
 
@@ -116,6 +134,14 @@ impl Extractor for CppExtractor {
             bytes,
             &mut references,
             None,
+        )?;
+        mark_receiver_qualifier_calls(
+            &root,
+            &ts_language,
+            RECEIVER_CALL_QUERY,
+            Language::Cpp,
+            bytes,
+            &mut references,
         )?;
         collect_inheritance(&root, bytes, file, &mut references);
         collect_read_references(&root, bytes, file, &mut references);
@@ -754,6 +780,11 @@ fn collect_bindings_dfs(node: &Node, bytes: &[u8], scopes: &[Scope], out: &mut V
         "declaration" => {
             // Emit Local bindings only when the innermost scope is Function or Block.
             // This prevents namespace-level globals and class members from becoming Locals.
+            // The declared type is shared by every declarator in one `declaration`
+            // (`Foo a, b;`); `auto`/primitive specifiers yield None (never guessed).
+            let decl_type = node
+                .child_by_field_name("type")
+                .and_then(|t| type_leaf_name(&t, bytes));
             let mut cursor = node.walk();
             for (i, child) in node.children(&mut cursor).enumerate() {
                 if node.field_name_for_child(i as u32) == Some("declarator") {
@@ -761,7 +792,14 @@ fn collect_bindings_dfs(node: &Node, bytes: &[u8], scopes: &[Scope], out: &mut V
                         let intro = child.start_byte();
                         if let Some(sid) = innermost_scope(intro, scopes) {
                             if matches!(scopes[sid].kind, ScopeKind::Function | ScopeKind::Block) {
-                                push_binding(out, name, intro, BindingKind::Local, scopes);
+                                push_typed_binding(
+                                    out,
+                                    name,
+                                    intro,
+                                    BindingKind::Local,
+                                    scopes,
+                                    decl_type.clone(),
+                                );
                             }
                         }
                     }
@@ -818,8 +856,13 @@ fn collect_params(params: &Node, bytes: &[u8], scopes: &[Scope], out: &mut Vec<B
             continue;
         };
         let intro = decl.start_byte();
+        // The `type:` field holds the declared type; `&`/`*` live in the
+        // declarator, so `Foo& x` still yields `Foo`. `auto`/primitives → None.
+        let type_name = child
+            .child_by_field_name("type")
+            .and_then(|t| type_leaf_name(&t, bytes));
         // Parameters are always inside a function scope — no kind guard needed.
-        push_binding(out, name, intro, BindingKind::Param, scopes);
+        push_typed_binding(out, name, intro, BindingKind::Param, scopes, type_name);
     }
 }
 
@@ -1974,5 +2017,67 @@ private:
         assert_eq!(draw.visibility, Visibility::Protected);
         let impl_m = by_name(&facts, "impl").expect("impl must emit");
         assert_eq!(impl_m.visibility, Visibility::Private);
+    }
+
+    // ── Local-typed-call facts: receiver qualifier + binding type_name ───────
+
+    #[test]
+    fn receiver_qualifier_dot_call_sets_qualifier() {
+        // `repo.save()` on a local — the `save` Call ref carries qualifier `repo`.
+        let src = "void run(){ Repo repo; repo.save(); }";
+        let facts = CppExtractor.extract(src, "src/c.cpp").unwrap();
+        let r = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Call && r.name == "save")
+            .expect("expected a Call ref for 'save'");
+        assert_eq!(r.qualifier.as_deref(), Some("repo"));
+        assert!(!r.self_receiver);
+    }
+
+    #[test]
+    fn receiver_qualifier_arrow_call_sets_qualifier() {
+        // `repo->save()` on a pointer local — same `field_expression` node kind,
+        // so the receiver query captures `repo` for the arrow form too.
+        let src = "void run(Repo* repo){ repo->save(); }";
+        let facts = CppExtractor.extract(src, "src/c.cpp").unwrap();
+        let r = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Call && r.name == "save")
+            .expect("expected a Call ref for 'save'");
+        assert_eq!(r.qualifier.as_deref(), Some("repo"));
+    }
+
+    #[test]
+    fn this_arrow_call_unaffected_by_receiver_query() {
+        // `this->save()` — still marked self_receiver, qualifier stays None.
+        let src = "struct C { void save(); void run(){ this->save(); } };";
+        let facts = CppExtractor.extract(src, "src/c.cpp").unwrap();
+        let r = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Call && r.name == "save")
+            .expect("expected a Call ref for 'save'");
+        assert!(r.self_receiver, "this->save() should stay self_receiver");
+        assert_eq!(r.qualifier, None);
+    }
+
+    #[test]
+    fn typed_local_and_param_set_binding_type_name() {
+        // Local `Foo x;` and param `Baz p` carry their types; `auto a = …`
+        // stays None (an inferred type is never guessed).
+        let src = "void run(Baz p){ Foo x; auto a = 1; x.f(); a.g(); p.h(); }";
+        let facts = CppExtractor.extract(src, "src/c.cpp").unwrap();
+        let ty = |n: &str| {
+            facts
+                .bindings
+                .iter()
+                .find(|b| b.name == n)
+                .and_then(|b| b.type_name.clone())
+        };
+        assert_eq!(ty("x").as_deref(), Some("Foo"), "declared local type");
+        assert_eq!(ty("p").as_deref(), Some("Baz"), "param type");
+        assert_eq!(ty("a"), None, "auto local must not carry a type");
     }
 }
