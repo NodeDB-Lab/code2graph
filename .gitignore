@@ -109,3 +109,10 @@ dmypy.json
 
 .pi/
 .pi-subagents/
+
+# Real-repository eval oracle cases are REGENERATED locally by
+# `eval/scripts/gen-realrepo-oracle.sh` (fetches pinned third-party repos +
+# runs external SCIP indexers). They are NOT vendored: a full third-party
+# source tree + binary `index.scip` per repo would balloon the tree and pull
+# in foreign licenses. The published numbers live in `eval/REAL-REPO-SCORECARD.md`.
+eval/corpus/*_realrepo/

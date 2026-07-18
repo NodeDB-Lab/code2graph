@@ -14,7 +14,18 @@ use std::path::Path;
 
 fn corpus() -> Vec<Case> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus");
-    load_corpus(&root).expect("corpus loads")
+    load_corpus(&root)
+        .expect("corpus loads")
+        .into_iter()
+        // `*_realrepo` cases are large real-world MEASUREMENT fixtures (scored by
+        // the scorecard binary, see REAL-REPO-SCORECARD.md), not curated invariant
+        // fixtures. Real code has macro/generic/line-divergence sites a build-free
+        // resolver genuinely mis-resolves, so the perfect-precision / full-recall
+        // invariants below hold only on the curated `*_oracle` + hand-built cases.
+        // They are also gitignored, so this keeps the guard identical whether or
+        // not a maintainer has regenerated them locally.
+        .filter(|c| !c.lang.ends_with("_realrepo"))
+        .collect()
 }
 
 /// Cases in a given language directory.
