@@ -32,8 +32,9 @@ use super::emit_embedded_sql_refs;
 use super::{
     BindingRules, ExtractCtx, Extractor, MIN_REF_LEN, attach_reference_scopes, child_text,
     collect_call_references, definition_bindings, import_bindings, make_symbol,
-    mark_self_receiver_calls, member_descriptors, node_span, node_text, one_line_signature,
-    push_binding, push_ref, push_scope, push_type_ref,
+    mark_receiver_qualifier_calls, mark_self_receiver_calls, member_descriptors, node_span,
+    node_text, one_line_signature, push_binding, push_ref, push_scope, push_type_ref,
+    push_typed_binding, simple_type_name,
 };
 
 /// Tree-sitter query capturing call-callee identifiers.
@@ -59,6 +60,26 @@ const SELF_CALL_QUERY: &str = r#"
 (call_expression
   function: (member_expression
     object: (this)
+    property: (property_identifier) @callee))
+"#;
+
+/// Method calls whose receiver is written as a bare local identifier
+/// (`x.foo()`), captured to populate [`Reference::qualifier`] with the
+/// receiver's name — the fact [`crate::resolve::LocalTypedCallResolver`]
+/// needs to map the receiver to its binding's declared type.
+///
+/// Deliberately a *separate* query from [`CALL_QUERY`], for the same
+/// double-emission reason documented on [`SELF_CALL_QUERY`]: combining this
+/// into `CALL_QUERY`'s alternation would match the same `member_expression`
+/// node twice. `object: (identifier)` structurally excludes both the `this`
+/// keyword (a distinct `(this)` node kind — [`SELF_CALL_QUERY`] stays the
+/// receiver-free path for it) and any non-identifier receiver (method chains
+/// `a().foo()`, nested member access `a.b.foo()`), so only a bare local/param
+/// name is ever captured.
+const RECEIVER_CALL_QUERY: &str = r#"
+(call_expression
+  function: (member_expression
+    object: (identifier) @receiver
     property: (property_identifier) @callee))
 "#;
 
@@ -131,6 +152,14 @@ pub(super) fn extract_ecmascript(
         bytes,
         &mut references,
         None,
+    )?;
+    mark_receiver_qualifier_calls(
+        &root,
+        &ts_language,
+        RECEIVER_CALL_QUERY,
+        lang,
+        bytes,
+        &mut references,
     )?;
     collect_inheritance(&root, bytes, file, &mut references);
     collect_imports(&root, bytes, file, &mut references, &module_id);
@@ -985,12 +1014,14 @@ fn collect_bindings_dfs(node: &Node, bytes: &[u8], scopes: &[Scope], out: &mut V
         // both nest a `variable_declarator` with a `name` field.
         if let Some(name) = node.child_by_field_name("name") {
             if name.kind() == "identifier" {
-                push_binding(
+                let type_name = variable_declarator_type_name(node, bytes);
+                push_typed_binding(
                     out,
                     node_text(&name, bytes).to_owned(),
                     name.start_byte(),
                     BindingKind::Local,
                     scopes,
+                    type_name,
                 );
             }
         }
@@ -1006,25 +1037,63 @@ fn collect_bindings_dfs(node: &Node, bytes: &[u8], scopes: &[Scope], out: &mut V
 
 /// Emit a [`BindingKind::Param`] for each parameter in a `formal_parameters`
 /// node, unwrapping the typed `required_parameter`/`optional_parameter` forms.
+/// A `required_parameter`/`optional_parameter`'s own `type` field (a
+/// `type_annotation`, e.g. `(x: Foo)`) — when present — is recorded as the
+/// binding's declared type.
 fn collect_params(params: &Node, bytes: &[u8], scopes: &[Scope], out: &mut Vec<Binding>) {
     for child in params.named_children(&mut params.walk()) {
-        let ident = match child.kind() {
-            "identifier" => Some(child),
-            "required_parameter" | "optional_parameter" => child.child_by_field_name("pattern"),
-            _ => None,
+        let (ident, type_name) = match child.kind() {
+            "identifier" => (Some(child), None),
+            "required_parameter" | "optional_parameter" => (
+                child.child_by_field_name("pattern"),
+                type_annotation_name(&child, bytes),
+            ),
+            _ => (None, None),
         };
         if let Some(id) = ident {
             if id.kind() == "identifier" {
-                push_binding(
+                push_typed_binding(
                     out,
                     node_text(&id, bytes).to_owned(),
                     id.start_byte(),
                     BindingKind::Param,
                     scopes,
+                    type_name,
                 );
             }
         }
     }
+}
+
+/// The bare written type name from a node's own `type` field (a
+/// `type_annotation` wrapping the actual type node, e.g. the `: Foo` in
+/// `(x: Foo)` or `const x: Foo`), as a purely syntactic fact — never guessed.
+/// `None` when there is no `type` field, or the annotation has no named type
+/// child (defensive; the grammar always supplies one).
+fn type_annotation_name(node: &Node, bytes: &[u8]) -> Option<String> {
+    let ann = node.child_by_field_name("type")?;
+    let type_node = ann.named_children(&mut ann.walk()).next()?;
+    Some(simple_type_name(node_text(&type_node, bytes), ".").to_owned())
+}
+
+/// The declared/constructed type of a `variable_declarator`, as bare written
+/// text (see [`Binding::type_name`]) — a purely syntactic fact, never guessed.
+///
+/// Prefers the explicit type annotation (`const x: Foo = …`); absent that,
+/// trusts a directly-written constructor initializer (`const x = new Foo();`)
+/// and takes its constructed type. Any other initializer shape (a bare call,
+/// a method chain, an object/array literal, …) yields `None` rather than
+/// guessing — this is why untyped JS locals only gain a `type_name` via `new`.
+fn variable_declarator_type_name(decl: &Node, bytes: &[u8]) -> Option<String> {
+    if let Some(type_name) = type_annotation_name(decl, bytes) {
+        return Some(type_name);
+    }
+    let value = decl.child_by_field_name("value")?;
+    if value.kind() != "new_expression" {
+        return None;
+    }
+    let ctor = value.child_by_field_name("constructor")?;
+    Some(simple_type_name(node_text(&ctor, bytes), ".").to_owned())
 }
 
 #[cfg(test)]
@@ -1803,5 +1872,78 @@ export const Y = 2;
             r.self_receiver,
             "this.foo() should have self_receiver == true"
         );
+    }
+
+    // ── Local-typed-call: receiver capture + Binding.type_name ─────────────
+
+    #[test]
+    fn typed_local_with_constructor_sets_binding_type_name() {
+        // `const x: Foo = new Foo();` → binding `x` has type_name == Some("Foo").
+        let src = "const x: Foo = new Foo();";
+        let facts = TypeScriptExtractor.extract(src, "src/main.ts").unwrap();
+        let b = facts
+            .bindings
+            .iter()
+            .find(|b| b.name == "x" && b.kind == BindingKind::Local)
+            .expect("expected a Local binding for 'x'");
+        assert_eq!(b.type_name.as_deref(), Some("Foo"));
+    }
+
+    #[test]
+    fn bare_receiver_call_sets_qualifier() {
+        // `x.bar()` → the `bar` Call ref carries qualifier == Some("x").
+        let src = "const x: Foo = new Foo(); x.bar();";
+        let facts = TypeScriptExtractor.extract(src, "src/main.ts").unwrap();
+        let r = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Call && r.name == "bar")
+            .expect("expected a Call ref for 'bar'");
+        assert_eq!(r.qualifier.as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn param_type_annotation_sets_binding_type_name() {
+        // `function f(x: Foo) {}` → param binding `x` has type_name == Some("Foo").
+        let src = "function f(x: Foo) {}";
+        let facts = TypeScriptExtractor.extract(src, "src/main.ts").unwrap();
+        let b = facts
+            .bindings
+            .iter()
+            .find(|b| b.name == "x" && b.kind == BindingKind::Param)
+            .expect("expected a Param binding for 'x'");
+        assert_eq!(b.type_name.as_deref(), Some("Foo"));
+    }
+
+    #[test]
+    fn this_receiver_call_keeps_self_receiver_and_no_qualifier() {
+        // `this.foo()` must remain self_receiver == true, qualifier == None —
+        // the receiver-capture query must not clobber the self-call path.
+        let src = "class C { m() { this.foo(); } }";
+        let facts = TypeScriptExtractor.extract(src, "src/c.ts").unwrap();
+        let r = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Call && r.name == "foo")
+            .expect("expected a Call ref for 'foo'");
+        assert!(
+            r.self_receiver,
+            "this.foo() should have self_receiver == true"
+        );
+        assert_eq!(r.qualifier, None, "this.foo() must not carry a qualifier");
+    }
+
+    #[test]
+    fn untyped_local_from_call_has_no_type_name() {
+        // `const y = getThing();` — a bare call initializer, not `new`, is not
+        // inferred; type_name must stay None.
+        let src = "const y = getThing();";
+        let facts = TypeScriptExtractor.extract(src, "src/main.ts").unwrap();
+        let b = facts
+            .bindings
+            .iter()
+            .find(|b| b.name == "y" && b.kind == BindingKind::Local)
+            .expect("expected a Local binding for 'y'");
+        assert_eq!(b.type_name, None);
     }
 }

@@ -351,6 +351,104 @@ mod csharp_tests {
     }
 }
 
+#[cfg(all(test, feature = "typescript"))]
+mod ts_tests {
+    use super::*;
+    use crate::extract::{Extractor, TypeScriptExtractor};
+
+    /// `class Repo { save() {} }` + `class C { run() { const r: Repo = new Repo(); r.save(); } }`
+    /// → exactly one edge, from the enclosing `run` to `...Repo#save().`, Scoped/LocalType.
+    #[test]
+    fn resolves_typed_local_method_call_end_to_end() {
+        let facts = TypeScriptExtractor
+            .extract(
+                "class Repo { save() {} } class C { run() { const r: Repo = new Repo(); r.save(); } }",
+                "src/c.ts",
+            )
+            .unwrap();
+
+        let graph = LocalTypedCallResolver.resolve(&[facts]).unwrap();
+        let edges: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.provenance == Provenance::LocalType)
+            .collect();
+
+        assert_eq!(
+            edges.len(),
+            1,
+            "expected exactly one LocalType edge, got {:?}",
+            edges
+                .iter()
+                .map(|e| format!("{} -> {}", e.from.to_scip_string(), e.to.to_scip_string()))
+                .collect::<Vec<_>>()
+        );
+        let e = edges[0];
+        assert!(e.to.to_scip_string().ends_with("Repo#save()."));
+        assert_eq!(e.confidence, Confidence::Scoped);
+        assert_eq!(e.provenance, Provenance::LocalType);
+        assert!(e.from.to_scip_string().ends_with("run()."));
+    }
+
+    /// JavaScript is dynamically typed (no type annotations), so local-typed
+    /// resolution there depends entirely on `new Foo()` constructor inference.
+    /// `class Repo { save() {} }` + `class C { run() { const r = new Repo(); r.save(); } }`
+    /// via the JS extractor → the same one-edge result as the TS test above.
+    #[test]
+    fn js_constructor_inference_resolves_typed_local_method_call() {
+        use crate::extract::JavaScriptExtractor;
+
+        let facts = JavaScriptExtractor
+            .extract(
+                "class Repo { save() {} } class C { run() { const r = new Repo(); r.save(); } }",
+                "src/c.js",
+            )
+            .unwrap();
+
+        let graph = LocalTypedCallResolver.resolve(&[facts]).unwrap();
+        let edges: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.provenance == Provenance::LocalType)
+            .collect();
+
+        assert_eq!(
+            edges.len(),
+            1,
+            "expected exactly one LocalType edge, got {:?}",
+            edges
+                .iter()
+                .map(|e| format!("{} -> {}", e.from.to_scip_string(), e.to.to_scip_string()))
+                .collect::<Vec<_>>()
+        );
+        let e = edges[0];
+        assert!(e.to.to_scip_string().ends_with("Repo#save()."));
+        assert_eq!(e.confidence, Confidence::Scoped);
+        assert_eq!(e.provenance, Provenance::LocalType);
+        assert!(e.from.to_scip_string().ends_with("run()."));
+    }
+
+    /// The receiver's type has no such member — no edge.
+    #[test]
+    fn wrong_member_yields_no_edge() {
+        let facts = TypeScriptExtractor
+            .extract(
+                "class Repo { save() {} } class C { run() { const r: Repo = new Repo(); r.missing(); } }",
+                "src/c.ts",
+            )
+            .unwrap();
+
+        let graph = LocalTypedCallResolver.resolve(&[facts]).unwrap();
+        assert!(
+            graph
+                .edges
+                .iter()
+                .all(|e| e.provenance != Provenance::LocalType),
+            "Repo has no missing() member — must not emit a LocalType edge"
+        );
+    }
+}
+
 #[cfg(all(test, feature = "kotlin"))]
 mod kotlin_tests {
     use super::*;

@@ -432,6 +432,66 @@ pub(crate) fn mark_self_receiver_calls(
     Ok(())
 }
 
+/// Run `receiver_call_query` and set `qualifier` on the matching, already
+/// collected [`RefRole::Call`] references (correlated by the `@callee` byte
+/// offset — the same technique [`mark_self_receiver_calls`] uses). Never
+/// creates new references, so this cannot double-emit. Shared by every
+/// extractor that captures a bare-identifier method-call receiver
+/// (`x.foo()`) as a syntactic fact for [`crate::resolve::LocalTypedCallResolver`]
+/// to map to the receiver binding's declared type.
+pub(crate) fn mark_receiver_qualifier_calls(
+    root: &Node,
+    ts_lang: &TsLanguage,
+    receiver_call_query: &str,
+    lang: Language,
+    bytes: &[u8],
+    references: &mut [Reference],
+) -> Result<()> {
+    let query = Query::new(ts_lang, receiver_call_query).map_err(|e| CodegraphError::Query {
+        lang: lang.as_str().to_owned(),
+        msg: e.to_string(),
+    })?;
+    let callee_idx =
+        query
+            .capture_index_for_name("callee")
+            .ok_or_else(|| CodegraphError::Query {
+                lang: lang.as_str().to_owned(),
+                msg: "missing @callee capture".to_owned(),
+            })?;
+    let receiver_idx =
+        query
+            .capture_index_for_name("receiver")
+            .ok_or_else(|| CodegraphError::Query {
+                lang: lang.as_str().to_owned(),
+                msg: "missing @receiver capture".to_owned(),
+            })?;
+    let call_ref_by_byte: std::collections::HashMap<usize, usize> = references
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.role == RefRole::Call)
+        .map(|(i, r)| (r.occ.byte, i))
+        .collect();
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(&query, *root, bytes);
+    while let Some(m) = matches.next() {
+        let Some(receiver_text) = m
+            .captures
+            .iter()
+            .find(|c| c.index == receiver_idx)
+            .and_then(|c| c.node.utf8_text(bytes).ok())
+        else {
+            continue;
+        };
+        for cap in m.captures.iter().filter(|c| c.index == callee_idx) {
+            let byte = cap.node.start_byte();
+            if let Some(&idx) = call_ref_by_byte.get(&byte) {
+                references[idx].qualifier = Some(receiver_text.to_owned());
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn collect_call_references(
     root: &Node,
     ts_lang: &TsLanguage,

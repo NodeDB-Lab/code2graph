@@ -28,8 +28,9 @@ use super::emit_embedded_sql_refs;
 use super::{
     BindingRules, ExtractCtx, Extractor, MIN_REF_LEN, attach_reference_scopes, child_text,
     collect_call_references, definition_bindings, import_bindings, make_symbol,
-    mark_self_receiver_calls, member_descriptors, node_occurrence, node_span, node_text,
-    one_line_signature, push_binding, push_ref, push_scope, push_typed_binding, simple_type_name,
+    mark_receiver_qualifier_calls, mark_self_receiver_calls, member_descriptors, node_occurrence,
+    node_span, node_text, one_line_signature, push_binding, push_ref, push_scope,
+    push_typed_binding, simple_type_name,
 };
 
 /// Tree-sitter query capturing call-callee identifiers (and optional qualifier).
@@ -171,7 +172,14 @@ impl RustExtractor {
             &mut references,
             None,
         )?;
-        mark_receiver_qualifier_calls(&root, &ts_language, bytes, &mut references)?;
+        mark_receiver_qualifier_calls(
+            &root,
+            &ts_language,
+            RECEIVER_CALL_QUERY,
+            Language::Rust,
+            bytes,
+            &mut references,
+        )?;
         collect_inheritance(&root, bytes, file, &mut references);
         collect_module_decl_refs(&root, bytes, file, &mut references);
         collect_imports(&root, bytes, file, &mut references, &module_id);
@@ -1080,61 +1088,6 @@ fn collect_associated_call_type_references(
                 cross_artifact: false,
                 self_receiver: false,
             });
-        }
-    }
-    Ok(())
-}
-
-/// Run [`RECEIVER_CALL_QUERY`] and set `qualifier` on the matching, already
-/// collected `Call` references (correlated by the `@callee` byte offset — the
-/// same technique [`mark_self_receiver_calls`] uses). Never creates new
-/// references, so this cannot double-emit.
-fn mark_receiver_qualifier_calls(
-    root: &Node,
-    ts_lang: &TsLanguage,
-    bytes: &[u8],
-    references: &mut [Reference],
-) -> Result<()> {
-    let query = Query::new(ts_lang, RECEIVER_CALL_QUERY).map_err(|e| CodegraphError::Query {
-        lang: "rust".to_owned(),
-        msg: e.to_string(),
-    })?;
-    let callee_idx =
-        query
-            .capture_index_for_name("callee")
-            .ok_or_else(|| CodegraphError::Query {
-                lang: "rust".to_owned(),
-                msg: "missing @callee capture".to_owned(),
-            })?;
-    let receiver_idx =
-        query
-            .capture_index_for_name("receiver")
-            .ok_or_else(|| CodegraphError::Query {
-                lang: "rust".to_owned(),
-                msg: "missing @receiver capture".to_owned(),
-            })?;
-    let call_ref_by_byte: std::collections::HashMap<usize, usize> = references
-        .iter()
-        .enumerate()
-        .filter(|(_, r)| r.role == RefRole::Call)
-        .map(|(i, r)| (r.occ.byte, i))
-        .collect();
-    let mut cursor = QueryCursor::new();
-    let mut matches = cursor.matches(&query, *root, bytes);
-    while let Some(m) = matches.next() {
-        let Some(receiver_text) = m
-            .captures
-            .iter()
-            .find(|c| c.index == receiver_idx)
-            .and_then(|c| c.node.utf8_text(bytes).ok())
-        else {
-            continue;
-        };
-        for cap in m.captures.iter().filter(|c| c.index == callee_idx) {
-            let byte = cap.node.start_byte();
-            if let Some(&idx) = call_ref_by_byte.get(&byte) {
-                references[idx].qualifier = Some(receiver_text.to_owned());
-            }
         }
     }
     Ok(())
