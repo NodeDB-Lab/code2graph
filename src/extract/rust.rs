@@ -48,6 +48,25 @@ const ASSOCIATED_CALL_SUBJECT_QUERY: &str = r#"
   function: (scoped_identifier path: (_) @subject name: (identifier)))
 "#;
 
+/// Method calls whose receiver is written as the `self` keyword (`self.foo()`).
+///
+/// Deliberately a *separate* query from [`CALL_QUERY`] rather than an extra
+/// alternation branch there: `field_expression value: (self) …` and
+/// `field_expression field: (field_identifier) …` (the existing branch) both
+/// structurally match the same `self.foo()` node, and tree-sitter's
+/// alternation explores every branch that fits — combining them in one `[ ]`
+/// would double-emit the reference. Run as a second pass and correlate back to
+/// [`CALL_QUERY`]'s output by the `field_identifier`'s byte offset (identical
+/// node in both queries), the same technique
+/// [`collect_associated_call_type_references`] uses for a second query over
+/// [`ASSOCIATED_CALL_SUBJECT_QUERY`].
+const SELF_CALL_QUERY: &str = r#"
+(call_expression
+  function: (field_expression
+    value: (self)
+    field: (field_identifier) @callee))
+"#;
+
 /// Tree-sitter query capturing type-position nodes for [`RefRole::TypeRef`] extraction.
 ///
 /// Field names verified against `tree-sitter-rust-0.23.3/src/node-types.json`:
@@ -122,6 +141,7 @@ impl RustExtractor {
         symbols.push(mod_sym);
         let mut references =
             collect_call_references(&root, &ts_language, CALL_QUERY, Language::Rust, bytes, file)?;
+        mark_self_receiver_calls(&root, &ts_language, bytes, &mut references)?;
         collect_inheritance(&root, bytes, file, &mut references);
         collect_module_decl_refs(&root, bytes, file, &mut references);
         collect_imports(&root, bytes, file, &mut references, &module_id);
@@ -950,6 +970,7 @@ fn collect_named_type_nodes(
             scope: None,
             type_ref_ctx: Some(context),
             cross_artifact: false,
+            self_receiver: false,
         }),
         "scoped_type_identifier" => {
             let Some(name_node) = node.child_by_field_name("name") else {
@@ -969,6 +990,7 @@ fn collect_named_type_nodes(
                 scope: None,
                 type_ref_ctx: Some(context),
                 cross_artifact: false,
+                self_receiver: false,
             });
         }
         "generic_type" => {
@@ -1043,7 +1065,59 @@ fn collect_associated_call_type_references(
                 scope: None,
                 type_ref_ctx: Some(TypeRefContext::Other),
                 cross_artifact: false,
+                self_receiver: false,
             });
+        }
+    }
+    Ok(())
+}
+
+/// Run [`SELF_CALL_QUERY`] and mark every already-collected [`RefRole::Call`]
+/// reference whose occurrence byte matches a captured `self.<name>()` callee
+/// with `self_receiver = true`. A NEUTRAL SYNTACTIC FACT: it records that the
+/// receiver was written as the `self` keyword — the resolver, not this
+/// extractor, maps `self` to the enclosing type. `qualifier` is left untouched
+/// (already `None` for a field-expression callee).
+///
+/// Byte-offset correlation is exact: both this query and [`CALL_QUERY`]
+/// capture the identical `field_identifier` node, so a reference dropped by
+/// [`CALL_QUERY`]'s [`MIN_REF_LEN`] filter simply finds no match here — a
+/// harmless no-op, never a false mark.
+///
+/// Correlation goes through a `byte -> index` map built once up front (O(n))
+/// rather than a linear scan of `references` per self-call match, which would
+/// be O(self-calls × total references) on a file with many `self.foo()` sites.
+fn mark_self_receiver_calls(
+    root: &Node,
+    ts_lang: &TsLanguage,
+    bytes: &[u8],
+    references: &mut [Reference],
+) -> Result<()> {
+    let query = Query::new(ts_lang, SELF_CALL_QUERY).map_err(|e| CodegraphError::Query {
+        lang: "rust".to_owned(),
+        msg: e.to_string(),
+    })?;
+    let callee_idx =
+        query
+            .capture_index_for_name("callee")
+            .ok_or_else(|| CodegraphError::Query {
+                lang: "rust".to_owned(),
+                msg: "missing @callee capture".to_owned(),
+            })?;
+    let call_ref_by_byte: std::collections::HashMap<usize, usize> = references
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.role == RefRole::Call)
+        .map(|(i, r)| (r.occ.byte, i))
+        .collect();
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(&query, *root, bytes);
+    while let Some(m) = matches.next() {
+        for cap in m.captures.iter().filter(|c| c.index == callee_idx) {
+            let byte = cap.node.start_byte();
+            if let Some(&idx) = call_ref_by_byte.get(&byte) {
+                references[idx].self_receiver = true;
+            }
         }
     }
     Ok(())
@@ -2647,6 +2721,44 @@ impl std::fmt::Display for Point {
             r.qualifier, None,
             "method call via field_expression should have qualifier == None, got {:?}",
             r.qualifier
+        );
+    }
+
+    #[test]
+    fn self_receiver_method_call_is_marked_self_receiver() {
+        // `self.foo()` — field_expression arm with a `self` value → leaf "foo",
+        // qualifier None, self_receiver true.
+        let src = "impl Person { fn caller(&self) { self.foo(); } }";
+        let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
+        let r = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Call && r.name == "foo")
+            .expect("expected a Call ref for 'foo'");
+        assert!(
+            r.self_receiver,
+            "self.foo() should have self_receiver == true"
+        );
+        assert_eq!(
+            r.qualifier, None,
+            "self.foo() should still have qualifier == None, got {:?}",
+            r.qualifier
+        );
+    }
+
+    #[test]
+    fn non_self_method_call_is_not_marked_self_receiver() {
+        // `x.foo()` on a local variable — must NOT be marked self_receiver.
+        let src = "impl Person { fn caller(&self, x: Foo) { x.foo(); } }";
+        let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
+        let r = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Call && r.name == "foo")
+            .expect("expected a Call ref for 'foo'");
+        assert!(
+            !r.self_receiver,
+            "x.foo() must not have self_receiver == true"
         );
     }
 

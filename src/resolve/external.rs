@@ -307,6 +307,7 @@ mod tests {
             scope: None,
             type_ref_ctx: None,
             cross_artifact: false,
+            self_receiver: false,
         });
         // Inject a Call ref for `helper` inside the `run` span.
         caller.references.push(Reference {
@@ -326,6 +327,7 @@ mod tests {
             scope: None,
             type_ref_ctx: None,
             cross_artifact: false,
+            self_receiver: false,
         });
 
         let graph = ExternalResolver.resolve(&[lib, caller]).unwrap();
@@ -384,6 +386,7 @@ mod tests {
             scope: None,
             type_ref_ctx: None,
             cross_artifact: false,
+            self_receiver: false,
         });
         // Inject Call ref: `from_str()` inside `run`'s span.
         let run_span_start = file
@@ -410,6 +413,7 @@ mod tests {
             scope: None,
             type_ref_ctx: None,
             cross_artifact: false,
+            self_receiver: false,
         });
 
         let graph = ExternalResolver.resolve(&[file]).unwrap();

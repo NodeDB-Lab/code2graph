@@ -373,6 +373,7 @@ fn collect_references_recursive(node: &Node, bytes: &[u8], file: &str, out: &mut
                                     scope: None,
                                     type_ref_ctx: None,
                                     cross_artifact: false,
+                                    self_receiver: false,
                                 });
                             }
                         }

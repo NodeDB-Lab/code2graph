@@ -214,6 +214,7 @@ pub(crate) fn push_ref(
         scope: None,
         type_ref_ctx: None,
         cross_artifact: false,
+        self_receiver: false,
     });
 }
 
@@ -251,6 +252,7 @@ pub(crate) fn push_import_ref(
         scope: None,
         type_ref_ctx: None,
         cross_artifact: false,
+        self_receiver: false,
     });
 }
 
@@ -282,6 +284,7 @@ pub(crate) fn push_type_ref(
         scope: None,
         type_ref_ctx: Some(ctx),
         cross_artifact: false,
+        self_receiver: false,
     });
 }
 
@@ -338,6 +341,12 @@ pub(crate) fn collect_call_references(
     // Rust after unit 8a) return `None` here, keeping qualifier `None` everywhere
     // for those languages → zero behavior change.
     let qualifier_idx = query.capture_index_for_name("qualifier");
+    // Optional generic marker capture: a query may tag the callee's receiver as
+    // the `self`/`this` keyword by including a `@self_receiver` capture on the
+    // match. Queries without it (every language until their extractor opts in)
+    // return `None` here, keeping `self_receiver` `false` everywhere → zero
+    // behavior change.
+    let self_receiver_idx = query.capture_index_for_name("self_receiver");
 
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(&query, *root, bytes);
@@ -350,6 +359,8 @@ pub(crate) fn collect_call_references(
                 .find(|c| c.index == qi)
                 .map(|c| node_text(&c.node, bytes).to_owned())
         });
+        let self_receiver =
+            self_receiver_idx.is_some_and(|si| m.captures.iter().any(|c| c.index == si));
         for cap in m.captures.iter().filter(|c| c.index == callee_idx) {
             let name = node_text(&cap.node, bytes).to_owned();
             if name.len() < MIN_REF_LEN {
@@ -367,6 +378,7 @@ pub(crate) fn collect_call_references(
                 scope: None,
                 type_ref_ctx: None,
                 cross_artifact: false,
+                self_receiver,
             });
         }
     }
@@ -577,6 +589,7 @@ pub(crate) fn emit_embedded_sql_refs(
             scope: None,
             type_ref_ctx: None,
             cross_artifact: true,
+            self_receiver: false,
         });
     }
 }

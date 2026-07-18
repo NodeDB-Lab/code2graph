@@ -14,25 +14,33 @@
 //!
 //! # What it covers (the honest v1 boundary)
 //!
-//! Only references where the call site **textually qualifies the owning type**
-//! are considered — i.e. the extractor populated
-//! [`Reference::qualifier`](crate::graph::types::Reference::qualifier) with
-//! the written type name (`Foo::bar()`, `Type.method()`). For such a reference,
-//! if `Foo` does not define `bar` directly but a supertype of `Foo` does, an
-//! edge is drawn to the inherited definition (first match wins, walking the
-//! hierarchy depth-first).
+//! Two shapes of call site are considered — never a receiver type inferred:
+//!
+//! - The call site **textually qualifies the owning type** — i.e. the extractor
+//!   populated [`Reference::qualifier`](crate::graph::types::Reference::qualifier)
+//!   with the written type name (`Foo::bar()`, `Type.method()`).
+//! - The call site's receiver is the **`self` keyword** — i.e. the extractor set
+//!   [`Reference::self_receiver`](crate::graph::types::Reference::self_receiver).
+//!   The owning type is then read off the *enclosing* member symbol (a purely
+//!   structural/syntactic fact — the call site is lexically inside that type's
+//!   own method body), never inferred from a receiver's runtime or static type.
+//!
+//! For either shape, if the owning type does not define the member directly but
+//! a supertype does, an edge is drawn to the inherited definition (first match
+//! wins, walking the hierarchy depth-first).
 //!
 //! # What it deliberately defers (the type-inference ceiling)
 //!
-//! - `self.method()` / `this.method()` — the qualifier is absent; resolving it
-//!   needs the *receiver's* type, which is type inference.
+//! - `this.method()` (non-Rust languages) — not yet marked by any extractor;
+//!   deferred until an extractor opts into `self_receiver` for that language.
 //! - chained `inner().method()` — needs the return type of `inner()`.
 //! - field-access chains (`a.b.method()`) — needs the field's type.
 //!
 //! These are out of scope: code2graph stays build-free and does not infer types.
-//! When the qualifier is missing, this resolver simply emits nothing for that
+//! When neither shape applies, this resolver simply emits nothing for that
 //! reference (recall is only ever *added*, never faked).
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 use crate::graph::types::{
@@ -138,21 +146,44 @@ impl Resolver for ConformanceResolver {
         for f in files.iter().copied() {
             let file_syms = by_file.get(f.file.as_str());
             for r in &f.references {
-                // Only the honest, type-qualified cases (no receiver inference).
+                // Only the honest, type-qualified cases (no receiver inference),
+                // plus the `self`/`this`-receiver case below (the owning type is
+                // the enclosing member's own type, not a written qualifier — still
+                // no receiver *type inference*, just reading the enclosing symbol).
                 if !matches!(r.role, RefRole::Call | RefRole::TypeRef) {
                     continue;
                 }
-                let Some(qualifier) = r.qualifier.as_deref() else {
-                    continue; // unqualified → would need receiver-type inference
-                };
-                // The written type name is the last segment of the qualifier
-                // (`a::b::Foo` → `Foo`, `Foo` → `Foo`). Iterate directly to
-                // avoid an intermediate Vec allocation on every reference.
-                let Some(type_name) = qualifier.split(['.', '/', ':']).rfind(|s| {
-                    !s.is_empty() && !matches!(*s, "." | ".." | "crate" | "self" | "super")
-                }) else {
-                    continue;
-                };
+
+                // `self.method()`: derive the owning type from the enclosing
+                // member symbol instead of a written qualifier. Fail closed (skip)
+                // when there is no enclosing symbol or it isn't itself a type
+                // member — never guess.
+                let (self_enclosing_idx, type_name): (Option<usize>, Cow<'_, str>) =
+                    if r.self_receiver {
+                        let Some(idx) = file_syms
+                            .and_then(|idxs| enclosing_symbol_index(&symbols, idxs, r.occ.byte))
+                        else {
+                            continue;
+                        };
+                        let Some((type_name, _)) = member_of_type(&symbols[idx]) else {
+                            continue;
+                        };
+                        (Some(idx), Cow::Owned(type_name))
+                    } else {
+                        let Some(qualifier) = r.qualifier.as_deref() else {
+                            continue; // unqualified → would need receiver-type inference
+                        };
+                        // The written type name is the last segment of the qualifier
+                        // (`a::b::Foo` → `Foo`, `Foo` → `Foo`). Iterate directly to
+                        // avoid an intermediate Vec allocation on every reference.
+                        let Some(type_name) = qualifier.split(['.', '/', ':']).rfind(|s| {
+                            !s.is_empty() && !matches!(*s, "." | ".." | "crate" | "self" | "super")
+                        }) else {
+                            continue;
+                        };
+                        (None, Cow::Borrowed(type_name))
+                    };
+                let type_name: &str = &type_name;
                 let member = r.name.as_str();
 
                 // Direct members are handled by the base resolvers — skip.
@@ -170,10 +201,11 @@ impl Resolver for ConformanceResolver {
                     continue;
                 };
 
-                // Attribute the edge's source to the enclosing caller symbol.
-                let Some(from_idx) =
+                // Attribute the edge's source to the enclosing caller symbol —
+                // already resolved above for the self-receiver case.
+                let Some(from_idx) = self_enclosing_idx.or_else(|| {
                     file_syms.and_then(|idxs| enclosing_symbol_index(&symbols, idxs, r.occ.byte))
-                else {
+                }) else {
                     continue;
                 };
 
@@ -266,6 +298,7 @@ mod tests {
             scope: None,
             type_ref_ctx: None,
             cross_artifact: false,
+            self_receiver: false,
         }
     }
 
@@ -530,6 +563,91 @@ mod tests {
             e.from.to_scip_string().ends_with("run()."),
             "edge `from` should end with 'run().', got: {}",
             e.from.to_scip_string()
+        );
+    }
+
+    /// End-to-end proof for the `self`-receiver case: `trait Greet { fn hello(&self); }`
+    /// plus `impl Greet for Person { fn hello(&self){} }` (a trait impl — its body
+    /// mints no `Person#hello()` symbol; the extractor only emits one for the
+    /// trait's own `hello`, per `collect_trait_members`) and a separate inherent
+    /// `impl Person { fn greet(&self){ self.hello(); } }` (a real `Person#greet()`
+    /// symbol). `self.hello()` has no written qualifier (the extractor sets
+    /// `self_receiver = true`, `qualifier = None`); the resolver must derive the
+    /// owning type (`Person`) from the enclosing `greet` method, find no direct
+    /// `hello` member on `Person`, walk to the supertype `Greet`, and link to
+    /// `Greet#hello().`.
+    #[cfg(feature = "rust")]
+    #[test]
+    fn conformance_resolves_rust_self_receiver_inherited_trait_method_end_to_end() {
+        let greet = RustExtractor
+            .extract("pub trait Greet { fn hello(&self); }", "src/greet.rs")
+            .unwrap();
+        let person = RustExtractor
+            .extract(
+                "pub struct Person; impl crate::greet::Greet for Person { fn hello(&self) {} } impl Person { fn greet(&self) { self.hello(); } }",
+                "src/person.rs",
+            )
+            .unwrap();
+
+        let graph = ConformanceResolver.resolve(&[greet, person]).unwrap();
+
+        let conf_edges: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.provenance == Provenance::Conformance)
+            .collect();
+
+        assert_eq!(
+            conf_edges.len(),
+            1,
+            "expected exactly one conformance edge for the self.hello() site, got {:?}",
+            conf_edges
+                .iter()
+                .map(|e| format!("{} -> {}", e.from.to_scip_string(), e.to.to_scip_string()))
+                .collect::<Vec<_>>()
+        );
+
+        let e = conf_edges[0];
+        assert!(
+            e.to.to_scip_string().ends_with("Greet#hello()."),
+            "edge `to` should be the inherited Greet#hello()., got: {}",
+            e.to.to_scip_string()
+        );
+        assert!(
+            e.from.to_scip_string().ends_with("Person#greet()."),
+            "edge `from` should be the enclosing Person#greet()., got: {}",
+            e.from.to_scip_string()
+        );
+        assert_eq!(e.confidence, Confidence::Scoped);
+        assert_eq!(e.provenance, Provenance::Conformance);
+    }
+
+    /// Negative: a `self.own()` call where `own` is a DIRECT member of the
+    /// enclosing type (no trait involved) must NOT produce a conformance edge —
+    /// the base resolvers already own direct members.
+    #[cfg(feature = "rust")]
+    #[test]
+    fn self_receiver_direct_member_does_not_emit_conformance_edge() {
+        let person = RustExtractor
+            .extract(
+                "pub struct Person; impl Person { fn own(&self) {} fn caller(&self) { self.own(); } }",
+                "src/person.rs",
+            )
+            .unwrap();
+
+        let graph = ConformanceResolver.resolve(&[person]).unwrap();
+        let conf_edges: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.provenance == Provenance::Conformance)
+            .collect();
+        assert!(
+            conf_edges.is_empty(),
+            "self.own() on a direct member must not yield a conformance edge, got {:?}",
+            conf_edges
+                .iter()
+                .map(|e| e.to.to_scip_string())
+                .collect::<Vec<_>>()
         );
     }
 

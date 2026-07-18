@@ -144,6 +144,7 @@ mod tests {
                     scope: None,
                     type_ref_ctx: None,
                     cross_artifact: false,
+                    self_receiver: false,
                 },
                 Reference {
                     name: "local".into(),
@@ -162,6 +163,7 @@ mod tests {
                     scope: None,
                     type_ref_ctx: None,
                     cross_artifact: false,
+                    self_receiver: false,
                 },
                 Reference {
                     name: "opaque".into(),
@@ -180,6 +182,7 @@ mod tests {
                     scope: None,
                     type_ref_ctx: None,
                     cross_artifact: false,
+                    self_receiver: false,
                 },
             ],
             scopes: vec![],

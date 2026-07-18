@@ -250,6 +250,13 @@ pub struct Reference {
     /// Extractors leave this false unless they emit a cross-artifact reference.
     #[cfg_attr(feature = "serde", serde(default))]
     pub cross_artifact: bool,
+    /// A NEUTRAL SYNTACTIC FACT: true when the call's receiver is the
+    /// `self`/`this` keyword (e.g. `self.foo()`). The extractor only marks that
+    /// the receiver was written as `self`/`this`; it does not resolve what type
+    /// that maps to — the resolver, not the extractor, maps `self` to the
+    /// enclosing type. `false` for every other reference.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub self_receiver: bool,
 }
 
 // ── Scope / binding data model ──────────────────────────────────────────────
@@ -903,6 +910,7 @@ mod serde_tests {
                 scope: None,
                 type_ref_ctx: None,
                 cross_artifact: false,
+                self_receiver: false,
             }],
             scopes: vec![],
             bindings: vec![],

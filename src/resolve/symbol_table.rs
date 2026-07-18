@@ -458,6 +458,7 @@ mod tests {
             scope: None,
             type_ref_ctx: None,
             cross_artifact: false,
+            self_receiver: false,
         });
 
         let graph = SymbolTableResolver.resolve(&[a, b]).unwrap();
