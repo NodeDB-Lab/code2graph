@@ -32,8 +32,8 @@ use super::emit_embedded_sql_refs;
 use super::{
     BindingRules, ExtractCtx, Extractor, MIN_REF_LEN, attach_reference_scopes, child_text,
     collect_call_references, definition_bindings, import_bindings, make_symbol,
-    mark_self_receiver_calls, node_span, node_text, one_line_signature, push_binding, push_ref,
-    push_scope, push_type_ref,
+    mark_self_receiver_calls, member_descriptors, node_span, node_text, one_line_signature,
+    push_binding, push_ref, push_scope, push_type_ref,
 };
 
 /// Tree-sitter query capturing call-callee identifiers.
@@ -353,19 +353,6 @@ fn emit_named(
     if let Some(n) = child_text(decl, "type_identifier", bytes) {
         push(out, n.clone(), kind, Descriptor::Type(n));
     }
-}
-
-/// Build the descriptor path for a class member: namespaces + `Type(type_name)`
-/// + `leaf`. Mirrors the Rust/Java extractors' member-descriptor helper.
-fn member_descriptors(namespaces: &[String], type_name: &str, leaf: Descriptor) -> Vec<Descriptor> {
-    let mut descriptors: Vec<Descriptor> = namespaces
-        .iter()
-        .cloned()
-        .map(Descriptor::Namespace)
-        .collect();
-    descriptors.push(Descriptor::Type(type_name.to_owned()));
-    descriptors.push(leaf);
-    descriptors
 }
 
 /// Emit a [`SymbolKind::Method`] symbol for each `method_definition` in a

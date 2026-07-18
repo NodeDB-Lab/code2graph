@@ -25,8 +25,8 @@ use crate::symbol::Descriptor;
 use super::{
     ExtractCtx, Extractor, MIN_REF_LEN, attach_reference_scopes, collect_call_references,
     definition_bindings, field_text, import_bindings, innermost_scope, make_symbol,
-    mark_self_receiver_calls, node_span, node_text, one_line_signature, push_binding, push_ref,
-    push_scope, push_type_ref, simple_type_name,
+    mark_self_receiver_calls, member_descriptors, node_span, node_text, one_line_signature,
+    push_binding, push_ref, push_scope, push_type_ref, simple_type_name,
 };
 
 /// Tree-sitter query capturing call-callee identifiers.
@@ -352,16 +352,14 @@ fn collect_members(
                 let Some(name) = field_text(&member, "name", ctx.bytes) else {
                     continue;
                 };
-                let mut descriptors: Vec<Descriptor> = namespaces
-                    .iter()
-                    .cloned()
-                    .map(Descriptor::Namespace)
-                    .collect();
-                descriptors.push(Descriptor::Type(type_name.to_owned()));
-                descriptors.push(Descriptor::Method {
-                    name: name.clone(),
-                    disambiguator: crate::symbol::MethodDisambiguator::empty(),
-                });
+                let descriptors = member_descriptors(
+                    namespaces,
+                    type_name,
+                    Descriptor::Method {
+                        name: name.clone(),
+                        disambiguator: crate::symbol::MethodDisambiguator::empty(),
+                    },
+                );
                 let mut method_sym = make_symbol(
                     ctx,
                     &member,
@@ -383,13 +381,11 @@ fn collect_members(
                     let Some(var_name) = field_text(&declarator, "name", ctx.bytes) else {
                         continue;
                     };
-                    let mut descriptors: Vec<Descriptor> = namespaces
-                        .iter()
-                        .cloned()
-                        .map(Descriptor::Namespace)
-                        .collect();
-                    descriptors.push(Descriptor::Type(type_name.to_owned()));
-                    descriptors.push(Descriptor::Term(var_name.clone()));
+                    let descriptors = member_descriptors(
+                        namespaces,
+                        type_name,
+                        Descriptor::Term(var_name.clone()),
+                    );
                     out.push(make_symbol(
                         ctx,
                         &member,

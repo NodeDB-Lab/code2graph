@@ -288,6 +288,27 @@ pub(crate) fn push_type_ref(
     });
 }
 
+/// Build the descriptor path for one member of a type (class/impl/trait/…
+/// body): `namespaces.map(Namespace) ++ [Type(type_name), leaf]`.
+///
+/// Shared by every per-language extractor that emits members (methods,
+/// fields, associated consts) qualified under an enclosing type — the shape
+/// is identical across languages, only how `leaf` is built differs.
+pub(crate) fn member_descriptors(
+    namespaces: &[String],
+    type_name: &str,
+    leaf: Descriptor,
+) -> Vec<Descriptor> {
+    let mut descriptors: Vec<Descriptor> = namespaces
+        .iter()
+        .cloned()
+        .map(Descriptor::Namespace)
+        .collect();
+    descriptors.push(Descriptor::Type(type_name.to_owned()));
+    descriptors.push(leaf);
+    descriptors
+}
+
 /// Strip a single layer of surrounding `"` or `` ` `` from a quoted identifier or
 /// string literal. Returns the inner slice. If the text is not wrapped in a matching
 /// pair of those delimiters, returns it unchanged. Does not panic on any input.

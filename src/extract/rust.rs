@@ -28,8 +28,8 @@ use super::emit_embedded_sql_refs;
 use super::{
     BindingRules, ExtractCtx, Extractor, MIN_REF_LEN, attach_reference_scopes, child_text,
     collect_call_references, definition_bindings, import_bindings, make_symbol,
-    mark_self_receiver_calls, node_occurrence, node_span, node_text, one_line_signature,
-    push_binding, push_ref, push_scope,
+    mark_self_receiver_calls, member_descriptors, node_occurrence, node_span, node_text,
+    one_line_signature, push_binding, push_ref, push_scope,
 };
 
 /// Tree-sitter query capturing call-callee identifiers (and optional qualifier).
@@ -336,23 +336,6 @@ fn collect_symbols(root: &Node, ctx: &ExtractCtx, namespaces: &[String]) -> Vec<
         }
     }
     out
-}
-
-/// Build the descriptor path for one member of an `impl` or `trait` body:
-/// `namespaces.map(Namespace) ++ [Type(type_name), leaf]`.
-///
-/// Shared by [`collect_impl_members`] and [`collect_trait_members`] so the two
-/// call sites don't duplicate the prefix construction. The `Symbol` itself is
-/// built by [`make_symbol`] at the call site.
-fn member_descriptors(namespaces: &[String], type_name: &str, leaf: Descriptor) -> Vec<Descriptor> {
-    let mut descriptors: Vec<Descriptor> = namespaces
-        .iter()
-        .cloned()
-        .map(Descriptor::Namespace)
-        .collect();
-    descriptors.push(Descriptor::Type(type_name.to_owned()));
-    descriptors.push(leaf);
-    descriptors
 }
 
 /// Walk an inherent `impl_item` node and emit member symbols (all visibilities).
