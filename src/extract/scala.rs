@@ -25,8 +25,8 @@ use crate::symbol::Descriptor;
 use super::{
     ExtractCtx, Extractor, MIN_REF_LEN, attach_reference_scopes, collect_call_references,
     definition_bindings, field_text, import_bindings, innermost_scope, make_symbol,
-    mark_self_receiver_calls, node_span, node_text, one_line_signature, push_binding,
-    push_import_ref, push_ref, push_scope, push_type_ref, simple_type_name,
+    mark_self_receiver_calls, node_span, node_text, one_line_signature, push_import_ref, push_ref,
+    push_scope, push_type_ref, push_typed_binding, simple_type_name,
 };
 
 /// Tree-sitter query capturing call-callee identifiers.
@@ -890,7 +890,15 @@ fn collect_bindings_dfs(node: &Node, bytes: &[u8], scopes: &[Scope], out: &mut V
                     let name = node_text(&pat, bytes);
                     let intro = pat.start_byte();
                     if name.len() >= MIN_REF_LEN && innermost_scope(intro, scopes) != Some(0) {
-                        push_binding(out, name.to_owned(), intro, BindingKind::Local, scopes);
+                        let type_name = val_definition_type_name(node, bytes);
+                        push_typed_binding(
+                            out,
+                            name.to_owned(),
+                            intro,
+                            BindingKind::Local,
+                            scopes,
+                            type_name,
+                        );
                     }
                 }
             }
@@ -911,9 +919,55 @@ fn collect_params(params: &Node, bytes: &[u8], scopes: &[Scope], out: &mut Vec<B
                 .map(|n| node_text(&n, bytes).to_owned());
             if let Some(name) = name_opt {
                 let intro = child.start_byte();
-                push_binding(out, name, intro, BindingKind::Param, scopes);
+                let type_name = child
+                    .child_by_field_name("type")
+                    .and_then(|t| scala_simple_type_name(&t, bytes));
+                push_typed_binding(out, name, intro, BindingKind::Param, scopes, type_name);
             }
         }
+    }
+}
+
+/// The declared/constructed type of a `val_definition`/`var_definition`, as
+/// bare written text (see [`Binding::type_name`]) — a purely syntactic fact,
+/// never guessed.
+///
+/// Prefers the definition's explicit `type` field (`val r: Repo = …`). Else,
+/// when the `value` field is a directly-written constructor call
+/// (`val r = new Repo()`) — an `instance_expression` — uses the constructed
+/// type's leaf name. Any other value shape (a bare identifier, a method
+/// chain, …) yields `None`.
+fn val_definition_type_name(def: &Node, bytes: &[u8]) -> Option<String> {
+    if let Some(t) = def.child_by_field_name("type") {
+        return scala_simple_type_name(&t, bytes);
+    }
+    let value = def.child_by_field_name("value")?;
+    if value.kind() != "instance_expression" {
+        return None;
+    }
+    let args_id = value.child_by_field_name("arguments").map(|n| n.id());
+    let type_node = value
+        .named_children(&mut value.walk())
+        .find(|c| Some(c.id()) != args_id && c.kind() != "template_body")?;
+    scala_simple_type_name(&type_node, bytes)
+}
+
+/// The bare leaf name of a syntactic type node, as written text — never
+/// guessed. Handles a plain named type (`type_identifier`), a dotted
+/// qualified type (`stable_type_identifier`, e.g. `pkg.Repo`), and unwraps a
+/// generic type's base (`generic_type`, e.g. `Repo[T]` → `Repo`) recursively.
+/// Any other type shape (compound, function, structural, projected, …)
+/// yields `None` rather than guessing.
+fn scala_simple_type_name(node: &Node, bytes: &[u8]) -> Option<String> {
+    match node.kind() {
+        "type_identifier" | "stable_type_identifier" => {
+            Some(simple_type_name(node_text(node, bytes), ".").to_owned())
+        }
+        "generic_type" => {
+            let base = node.child_by_field_name("type")?;
+            scala_simple_type_name(&base, bytes)
+        }
+        _ => None,
     }
 }
 
@@ -1401,5 +1455,73 @@ object O {
                 .map(|r| (&r.role, &r.name))
                 .collect::<Vec<_>>()
         );
+    }
+
+    // ── Binding type_name (local-typed-call resolution) ────────────────────────
+
+    #[test]
+    fn typed_local_val_carries_type_name() {
+        let src = r#"
+object O {
+  def run(): Unit = {
+    val repo: Repo = new Repo()
+  }
+}
+"#;
+        let facts = extract(src, "src/O.scala");
+        let repo = facts
+            .bindings
+            .iter()
+            .find(|b| b.kind == BindingKind::Local && b.name == "repo")
+            .expect("expected a Local binding for 'repo'");
+        assert_eq!(repo.type_name.as_deref(), Some("Repo"));
+    }
+
+    #[test]
+    fn constructor_inferred_local_val_carries_type_name() {
+        let src = r#"
+object O {
+  def run(): Unit = {
+    val repo = new Repo()
+  }
+}
+"#;
+        let facts = extract(src, "src/O.scala");
+        let repo = facts
+            .bindings
+            .iter()
+            .find(|b| b.kind == BindingKind::Local && b.name == "repo")
+            .expect("expected a Local binding for 'repo'");
+        assert_eq!(repo.type_name.as_deref(), Some("Repo"));
+    }
+
+    #[test]
+    fn untyped_local_val_has_no_type_name() {
+        let src = r#"
+object O {
+  def run(): Unit = {
+    val count = 1
+  }
+}
+"#;
+        let facts = extract(src, "src/O.scala");
+        let count = facts
+            .bindings
+            .iter()
+            .find(|b| b.kind == BindingKind::Local && b.name == "count")
+            .expect("expected a Local binding for 'count'");
+        assert_eq!(count.type_name, None);
+    }
+
+    #[test]
+    fn typed_param_carries_type_name() {
+        let src = "object O { def run(repo: Repo): Unit = {} }";
+        let facts = extract(src, "src/O.scala");
+        let repo = facts
+            .bindings
+            .iter()
+            .find(|b| b.kind == BindingKind::Param && b.name == "repo")
+            .expect("expected a Param binding for 'repo'");
+        assert_eq!(repo.type_name.as_deref(), Some("Repo"));
     }
 }

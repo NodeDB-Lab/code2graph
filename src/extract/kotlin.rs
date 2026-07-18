@@ -40,7 +40,7 @@ use super::{
     ExtractCtx, Extractor, MIN_REF_LEN, attach_reference_scopes, child_text,
     collect_call_references, definition_bindings, field_text, import_bindings, innermost_scope,
     make_symbol, mark_self_receiver_calls, node_span, node_text, one_line_signature, push_binding,
-    push_ref, push_scope, push_type_ref,
+    push_ref, push_scope, push_type_ref, push_typed_binding, simple_type_name,
 };
 
 /// Tree-sitter query capturing call-callee identifiers.
@@ -1048,7 +1048,15 @@ fn collect_bindings_dfs(node: &Node, bytes: &[u8], scopes: &[Scope], out: &mut V
                         let sid = innermost_scope(intro, scopes).unwrap_or(0);
                         if matches!(scopes[sid].kind, ScopeKind::Function | ScopeKind::Block) {
                             let name = node_text(&ident, bytes);
-                            push_binding(out, name.to_owned(), intro, BindingKind::Local, scopes);
+                            let type_name = property_declaration_type_name(node, &child, bytes);
+                            push_typed_binding(
+                                out,
+                                name.to_owned(),
+                                intro,
+                                BindingKind::Local,
+                                scopes,
+                                type_name,
+                            );
                         }
                     }
                     break;
@@ -1103,10 +1111,56 @@ fn collect_params(params: &Node, bytes: &[u8], scopes: &[Scope], out: &mut Vec<B
             {
                 let name = node_text(&ident, bytes);
                 let intro = ident.start_byte();
-                push_binding(out, name.to_owned(), intro, BindingKind::Param, scopes);
+                let type_name = child
+                    .named_children(&mut child.walk())
+                    .find(|c| c.kind() == "user_type")
+                    .map(|t| simple_type_name(node_text(&t, bytes), ".").to_owned());
+                push_typed_binding(
+                    out,
+                    name.to_owned(),
+                    intro,
+                    BindingKind::Param,
+                    scopes,
+                    type_name,
+                );
             }
         }
     }
+}
+
+/// The declared/constructed type of a local `property_declaration`'s
+/// `variable_declaration`, as bare written text (see [`Binding::type_name`]) —
+/// a purely syntactic fact, never guessed.
+///
+/// Prefers an explicit type annotation (`val r: Repo = …`) written as a plain
+/// `user_type` child of the `variable_declaration` (nullable/function/other
+/// type shapes yield `None` rather than guessing). Otherwise, when the
+/// initializer immediately following the declaration is a bare constructor
+/// call whose callee is a simple identifier (`val r = Repo()`), uses that
+/// callee's name. Any other initializer shape (a qualified call, a method
+/// chain, …) yields `None`.
+fn property_declaration_type_name(prop: &Node, var_decl: &Node, bytes: &[u8]) -> Option<String> {
+    if let Some(t) = var_decl
+        .named_children(&mut var_decl.walk())
+        .find(|c| c.kind() == "user_type")
+    {
+        return Some(simple_type_name(node_text(&t, bytes), ".").to_owned());
+    }
+    let mut past_decl = false;
+    for child in prop.named_children(&mut prop.walk()) {
+        if past_decl {
+            if child.kind() != "call_expression" {
+                return None;
+            }
+            let callee = child.named_children(&mut child.walk()).next()?;
+            return (callee.kind() == "identifier")
+                .then(|| simple_type_name(node_text(&callee, bytes), ".").to_owned());
+        }
+        if child.id() == var_decl.id() {
+            past_decl = true;
+        }
+    }
+    None
 }
 
 // ── Inheritance extraction ───────────────────────────────────────────────────
@@ -1621,6 +1675,63 @@ fun main() {
             "for-loop x should be in a Function or Block scope, got {:?}",
             facts.scopes[x.scope].kind
         );
+    }
+
+    // Test B4b: typed local val → Local binding with type_name = Some("Repo").
+    #[test]
+    fn typed_local_val_carries_type_name() {
+        let src = "fun f() { val r: Repo = Repo() }";
+        let facts = extract(src, "src/F.kt");
+
+        let r = facts
+            .bindings
+            .iter()
+            .find(|b| b.kind == BindingKind::Local && b.name == "r")
+            .expect("expected a Local binding for 'r'");
+        assert_eq!(r.type_name.as_deref(), Some("Repo"));
+    }
+
+    // Test B4c: constructor-inferred local val (`val r = Repo()`, no annotation)
+    // → Local binding with type_name = Some("Repo").
+    #[test]
+    fn constructor_inferred_local_val_carries_type_name() {
+        let src = "fun f() { val r = Repo() }";
+        let facts = extract(src, "src/F.kt");
+
+        let r = facts
+            .bindings
+            .iter()
+            .find(|b| b.kind == BindingKind::Local && b.name == "r")
+            .expect("expected a Local binding for 'r'");
+        assert_eq!(r.type_name.as_deref(), Some("Repo"));
+    }
+
+    // Test B4d: untyped/uninferable local (`val x = 1`) → type_name = None.
+    #[test]
+    fn untyped_local_val_has_no_type_name() {
+        let src = "fun f() { val x = 1 }";
+        let facts = extract(src, "src/F.kt");
+
+        let x = facts
+            .bindings
+            .iter()
+            .find(|b| b.kind == BindingKind::Local && b.name == "x")
+            .expect("expected a Local binding for 'x'");
+        assert_eq!(x.type_name, None);
+    }
+
+    // Test B4e: typed parameter → Param binding with type_name = Some("Repo").
+    #[test]
+    fn typed_param_carries_type_name() {
+        let src = "fun f(r: Repo) {}";
+        let facts = extract(src, "src/F.kt");
+
+        let r = facts
+            .bindings
+            .iter()
+            .find(|b| b.kind == BindingKind::Param && b.name == "r")
+            .expect("expected a Param binding for 'r'");
+        assert_eq!(r.type_name.as_deref(), Some("Repo"));
     }
 
     // Test B5: class property is NOT a Local but IS a Definition.

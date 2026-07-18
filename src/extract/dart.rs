@@ -24,10 +24,10 @@ use crate::lang::Language;
 use crate::symbol::Descriptor;
 
 use super::{
-    ExtractCtx, Extractor, MIN_REF_LEN, attach_reference_scopes, collect_call_references,
-    definition_bindings, field_text, import_bindings, innermost_scope, make_symbol,
-    mark_self_receiver_calls, node_span, node_text, one_line_signature, push_binding,
-    push_import_ref, push_ref, push_scope, push_type_ref, simple_type_name,
+    ExtractCtx, Extractor, MIN_REF_LEN, attach_reference_scopes, child_text,
+    collect_call_references, definition_bindings, field_text, import_bindings, innermost_scope,
+    make_symbol, mark_self_receiver_calls, node_span, node_text, one_line_signature,
+    push_import_ref, push_ref, push_scope, push_type_ref, push_typed_binding, simple_type_name,
 };
 
 /// Tree-sitter query capturing call-callee identifiers.
@@ -1104,13 +1104,30 @@ fn collect_bindings_dfs(node: &Node, bytes: &[u8], scopes: &[Scope], out: &mut V
             // children (each with its own `name`/`value` fields, no `type`).
             for child in node.children(&mut node.walk()) {
                 if child.kind() == "initialized_variable_definition" {
+                    // Declared type is a plain `type` child (not a named field),
+                    // shared by every comma-separated identifier in this
+                    // definition. Dart has no `new` keyword requirement (since
+                    // Dart 2), so a bare call `Foo()` is syntactically identical
+                    // to a function call `foo()` — there is no reliable
+                    // constructor-call marker to infer a type from, unlike
+                    // Rust's struct literal or C#'s `new`. So an untyped local
+                    // (`var x = Foo()`) always yields `None` here — never guessed.
+                    let type_name = child_text(&child, "type", bytes)
+                        .map(|t| simple_type_name(&t, ".").to_owned());
                     if let Some(name) = field_text(&child, "name", bytes) {
                         let intro = child
                             .child_by_field_name("name")
                             .map(|n| n.start_byte())
                             .unwrap_or_else(|| child.start_byte());
                         if name.len() >= MIN_REF_LEN && innermost_scope(intro, scopes) != Some(0) {
-                            push_binding(out, name, intro, BindingKind::Local, scopes);
+                            push_typed_binding(
+                                out,
+                                name,
+                                intro,
+                                BindingKind::Local,
+                                scopes,
+                                type_name.clone(),
+                            );
                         }
                     }
                     for item in child
@@ -1125,7 +1142,14 @@ fn collect_bindings_dfs(node: &Node, bytes: &[u8], scopes: &[Scope], out: &mut V
                             if name.len() >= MIN_REF_LEN
                                 && innermost_scope(intro, scopes) != Some(0)
                             {
-                                push_binding(out, name, intro, BindingKind::Local, scopes);
+                                push_typed_binding(
+                                    out,
+                                    name,
+                                    intro,
+                                    BindingKind::Local,
+                                    scopes,
+                                    type_name.clone(),
+                                );
                             }
                         }
                     }
@@ -1145,7 +1169,10 @@ fn collect_params(params: &Node, bytes: &[u8], scopes: &[Scope], out: &mut Vec<B
         if child.kind() == "formal_parameter" {
             if let Some(name) = field_text(&child, "name", bytes) {
                 let intro = child.start_byte();
-                push_binding(out, name, intro, BindingKind::Param, scopes);
+                // Declared type is a plain `type` child (not a named field).
+                let type_name =
+                    child_text(&child, "type", bytes).map(|t| simple_type_name(&t, ".").to_owned());
+                push_typed_binding(out, name, intro, BindingKind::Param, scopes, type_name);
             }
         }
     }
@@ -1519,5 +1546,71 @@ void run() {
             !reads.contains(&"field"),
             "member property 'field' must NOT be emitted as a Read ref: {reads:?}"
         );
+    }
+
+    // ── Binding type_name (local-typed-call resolution) ────────────────────────
+
+    #[test]
+    fn typed_local_declaration_carries_type_name() {
+        let src = r#"
+void run() {
+  Repo repo = Repo();
+}
+"#;
+        let facts = extract(src, "lib/run.dart");
+        let repo = facts
+            .bindings
+            .iter()
+            .find(|b| b.kind == BindingKind::Local && b.name == "repo")
+            .expect("expected a Local binding for 'repo'");
+        assert_eq!(repo.type_name.as_deref(), Some("Repo"));
+    }
+
+    #[test]
+    fn constructor_call_local_has_no_type_name() {
+        // `var repo = Repo();` — Dart has no `new` requirement (since Dart 2),
+        // so a bare call `Repo()` is syntactically identical to a function
+        // call `repo()`; there is no reliable constructor marker to infer
+        // from, so this must stay `None` rather than guess.
+        let src = r#"
+void run() {
+  var repo = Repo();
+}
+"#;
+        let facts = extract(src, "lib/run.dart");
+        let repo = facts
+            .bindings
+            .iter()
+            .find(|b| b.kind == BindingKind::Local && b.name == "repo")
+            .expect("expected a Local binding for 'repo'");
+        assert_eq!(repo.type_name, None);
+    }
+
+    #[test]
+    fn untyped_local_has_no_type_name() {
+        let src = r#"
+void run() {
+  var result = compute();
+}
+"#;
+        let facts = extract(src, "lib/run.dart");
+        let result = facts
+            .bindings
+            .iter()
+            .find(|b| b.kind == BindingKind::Local && b.name == "result")
+            .expect("expected a Local binding for 'result'");
+        assert_eq!(result.type_name, None);
+    }
+
+    #[test]
+    fn typed_param_carries_type_name() {
+        let src = "void run(Repo repo) {}";
+        let facts = extract(src, "lib/run.dart");
+        let repo = facts
+            .bindings
+            .iter()
+            .find(|b| b.kind == BindingKind::Param && b.name == "repo")
+            .expect("expected a Param binding for 'repo'");
+        assert_eq!(repo.type_name.as_deref(), Some("Repo"));
     }
 }

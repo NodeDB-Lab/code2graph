@@ -350,3 +350,185 @@ mod csharp_tests {
         );
     }
 }
+
+#[cfg(all(test, feature = "kotlin"))]
+mod kotlin_tests {
+    use super::*;
+    use crate::extract::{Extractor, KotlinExtractor};
+
+    /// `class Repo { fun save() {} }` + `class C { fun run() { val repo: Repo = Repo(); repo.save() } }`
+    /// → exactly one edge, from the enclosing `run` to `...Repo#save().`, Scoped/LocalType.
+    #[test]
+    fn resolves_typed_local_method_call_end_to_end() {
+        let src = r#"
+class Repo {
+    fun save() {}
+}
+class C {
+    fun run() {
+        val repo: Repo = Repo()
+        repo.save()
+    }
+}
+"#;
+        let facts = KotlinExtractor.extract(src, "src/C.kt").unwrap();
+
+        let graph = LocalTypedCallResolver.resolve(&[facts]).unwrap();
+        let edges: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.provenance == Provenance::LocalType)
+            .collect();
+
+        assert_eq!(
+            edges.len(),
+            1,
+            "expected exactly one LocalType edge, got {:?}",
+            edges
+                .iter()
+                .map(|e| format!("{} -> {}", e.from.to_scip_string(), e.to.to_scip_string()))
+                .collect::<Vec<_>>()
+        );
+        let e = edges[0];
+        assert!(e.to.to_scip_string().ends_with("Repo#save()."));
+        assert_eq!(e.confidence, Confidence::Scoped);
+        assert_eq!(e.provenance, Provenance::LocalType);
+        assert!(e.from.to_scip_string().ends_with("run()."));
+    }
+
+    /// The receiver's type has no such member — no edge.
+    #[test]
+    fn wrong_member_yields_no_edge() {
+        let src = r#"
+class Repo {
+    fun save() {}
+}
+class C {
+    fun run() {
+        val repo: Repo = Repo()
+        repo.missing()
+    }
+}
+"#;
+        let facts = KotlinExtractor.extract(src, "src/C.kt").unwrap();
+
+        let graph = LocalTypedCallResolver.resolve(&[facts]).unwrap();
+        assert!(
+            graph
+                .edges
+                .iter()
+                .all(|e| e.provenance != Provenance::LocalType),
+            "Repo has no missing() member — must not emit a LocalType edge"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "dart"))]
+mod dart_tests {
+    use super::*;
+    use crate::extract::{DartExtractor, Extractor};
+
+    /// `class Repo { void save() {} }` + `class C { void run() { Repo repo = Repo(); repo.save(); } }`
+    /// → exactly one edge, from the enclosing `run` to `...Repo#save().`, Scoped/LocalType.
+    ///
+    /// Dart has no `new`-keyword marker for constructor calls, so this relies
+    /// on the explicit local type annotation (`Repo repo = …`), not
+    /// constructor-call inference (which the Dart extractor deliberately
+    /// does not attempt — see `dart.rs`'s binding collection).
+    #[test]
+    fn resolves_typed_local_method_call_end_to_end() {
+        let src = "class Repo { void save() {} } class C { void run() { Repo repo = Repo(); repo.save(); } }";
+        let facts = DartExtractor.extract(src, "lib/c.dart").unwrap();
+
+        let graph = LocalTypedCallResolver.resolve(&[facts]).unwrap();
+        let edges: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.provenance == Provenance::LocalType)
+            .collect();
+
+        assert_eq!(
+            edges.len(),
+            1,
+            "expected exactly one LocalType edge, got {:?}",
+            edges
+                .iter()
+                .map(|e| format!("{} -> {}", e.from.to_scip_string(), e.to.to_scip_string()))
+                .collect::<Vec<_>>()
+        );
+        let e = edges[0];
+        assert!(e.to.to_scip_string().ends_with("Repo#save()."));
+        assert_eq!(e.confidence, Confidence::Scoped);
+        assert_eq!(e.provenance, Provenance::LocalType);
+        assert!(e.from.to_scip_string().ends_with("run()."));
+    }
+
+    /// The receiver's type has no such member — no edge.
+    #[test]
+    fn wrong_member_yields_no_edge() {
+        let src = "class Repo { void save() {} } class C { void run() { Repo repo = Repo(); repo.missing(); } }";
+        let facts = DartExtractor.extract(src, "lib/c.dart").unwrap();
+
+        let graph = LocalTypedCallResolver.resolve(&[facts]).unwrap();
+        assert!(
+            graph
+                .edges
+                .iter()
+                .all(|e| e.provenance != Provenance::LocalType),
+            "Repo has no missing() member — must not emit a LocalType edge"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "scala"))]
+mod scala_tests {
+    use super::*;
+    use crate::extract::{Extractor, ScalaExtractor};
+
+    /// `class Repo { def save(): Unit = {} }` + `class C { def run(): Unit = { val repo: Repo = new Repo(); repo.save() } }`
+    /// → exactly one edge, from the enclosing `run` to `...Repo#save().`, Scoped/LocalType.
+    #[test]
+    fn resolves_typed_local_method_call_end_to_end() {
+        // Multi-line: tree-sitter-scala mis-parses two class defs on one line.
+        let src = "class Repo {\n  def save(): Unit = {}\n}\nclass C {\n  def run(): Unit = {\n    val repo: Repo = new Repo()\n    repo.save()\n  }\n}\n";
+        let facts = ScalaExtractor.extract(src, "src/C.scala").unwrap();
+
+        let graph = LocalTypedCallResolver.resolve(&[facts]).unwrap();
+        let edges: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.provenance == Provenance::LocalType)
+            .collect();
+
+        assert_eq!(
+            edges.len(),
+            1,
+            "expected exactly one LocalType edge, got {:?}",
+            edges
+                .iter()
+                .map(|e| format!("{} -> {}", e.from.to_scip_string(), e.to.to_scip_string()))
+                .collect::<Vec<_>>()
+        );
+        let e = edges[0];
+        assert!(e.to.to_scip_string().ends_with("Repo#save()."));
+        assert_eq!(e.confidence, Confidence::Scoped);
+        assert_eq!(e.provenance, Provenance::LocalType);
+        assert!(e.from.to_scip_string().ends_with("run()."));
+    }
+
+    /// The receiver's type has no such member — no edge.
+    #[test]
+    fn wrong_member_yields_no_edge() {
+        let src = "class Repo { def save(): Unit = {} } class C { def run(): Unit = { val repo: Repo = new Repo(); repo.missing() } }";
+        let facts = ScalaExtractor.extract(src, "src/C.scala").unwrap();
+
+        let graph = LocalTypedCallResolver.resolve(&[facts]).unwrap();
+        assert!(
+            graph
+                .edges
+                .iter()
+                .all(|e| e.provenance != Provenance::LocalType),
+            "Repo has no missing() member — must not emit a LocalType edge"
+        );
+    }
+}
