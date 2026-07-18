@@ -270,6 +270,8 @@ mod tests {
     use crate::extract::JavaExtractor;
     #[cfg(feature = "rust")]
     use crate::extract::RustExtractor;
+    #[cfg(feature = "typescript")]
+    use crate::extract::TypeScriptExtractor;
     #[cfg(feature = "java")]
     use crate::graph::types::{Occurrence, Reference};
 
@@ -705,11 +707,92 @@ mod tests {
         assert_eq!(e.provenance, Provenance::Conformance);
     }
 
-    // NOTE: the TypeScript/JavaScript end-to-end self-receiver test lives with the
-    // TS class-member extraction work: `this.method()` is already marked by the TS
-    // extractor, but resolving it to an inherited member requires TS to emit
-    // per-method `Type#method` symbols (it currently emits only the class symbol),
-    // which is a separate extraction unit.
+    /// TypeScript equivalent: `Base` defines `hello`, `Sub extends Base` calls
+    /// `this.hello()` from its own method without redefining it. Requires TS to
+    /// emit per-method `Type#method` symbols (class-member extraction) so the
+    /// enclosing `Sub#greetAll` type and the inherited `Base#hello` target both
+    /// exist as symbols.
+    #[cfg(feature = "typescript")]
+    #[test]
+    fn conformance_resolves_ts_self_receiver_inherited_class_method_end_to_end() {
+        let base = TypeScriptExtractor
+            .extract("export class Base { hello() {} }", "src/base.ts")
+            .unwrap();
+        let sub = TypeScriptExtractor
+            .extract(
+                "import { Base } from './base'; export class Sub extends Base { greetAll() { this.hello(); } }",
+                "src/sub.ts",
+            )
+            .unwrap();
+
+        let graph = ConformanceResolver.resolve(&[base, sub]).unwrap();
+
+        let conf_edges: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.provenance == Provenance::Conformance)
+            .collect();
+
+        assert_eq!(
+            conf_edges.len(),
+            1,
+            "expected exactly one conformance edge for the this.hello() site, got {:?}",
+            conf_edges
+                .iter()
+                .map(|e| format!("{} -> {}", e.from.to_scip_string(), e.to.to_scip_string()))
+                .collect::<Vec<_>>()
+        );
+
+        let e = conf_edges[0];
+        assert!(
+            e.to.to_scip_string().ends_with("Base#hello()."),
+            "edge `to` should be the inherited Base#hello(), got: {}",
+            e.to.to_scip_string()
+        );
+        assert!(
+            e.from.to_scip_string().ends_with("Sub#greetAll()."),
+            "edge `from` should be the enclosing Sub#greetAll(), got: {}",
+            e.from.to_scip_string()
+        );
+        assert_eq!(e.confidence, Confidence::Scoped);
+        assert_eq!(e.provenance, Provenance::Conformance);
+    }
+
+    /// JavaScript variant (shared TS core): same inheritance shape in `.js` files,
+    /// proving `this.method()` self-receiver resolution flows through for JS too.
+    #[cfg(feature = "typescript")]
+    #[test]
+    fn conformance_resolves_js_self_receiver_inherited_class_method_end_to_end() {
+        use crate::extract::JavaScriptExtractor;
+        let base = JavaScriptExtractor
+            .extract("export class Base { hello() {} }", "src/base.js")
+            .unwrap();
+        let sub = JavaScriptExtractor
+            .extract(
+                "import { Base } from './base'; export class Sub extends Base { greetAll() { this.hello(); } }",
+                "src/sub.js",
+            )
+            .unwrap();
+
+        let graph = ConformanceResolver.resolve(&[base, sub]).unwrap();
+        let conf_edges: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.provenance == Provenance::Conformance)
+            .collect();
+
+        assert_eq!(
+            conf_edges.len(),
+            1,
+            "expected exactly one conformance edge for the JS this.hello() site, got {:?}",
+            conf_edges
+                .iter()
+                .map(|e| format!("{} -> {}", e.from.to_scip_string(), e.to.to_scip_string()))
+                .collect::<Vec<_>>()
+        );
+        assert!(conf_edges[0].to.to_scip_string().ends_with("Base#hello()."));
+        assert_eq!(conf_edges[0].confidence, Confidence::Scoped);
+    }
 
     /// An unqualified reference (no receiver type written) is deferred entirely:
     /// resolving it would need receiver-type inference, which v1 does not do.
