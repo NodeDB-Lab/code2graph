@@ -27,8 +27,9 @@ use crate::symbol::Descriptor;
 
 use super::{
     ExtractCtx, Extractor, MIN_REF_LEN, attach_reference_scopes, collect_call_references,
-    definition_bindings, field_text, innermost_scope, is_static, make_symbol, node_span, node_text,
-    one_line_signature, push_binding, push_ref, push_scope, push_type_ref,
+    definition_bindings, field_text, innermost_scope, is_static, make_symbol,
+    mark_self_receiver_calls, node_span, node_text, one_line_signature, push_binding, push_ref,
+    push_scope, push_type_ref,
 };
 
 // NOTE: SymbolKind has no Union variant; unions map to Struct. Preprocessor
@@ -43,6 +44,25 @@ const CALL_QUERY: &str = r#"
   (call_expression function: (field_expression field: (field_identifier) @callee))
   (call_expression function: (qualified_identifier name: (identifier) @callee))
 ]
+"#;
+
+/// Method calls whose receiver is written as the `this` keyword
+/// (`this->foo()`).
+///
+/// Deliberately a *separate* query from [`CALL_QUERY`] rather than an extra
+/// alternation branch there, mirroring the Rust extractor's `SELF_CALL_QUERY`:
+/// `field_expression argument: (this) field: (field_identifier) …` and the
+/// existing `field_expression field: (field_identifier) …` branch both
+/// structurally match the same `this->foo()` node, and tree-sitter's
+/// alternation explores every branch that fits — combining them in one `[ ]`
+/// would double-emit the reference. Run as a second pass and correlate back to
+/// [`CALL_QUERY`]'s output by the `field_identifier`'s byte offset (identical
+/// node in both queries).
+const SELF_CALL_QUERY: &str = r#"
+(call_expression
+  function: (field_expression
+    argument: (this)
+    field: (field_identifier) @callee))
 "#;
 
 /// Extracts C++ symbols and references.
@@ -88,6 +108,14 @@ impl Extractor for CppExtractor {
         ));
         let mut references =
             collect_call_references(&root, &ts_language, CALL_QUERY, Language::Cpp, bytes, file)?;
+        mark_self_receiver_calls(
+            &root,
+            &ts_language,
+            SELF_CALL_QUERY,
+            Language::Cpp,
+            bytes,
+            &mut references,
+        )?;
         collect_inheritance(&root, bytes, file, &mut references);
         collect_read_references(&root, bytes, file, &mut references);
         collect_write_references(&root, bytes, file, &mut references);
@@ -1255,6 +1283,50 @@ void run() {
             "expected 'connect' in {names:?}"
         );
         assert!(names.contains(&"handle"), "expected 'handle' in {names:?}");
+    }
+
+    #[test]
+    fn this_receiver_call_marks_self_receiver() {
+        let src = r#"
+struct S {
+    void foo() {}
+    void run() { this->foo(); }
+};
+"#;
+        let facts = CppExtractor.extract(src, "src/s.cpp").unwrap();
+        let foo_call = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Call && r.name == "foo")
+            .expect("expected a Call reference for 'foo'");
+        assert!(
+            foo_call.self_receiver,
+            "this->foo() should mark self_receiver = true"
+        );
+        assert_eq!(
+            foo_call.qualifier, None,
+            "self-call qualifier must stay None"
+        );
+    }
+
+    #[test]
+    fn non_self_receiver_call_does_not_mark_self_receiver() {
+        let src = r#"
+struct S {
+    void foo() {}
+    void run(S* obj) { obj->foo(); }
+};
+"#;
+        let facts = CppExtractor.extract(src, "src/s.cpp").unwrap();
+        let foo_calls: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Call && r.name == "foo")
+            .collect();
+        assert!(
+            foo_calls.iter().any(|r| !r.self_receiver),
+            "obj->foo() must NOT mark self_receiver, got {foo_calls:?}"
+        );
     }
 
     #[test]

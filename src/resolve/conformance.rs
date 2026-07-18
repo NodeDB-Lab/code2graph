@@ -261,15 +261,34 @@ fn find_inherited(
     None
 }
 
-#[cfg(all(test, any(feature = "java", feature = "rust", feature = "typescript")))]
+#[cfg(all(
+    test,
+    any(
+        feature = "java",
+        feature = "rust",
+        feature = "typescript",
+        feature = "cpp",
+        feature = "swift"
+    )
+))]
 mod tests {
     use super::*;
-    #[cfg(any(feature = "java", feature = "rust", feature = "typescript"))]
+    #[cfg(feature = "cpp")]
+    use crate::extract::CppExtractor;
+    #[cfg(any(
+        feature = "java",
+        feature = "rust",
+        feature = "typescript",
+        feature = "cpp",
+        feature = "swift"
+    ))]
     use crate::extract::Extractor;
     #[cfg(feature = "java")]
     use crate::extract::JavaExtractor;
     #[cfg(feature = "rust")]
     use crate::extract::RustExtractor;
+    #[cfg(feature = "swift")]
+    use crate::extract::SwiftExtractor;
     #[cfg(feature = "typescript")]
     use crate::extract::TypeScriptExtractor;
     #[cfg(feature = "java")]
@@ -792,6 +811,104 @@ mod tests {
         );
         assert!(conf_edges[0].to.to_scip_string().ends_with("Base#hello()."));
         assert_eq!(conf_edges[0].confidence, Confidence::Scoped);
+    }
+
+    /// C++ variant: `Base` defines `hello`, `Sub : public Base` calls
+    /// `this->hello()` from its own method without redefining it. Mirrors
+    /// `conformance_resolves_java_self_receiver_inherited_class_method_end_to_end`.
+    #[cfg(feature = "cpp")]
+    #[test]
+    fn conformance_resolves_cpp_self_receiver_inherited_class_method_end_to_end() {
+        let base = CppExtractor
+            .extract("class Base { public: void hello() {} };", "src/base.cpp")
+            .unwrap();
+        let sub = CppExtractor
+            .extract(
+                "class Sub : public Base { public: void greetAll() { this->hello(); } };",
+                "src/sub.cpp",
+            )
+            .unwrap();
+
+        let graph = ConformanceResolver.resolve(&[base, sub]).unwrap();
+
+        let conf_edges: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.provenance == Provenance::Conformance)
+            .collect();
+
+        assert_eq!(
+            conf_edges.len(),
+            1,
+            "expected exactly one conformance edge for the this->hello() site, got {:?}",
+            conf_edges
+                .iter()
+                .map(|e| format!("{} -> {}", e.from.to_scip_string(), e.to.to_scip_string()))
+                .collect::<Vec<_>>()
+        );
+
+        let e = conf_edges[0];
+        assert!(
+            e.to.to_scip_string().ends_with("Base#hello()."),
+            "edge `to` should be the inherited Base#hello(), got: {}",
+            e.to.to_scip_string()
+        );
+        assert!(
+            e.from.to_scip_string().ends_with("Sub#greetAll()."),
+            "edge `from` should be the enclosing Sub#greetAll(), got: {}",
+            e.from.to_scip_string()
+        );
+        assert_eq!(e.confidence, Confidence::Scoped);
+        assert_eq!(e.provenance, Provenance::Conformance);
+    }
+
+    /// Swift variant: `Base` defines `hello`, `Sub: Base` calls `self.hello()`
+    /// from its own method without redefining it. Mirrors
+    /// `conformance_resolves_java_self_receiver_inherited_class_method_end_to_end`.
+    #[cfg(feature = "swift")]
+    #[test]
+    fn conformance_resolves_swift_self_receiver_inherited_class_method_end_to_end() {
+        let base = SwiftExtractor
+            .extract("class Base { func hello() {} }", "Sources/Base.swift")
+            .unwrap();
+        let sub = SwiftExtractor
+            .extract(
+                "class Sub: Base { func greetAll() { self.hello() } }",
+                "Sources/Sub.swift",
+            )
+            .unwrap();
+
+        let graph = ConformanceResolver.resolve(&[base, sub]).unwrap();
+
+        let conf_edges: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.provenance == Provenance::Conformance)
+            .collect();
+
+        assert_eq!(
+            conf_edges.len(),
+            1,
+            "expected exactly one conformance edge for the self.hello() site, got {:?}",
+            conf_edges
+                .iter()
+                .map(|e| format!("{} -> {}", e.from.to_scip_string(), e.to.to_scip_string()))
+                .collect::<Vec<_>>()
+        );
+
+        let e = conf_edges[0];
+        assert!(
+            e.to.to_scip_string().ends_with("Base#hello()."),
+            "edge `to` should be the inherited Base#hello(), got: {}",
+            e.to.to_scip_string()
+        );
+        assert!(
+            e.from.to_scip_string().ends_with("Sub#greetAll()."),
+            "edge `from` should be the enclosing Sub#greetAll(), got: {}",
+            e.from.to_scip_string()
+        );
+        assert_eq!(e.confidence, Confidence::Scoped);
+        assert_eq!(e.provenance, Provenance::Conformance);
     }
 
     /// An unqualified reference (no receiver type written) is deferred entirely:

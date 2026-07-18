@@ -34,8 +34,9 @@ use crate::symbol::Descriptor;
 
 use super::{
     ExtractCtx, Extractor, MIN_REF_LEN, attach_reference_scopes, collect_call_references,
-    definition_bindings, field_text, import_bindings, innermost_scope, make_symbol, node_span,
-    node_text, one_line_signature, push_binding, push_ref, push_scope, push_type_ref,
+    definition_bindings, field_text, import_bindings, innermost_scope, make_symbol,
+    mark_self_receiver_calls, node_span, node_text, one_line_signature, push_binding, push_ref,
+    push_scope, push_type_ref,
 };
 
 /// Tree-sitter query capturing call-callee identifiers.
@@ -48,6 +49,24 @@ const CALL_QUERY: &str = r#"
   (call_expression (simple_identifier) @callee)
   (call_expression (navigation_expression suffix: (navigation_suffix suffix: (simple_identifier) @callee)))
 ]
+"#;
+
+/// Method calls whose receiver is written as the `self` keyword
+/// (`self.foo()`).
+///
+/// Deliberately a *separate* query from [`CALL_QUERY`] rather than an extra
+/// alternation branch there, mirroring the Rust extractor's `SELF_CALL_QUERY`:
+/// `navigation_expression target: (self_expression) …` and the existing
+/// member-call pattern both structurally match the same `self.foo()` node,
+/// and tree-sitter's alternation explores every branch that fits — combining
+/// them in one `[ ]` would double-emit the reference. Run as a second pass
+/// and correlate back to [`CALL_QUERY`]'s output by the `simple_identifier`'s
+/// byte offset (identical node in both queries).
+const SELF_CALL_QUERY: &str = r#"
+(call_expression
+  (navigation_expression
+    target: (self_expression)
+    suffix: (navigation_suffix suffix: (simple_identifier) @callee)))
 "#;
 
 /// Extracts Swift symbols and references.
@@ -104,6 +123,14 @@ impl Extractor for SwiftExtractor {
             Language::Swift,
             bytes,
             file,
+        )?;
+        mark_self_receiver_calls(
+            &root,
+            &ts_language,
+            SELF_CALL_QUERY,
+            Language::Swift,
+            bytes,
+            &mut references,
         )?;
         collect_inheritance(&root, bytes, file, &mut references);
         collect_imports(&root, bytes, file, &mut references);
@@ -1355,6 +1382,50 @@ func main() {
     fn lang_tag() {
         let facts = extract("func foo() {}", "Sources/Foo.swift");
         assert_eq!(facts.lang, "swift");
+    }
+
+    #[test]
+    fn self_receiver_call_marks_self_receiver() {
+        let src = r#"
+class S {
+    func foo() {}
+    func run() { self.foo() }
+}
+"#;
+        let facts = extract(src, "Sources/S.swift");
+        let foo_call = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Call && r.name == "foo")
+            .expect("expected a Call reference for 'foo'");
+        assert!(
+            foo_call.self_receiver,
+            "self.foo() should mark self_receiver = true"
+        );
+        assert_eq!(
+            foo_call.qualifier, None,
+            "self-call qualifier must stay None"
+        );
+    }
+
+    #[test]
+    fn non_self_receiver_call_does_not_mark_self_receiver() {
+        let src = r#"
+class S {
+    func foo() {}
+    func run(obj: S) { obj.foo() }
+}
+"#;
+        let facts = extract(src, "Sources/S.swift");
+        let foo_calls: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Call && r.name == "foo")
+            .collect();
+        assert!(
+            foo_calls.iter().any(|r| !r.self_receiver),
+            "obj.foo() must NOT mark self_receiver, got {foo_calls:?}"
+        );
     }
 
     // Test 9: class with superclass and protocol conformance
