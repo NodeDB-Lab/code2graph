@@ -12,9 +12,9 @@
 //! fan-out edges for that reference stay [`Confidence::NameOnly`]. This is the
 //! recall-first baseline that works for every language without per-language
 //! binding rules — the confidence varies, edges are otherwise preserved. The one
-//! exception is scalability: a name shared by more than [`MAX_NAME_FANOUT`]
+//! exception is scalability: a name shared by more than `MAX_NAME_FANOUT`
 //! definitions is hopelessly ambiguous, so its combinatorial cross-product is
-//! dropped (keeping any import-disambiguated survivor) — see [`MAX_NAME_FANOUT`].
+//! dropped (keeping any import-disambiguated survivor) — see `MAX_NAME_FANOUT`.
 //! A precise resolver tags its edges [`Confidence::Exact`] instead.
 //!
 //! It returns neutral [`Edge`]s and never writes to storage.
