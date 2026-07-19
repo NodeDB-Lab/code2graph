@@ -181,7 +181,7 @@ jobs:
           release_json() { curl -fsSL "https://pypi.org/pypi/$project/$version/json"; }
           check_hashes() {
             local json="$1" file name local_hash remote_hash
-            mapfile -t local_names < <(find bundle/python -maxdepth 1 -type f -printf '%f\n' | sort)
+            mapfile -t local_names < <(find bundle/python -maxdepth 1 -type f \( -name '*.whl' -o -name '*.tar.gz' \) -printf '%f\n' | sort)
             mapfile -t remote_names < <(jq -r '.urls[].filename' <<<"$json" | sort)
             for name in "${remote_names[@]}"; do
               printf '%s\n' "${local_names[@]}" | grep -Fxq "$name" || { echo "unexpected PyPI artifact $name" >&2; return 1; }
@@ -202,12 +202,12 @@ jobs:
           set -euo pipefail
           for attempt in {1..90}; do
             if json="$(curl -fsSL -H 'Cache-Control: no-cache' "https://pypi.org/pypi/code2graph-rs/${{ needs.validate.outputs.python_version }}/json?attempt=$attempt" 2>/dev/null)"; then
-              mapfile -t local_names < <(find bundle/python -maxdepth 1 -type f -printf '%f\n' | sort)
+              mapfile -t local_names < <(find bundle/python -maxdepth 1 -type f \( -name '*.whl' -o -name '*.tar.gz' \) -printf '%f\n' | sort)
               mapfile -t remote_names < <(jq -r '.urls[].filename' <<<"$json" | sort)
               complete=true
               test "${local_names[*]}" = "${remote_names[*]}" || complete=false
-              for file in bundle/python/*; do
-                name="$(basename "$file")"; hash="$(sha256sum "$file" | awk '{print $1}')"
+              for name in "${local_names[@]}"; do
+                hash="$(sha256sum "bundle/python/$name" | awk '{print $1}')"
                 test "$(jq -r --arg name "$name" '.urls[] | select(.filename == $name) | .digests.sha256' <<<"$json")" = "$hash" || complete=false
               done
               "$complete" && exit 0
