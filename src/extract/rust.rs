@@ -186,6 +186,7 @@ impl RustExtractor {
         collect_type_references(&root, &ts_language, bytes, file, &mut references)?;
         collect_associated_call_type_references(&root, &ts_language, bytes, file, &mut references)?;
         collect_read_references(&root, bytes, file, &mut references);
+        collect_field_access_references(&root, bytes, file, &mut references);
         collect_write_references(&root, bytes, file, &mut references);
         #[cfg(feature = "sql")]
         if let Some(rules) = rules {
@@ -1353,6 +1354,86 @@ fn collect_write_references(node: &Node, bytes: &[u8], file: &str, out: &mut Vec
     for child in node.children(&mut node.walk()) {
         collect_write_references(&child, bytes, file, out);
     }
+}
+
+/// Recursively walk `node` and emit [`RefRole::Read`] references for
+/// field-access expressions (`x.field`) whose `field:` is a `field_identifier`,
+/// EXCEPT method-call callees (`x.foo()`) — those are already captured as
+/// [`RefRole::Call`] by [`CALL_QUERY`], so re-emitting them here would
+/// double-count. Capturing the bare field read lets a resolver connect it to the
+/// `Field` symbol emitted for the struct field.
+///
+/// Receiver disambiguation mirrors the method-call receiver convention exactly:
+/// - a bare-identifier receiver (`x.field`) populates [`Reference::qualifier`]
+///   with the receiver name — the same fact
+///   [`mark_receiver_qualifier_calls`](super::mark_receiver_qualifier_calls)
+///   records for `x.foo()`, letting a typed resolver map `x` to its declared type;
+/// - a `self` receiver (`self.field`) sets `self_receiver` and clears
+///   `qualifier`, as
+///   [`mark_self_receiver_calls`](super::mark_self_receiver_calls) does for
+///   `self.foo()`;
+/// - any other receiver (`a().field`, `a.b.field`) leaves `qualifier = None` —
+///   still captured by name for name-tier resolution.
+///
+/// `scope` is left `None`; the enclosing scope is attached later by
+/// [`attach_reference_scopes`](super::attach_reference_scopes), as for every
+/// other reference. Applies [`MIN_REF_LEN`].
+fn collect_field_access_references(
+    node: &Node,
+    bytes: &[u8],
+    file: &str,
+    out: &mut Vec<Reference>,
+) {
+    // Skip macro bodies — their AST is unreliable.
+    if matches!(node.kind(), "macro_definition" | "macro_invocation") {
+        return;
+    }
+    if node.kind() == "field_expression" {
+        if let Some(field) = node.child_by_field_name("field") {
+            if field.kind() == "field_identifier" && !is_method_call_callee(node) {
+                let name = node_text(&field, bytes);
+                if name.len() >= MIN_REF_LEN {
+                    let (qualifier, self_receiver) = match node.child_by_field_name("value") {
+                        Some(v) if v.kind() == "self" => (None, true),
+                        Some(v) if v.kind() == "identifier" => {
+                            (Some(node_text(&v, bytes).to_owned()), false)
+                        }
+                        _ => (None, false),
+                    };
+                    out.push(Reference {
+                        name: name.to_owned(),
+                        occ: node_occurrence(&field, file),
+                        role: RefRole::Read,
+                        source_module: None,
+                        from_path: None,
+                        is_reexport: false,
+                        imported_name: None,
+                        qualifier,
+                        scope: None,
+                        type_ref_ctx: None,
+                        cross_artifact: false,
+                        self_receiver,
+                    });
+                }
+            }
+        }
+    }
+    for child in node.children(&mut node.walk()) {
+        collect_field_access_references(&child, bytes, file, out);
+    }
+}
+
+/// True when `field_expr` (a `field_expression`) is the `function:` callee of a
+/// parent `call_expression` — i.e. a method call `x.foo()`, already captured as a
+/// [`RefRole::Call`] reference by [`CALL_QUERY`]. Such nodes must NOT also be
+/// emitted as a field Read by [`collect_field_access_references`].
+fn is_method_call_callee(field_expr: &Node) -> bool {
+    field_expr
+        .parent()
+        .filter(|p| p.kind() == "call_expression")
+        .and_then(|p| p.child_by_field_name("function"))
+        .as_ref()
+        == Some(field_expr)
 }
 
 // ── Query-binding scan (cross-artifact code→SQL edges) ───────────────────────
@@ -3331,21 +3412,99 @@ impl std::fmt::Display for Point {
     }
 
     #[test]
-    fn field_access_not_a_read_of_field() {
-        // `fn f(c: C) -> i32 { c.field }` →
-        //   - a Read ref "c" (the receiver) is acceptable
-        //   - NO Read ref "field" (field_identifier is a different node kind)
-        let src = "fn f(c: C) -> i32 { c.field }";
+    fn field_access_is_a_read_of_the_field() {
+        // `fn f(c: Config) -> i32 { c.value }` → a Read ref "value" whose
+        // `qualifier` is the bare-identifier receiver "c" (the fact a typed
+        // resolver needs to map `c.value` onto Config's `value` field, exactly
+        // as method calls carry the receiver into `qualifier`).
+        let src = "fn f(c: Config) -> i32 { c.value }";
         let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
         let field_reads: Vec<_> = facts
             .references
             .iter()
-            .filter(|r| r.role == RefRole::Read && r.name == "field")
+            .filter(|r| r.role == RefRole::Read && r.name == "value")
+            .collect();
+        assert_eq!(
+            field_reads.len(),
+            1,
+            "expected exactly one Read ref for field 'value'; got: {field_reads:?}"
+        );
+        assert_eq!(
+            field_reads[0].qualifier.as_deref(),
+            Some("c"),
+            "field read 'value' must carry the receiver 'c' as qualifier"
+        );
+        assert!(
+            !field_reads[0].self_receiver,
+            "a bare-identifier receiver is not a self receiver"
+        );
+    }
+
+    #[test]
+    fn method_call_not_also_a_field_read() {
+        // `fn f(x: X) { x.foo(); }` → exactly one Call ref "foo" and NO Read ref
+        // "foo": the method-call callee must not be double-emitted as a field read.
+        let src = "fn f(x: X) { x.foo(); }";
+        let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
+        let call_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Call && r.name == "foo")
+            .collect();
+        assert_eq!(
+            call_refs.len(),
+            1,
+            "expected exactly one Call ref for 'foo'; got: {call_refs:?}"
+        );
+        let read_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Read && r.name == "foo")
             .collect();
         assert!(
-            field_reads.is_empty(),
-            "field 'field' in field_expression must NOT be a Read ref; got: {field_reads:?}"
+            read_refs.is_empty(),
+            "x.foo() must NOT also produce a Read ref for 'foo'; got: {read_refs:?}"
         );
+    }
+
+    #[test]
+    fn self_field_read_marks_self_receiver() {
+        // `self.field` is marked consistently with `self.method()`: `self_receiver`
+        // is set and `qualifier` is cleared (the owning type comes from the
+        // enclosing member, never from the `self` keyword).
+        let src = "impl S { fn f(&self) -> i32 { self.value } }";
+        let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
+        let read = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Read && r.name == "value")
+            .expect("expected a Read ref for 'value' from self.value");
+        assert!(
+            read.self_receiver,
+            "self.value must set self_receiver = true"
+        );
+        assert_eq!(
+            read.qualifier, None,
+            "self.value must clear qualifier (self is not a resolvable receiver)"
+        );
+    }
+
+    #[test]
+    fn chained_receiver_field_read_has_no_qualifier() {
+        // `a().field` — the receiver is not a bare identifier, so the field read
+        // is still captured by name but carries no `qualifier`.
+        let src = "fn f() -> i32 { a().field }";
+        let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
+        let read = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Read && r.name == "field")
+            .expect("expected a Read ref for 'field' from a().field");
+        assert_eq!(
+            read.qualifier, None,
+            "a().field must leave qualifier = None (receiver is not a bare identifier)"
+        );
+        assert!(!read.self_receiver, "a().field is not a self receiver");
     }
 
     // ── assoc fn / assoc const extraction (unit C3) ───────────────────────────
