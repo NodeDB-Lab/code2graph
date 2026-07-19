@@ -33,7 +33,7 @@ pub use incremental::{
     FILE_SUBGRAPH_SCHEMA_VERSION, FileChange, FileSubgraph, IncrementalGraph, ScopeGraphDelta,
     ScopeSnapshotToken, TrackedIncrementalGraph,
 };
-pub use layered::LayeredResolver;
+pub use layered::{LayeredResolver, supplement_scoped_graph};
 pub use local_typed_call::LocalTypedCallResolver;
 pub use normalized_name::NormalizedNameResolver;
 pub use resolver::Resolver;

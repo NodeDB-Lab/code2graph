@@ -68,6 +68,51 @@ impl LayeredResolver {
             Box::new(NormalizedNameResolver),
         ])
     }
+
+    /// The default **precise** tier: scope-path resolution plus the two additive
+    /// receiver-typed passes, all emitting `Scoped`/`Exact` edges only.
+    /// 1. [`ScopeGraphResolver`] — scope-aware path resolution.
+    /// 2. [`ConformanceResolver`] — inherited/implemented cross-file members
+    ///    (`Provenance::Conformance`).
+    /// 3. [`LocalTypedCallResolver`] — member calls on a receiver whose type is
+    ///    known syntactically (`Provenance::LocalType`).
+    ///
+    /// Deliberately excludes the recall/heuristic layers of [`default_dense`]
+    /// (`SymbolTableResolver`, `ExternalResolver`, `NormalizedNameResolver`).
+    /// Order matters: `ScopeGraphResolver` runs first so its `Exact`/`Scoped`
+    /// edges win the confidence-preferring dedup.
+    ///
+    /// [`default_dense`]: LayeredResolver::default_dense
+    pub fn default_scoped() -> Self {
+        Self::new(vec![
+            Box::new(ScopeGraphResolver),
+            Box::new(ConformanceResolver),
+            Box::new(LocalTypedCallResolver),
+        ])
+    }
+}
+
+/// Supplement an already-resolved scope-tier graph with the remaining precise
+/// resolvers (Conformance, LocalTypedCall), merging by the same confidence rule
+/// LayeredResolver uses. Lets the CLI reuse a scope graph it resolved
+/// incrementally instead of re-running ScopeGraphResolver. Equivalent to
+/// `LayeredResolver::default_scoped().resolve(files)` whenever `scope_graph`
+/// equals `ScopeGraphResolver.resolve(files)`.
+pub fn supplement_scoped_graph(
+    scope_graph: CodeGraph,
+    files: &[FileFacts],
+) -> crate::Result<CodeGraph> {
+    crate::validate_file_facts(files)?;
+    // The precise set here mirrors `LayeredResolver::default_scoped()`; the layer
+    // order (scope graph first, then conformance, then local-typed) must match it
+    // so the two are equivalent.
+    let conformance_graph = ConformanceResolver.resolve(files)?;
+    let localtyped_graph = LocalTypedCallResolver.resolve(files)?;
+    Ok(merge_graphs(vec![
+        scope_graph,
+        conformance_graph,
+        localtyped_graph,
+    ]))
 }
 
 impl Resolver for LayeredResolver {
@@ -80,80 +125,87 @@ impl Resolver for LayeredResolver {
             .map(|r| r.resolve(files))
             .collect::<crate::Result<_>>()?;
 
-        // ── 2. Symbol union — dedup by complete structural identity ────────
-        let mut seen_syms: HashSet<crate::symbol::SymbolId> = HashSet::new();
-        let mut symbols: Vec<Symbol> = Vec::new();
-        for g in &graphs {
-            for sym in &g.symbols {
-                if seen_syms.insert(sym.id.clone()) {
-                    symbols.push(sym.clone());
-                }
-            }
-        }
-
-        // ── 3. Edge union — confidence-preferring dedup ─────────────────────
-        //
-        // The dedup key uses structural SymbolIds so language/file context is
-        // not erased by the standard SCIP presentation string.
-        // `Occurrence` is `Eq` but not `Hash`, so we decompose it by hand.
-        // `RefRole` is `Hash + Eq`; `Provenance` is `Hash + Eq`.
-
-        type ResolutionKey = (
-            crate::symbol::SymbolId,
-            crate::symbol::SymbolId,
-            RefRole,
-            String,
-            usize,
-        );
-
-        // Flatten all edges in layer order (layer 0 first) and compute each
-        // edge's key once, shared across both passes.
-        let all_edges: Vec<_> = graphs.iter().flat_map(|g| g.edges.iter()).collect();
-        let keys: Vec<ResolutionKey> = all_edges
-            .iter()
-            .map(|e| {
-                (
-                    e.from.clone(),
-                    e.to.clone(),
-                    e.role,
-                    e.occ.file.clone(),
-                    e.occ.byte,
-                )
-            })
-            .collect();
-
-        // Pass 1: find max Confidence per key.
-        let mut max_conf: HashMap<ResolutionKey, Confidence> = HashMap::new();
-        for (key, e) in keys.iter().zip(all_edges.iter()) {
-            if let Some(c) = max_conf.get_mut(key) {
-                *c = (*c).max(e.confidence);
-            } else {
-                max_conf.insert(key.clone(), e.confidence);
-            }
-        }
-
-        // Pass 2: iterate in original order; keep an edge iff:
-        //   - its confidence equals the max for its key, AND
-        //   - (key, provenance) has not already been emitted (exact-dupe guard).
-        let mut seen_key_prov: HashSet<crate::graph::EdgeKey> = HashSet::new();
-        let mut edges: Vec<Edge> = Vec::new();
-        for (e, key) in all_edges.into_iter().zip(keys) {
-            // Every key was inserted in pass 1; the `else` branch is unreachable
-            // in practice but avoids any `.unwrap()` in non-test code.
-            let Some(&max) = max_conf.get(&key) else {
-                continue;
-            };
-            if e.confidence < max {
-                continue;
-            }
-            // Same confidence: keep each distinct provenance once.
-            if seen_key_prov.insert(e.key()) {
-                edges.push(e.clone());
-            }
-        }
-
-        Ok(CodeGraph { symbols, edges })
+        Ok(merge_graphs(graphs))
     }
+}
+
+/// Merge already-resolved graphs (given in layer order, layer 0 first) into one
+/// [`CodeGraph`]: union symbols by structural identity, then union edges with the
+/// confidence-preferring dedup documented on [`LayeredResolver`].
+fn merge_graphs(graphs: Vec<CodeGraph>) -> CodeGraph {
+    // ── 2. Symbol union — dedup by complete structural identity ────────
+    let mut seen_syms: HashSet<crate::symbol::SymbolId> = HashSet::new();
+    let mut symbols: Vec<Symbol> = Vec::new();
+    for g in &graphs {
+        for sym in &g.symbols {
+            if seen_syms.insert(sym.id.clone()) {
+                symbols.push(sym.clone());
+            }
+        }
+    }
+
+    // ── 3. Edge union — confidence-preferring dedup ─────────────────────
+    //
+    // The dedup key uses structural SymbolIds so language/file context is
+    // not erased by the standard SCIP presentation string.
+    // `Occurrence` is `Eq` but not `Hash`, so we decompose it by hand.
+    // `RefRole` is `Hash + Eq`; `Provenance` is `Hash + Eq`.
+
+    type ResolutionKey = (
+        crate::symbol::SymbolId,
+        crate::symbol::SymbolId,
+        RefRole,
+        String,
+        usize,
+    );
+
+    // Flatten all edges in layer order (layer 0 first) and compute each
+    // edge's key once, shared across both passes.
+    let all_edges: Vec<_> = graphs.iter().flat_map(|g| g.edges.iter()).collect();
+    let keys: Vec<ResolutionKey> = all_edges
+        .iter()
+        .map(|e| {
+            (
+                e.from.clone(),
+                e.to.clone(),
+                e.role,
+                e.occ.file.clone(),
+                e.occ.byte,
+            )
+        })
+        .collect();
+
+    // Pass 1: find max Confidence per key.
+    let mut max_conf: HashMap<ResolutionKey, Confidence> = HashMap::new();
+    for (key, e) in keys.iter().zip(all_edges.iter()) {
+        if let Some(c) = max_conf.get_mut(key) {
+            *c = (*c).max(e.confidence);
+        } else {
+            max_conf.insert(key.clone(), e.confidence);
+        }
+    }
+
+    // Pass 2: iterate in original order; keep an edge iff:
+    //   - its confidence equals the max for its key, AND
+    //   - (key, provenance) has not already been emitted (exact-dupe guard).
+    let mut seen_key_prov: HashSet<crate::graph::EdgeKey> = HashSet::new();
+    let mut edges: Vec<Edge> = Vec::new();
+    for (e, key) in all_edges.into_iter().zip(keys) {
+        // Every key was inserted in pass 1; the `else` branch is unreachable
+        // in practice but avoids any `.unwrap()` in non-test code.
+        let Some(&max) = max_conf.get(&key) else {
+            continue;
+        };
+        if e.confidence < max {
+            continue;
+        }
+        // Same confidence: keep each distinct provenance once.
+        if seen_key_prov.insert(e.key()) {
+            edges.push(e.clone());
+        }
+    }
+
+    CodeGraph { symbols, edges }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────

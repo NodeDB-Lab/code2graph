@@ -6,7 +6,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use code2graph::{
     CodeGraph, FileChange, FileFacts, FileSubgraph, IncrementalGraph, LayeredResolver, Resolver,
-    ScopeGraphDelta, ScopeSnapshotToken, SymbolTableResolver, validate_file_facts,
+    ScopeGraphDelta, ScopeSnapshotToken, SymbolTableResolver, supplement_scoped_graph,
+    validate_file_facts,
 };
 
 use crate::cache::{CandidateId, ResolverCacheTier};
@@ -154,6 +155,12 @@ fn resolve_scope(inputs: ResolveCandidateInputs<'_>) -> Result<ResolvedCandidate
     )?;
     let graph = tracked.graph();
     check(inputs.deadline, inputs.cancellation)?;
+    // The persisted scope-tier whole-graph unions the precise receiver-typed
+    // edges (Conformance + LocalTypedCall) so method callers/usages resolve at
+    // the default tier; per-file subgraphs remain scope-only to preserve
+    // incremental hydration.
+    let graph = supplement_scoped_graph(graph, inputs.files).map_err(index_error)?;
+    check(inputs.deadline, inputs.cancellation)?;
     Ok(ResolvedCandidate {
         graph,
         file_subgraphs,
@@ -175,6 +182,12 @@ fn fresh_scope(inputs: ResolveCandidateInputs<'_>) -> Result<ResolvedCandidate> 
         inputs.cancellation,
     )?;
     let graph = store.graph();
+    check(inputs.deadline, inputs.cancellation)?;
+    // The persisted scope-tier whole-graph unions the precise receiver-typed
+    // edges (Conformance + LocalTypedCall) so method callers/usages resolve at
+    // the default tier; per-file subgraphs remain scope-only to preserve
+    // incremental hydration.
+    let graph = supplement_scoped_graph(graph, inputs.files).map_err(index_error)?;
     check(inputs.deadline, inputs.cancellation)?;
     Ok(ResolvedCandidate {
         graph,
@@ -389,7 +402,7 @@ mod tests {
             (ResolverCacheTier::Name, SymbolTableResolver.resolve(&files)),
             (
                 ResolverCacheTier::Scope,
-                code2graph::ScopeGraphResolver.resolve(&files),
+                code2graph::LayeredResolver::default_scoped().resolve(&files),
             ),
             (
                 ResolverCacheTier::Dense,
@@ -416,6 +429,55 @@ mod tests {
             }
             assert!(resolved.scope_delta.is_none());
         }
+    }
+
+    #[test]
+    fn scope_tier_unions_receiver_typed_method_edges() {
+        // A method call on a locally-typed receiver (`r.save()`) is resolved only
+        // by LocalTypedCallResolver, not by plain ScopeGraphResolver. The default
+        // scope tier must supplement the scope graph with it so method
+        // callers/usages resolve.
+        let files = vec![
+            code2graph::extract_path(
+                "main.rs",
+                "pub fn run() { let r: Repo = Repo {}; r.save(); }",
+            )
+            .expect("caller facts"),
+            code2graph::extract_path(
+                "repo.rs",
+                "pub struct Repo {} impl Repo { pub fn save(&self) {} }",
+            )
+            .expect("repo facts"),
+        ];
+        let deadline = Deadline::new(None);
+        let resolved = resolve(
+            ResolverCacheTier::Scope,
+            &files,
+            None,
+            None,
+            &deadline,
+            &NeverCancelled,
+        )
+        .expect("fresh scope");
+
+        let has_method_edge = |graph: &CodeGraph| {
+            graph.edges.iter().any(|e| {
+                e.role == code2graph::RefRole::Call
+                    && e.to.to_scip_string().ends_with("Repo#save().")
+            })
+        };
+        assert!(
+            has_method_edge(&resolved.graph),
+            "scope tier must contain the receiver-typed Repo#save() call edge"
+        );
+
+        let scope_only = code2graph::ScopeGraphResolver
+            .resolve(&files)
+            .expect("direct scope-only");
+        assert!(
+            !has_method_edge(&scope_only),
+            "ScopeGraphResolver alone must NOT contain the receiver-typed edge (supplement adds it)"
+        );
     }
 
     #[test]
@@ -495,7 +557,7 @@ mod tests {
             &NeverCancelled,
         )
         .expect("incremental scope");
-        let direct = code2graph::ScopeGraphResolver
+        let direct = code2graph::LayeredResolver::default_scoped()
             .resolve(&current)
             .expect("direct scope");
         assert_eq!(format!("{:?}", restored.graph), format!("{:?}", direct));
@@ -685,7 +747,7 @@ mod tests {
             &NeverCancelled,
         )
         .expect("derived deletion");
-        let direct = code2graph::ScopeGraphResolver
+        let direct = code2graph::LayeredResolver::default_scoped()
             .resolve(&current)
             .expect("direct scope");
         assert_eq!(format!("{:?}", incremental.graph), format!("{:?}", direct));
@@ -749,7 +811,7 @@ mod tests {
             cancellation: &NeverCancelled,
         })
         .expect("incremental ambiguity");
-        let direct = code2graph::ScopeGraphResolver
+        let direct = code2graph::LayeredResolver::default_scoped()
             .resolve(&current)
             .expect("direct scope");
         assert_eq!(format!("{:?}", incremental.graph), format!("{:?}", direct));
