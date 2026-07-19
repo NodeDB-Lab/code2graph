@@ -112,6 +112,28 @@ pub fn diagnose_case(case: &Case) -> Option<crate::diagnose::RecallDiagnosis> {
     ))
 }
 
+/// Up to `limit` `def_structural` misses for one case at the dense tier, with the
+/// source line at each endpoint (for inspecting which definition kinds are missed).
+/// Empty for cases with no oracle.
+pub fn structural_samples_for_case(
+    case: &Case,
+    limit: usize,
+) -> Vec<crate::diagnose::StructuralMissSample> {
+    if case.oracle.is_empty() {
+        return Vec::new();
+    }
+    let facts: Vec<_> = case
+        .files
+        .iter()
+        .filter_map(|(name, src)| extract_path(name, src).ok())
+        .collect();
+    let graph = LayeredResolver::default_dense()
+        .resolve(&facts)
+        .expect("extractors must produce resolver-valid FileFacts");
+    let sources: std::collections::HashMap<String, String> = case.files.iter().cloned().collect();
+    crate::diagnose::structural_miss_samples(&graph, &case.oracle, &sources, limit)
+}
+
 /// Aggregate `TieredScorecard` over every case, grouped by language directory.
 pub fn per_language_tiered(cases: &[Case]) -> BTreeMap<String, TieredScorecard> {
     let mut by_lang: BTreeMap<String, TieredScorecard> = BTreeMap::new();

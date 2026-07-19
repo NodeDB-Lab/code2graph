@@ -260,6 +260,112 @@ pub fn diagnose_recall(
     d
 }
 
+/// One `def_structural` miss with the source line at each endpoint, for eyeballing
+/// which definition KINDS the extractor is not emitting.
+#[derive(Debug, Clone)]
+pub struct StructuralMissSample {
+    pub ref_file: String,
+    pub ref_line: u32,
+    pub ref_source: String,
+    pub def_file: String,
+    pub def_line: u32,
+    pub def_source: String,
+}
+
+/// Collect up to `limit` `def_structural` misses (as defined by
+/// [`diagnose_recall`]) with the source line at each endpoint. Deterministic:
+/// oracle edges are sorted and de-duplicated before sampling. This is a sibling
+/// of [`diagnose_recall`] that isolates only the structural-miss category (it
+/// needs a subset of the same emitted / symbol-line / function-span setup).
+pub fn structural_miss_samples(
+    graph: &CodeGraph,
+    oracle: &[(String, u32, String, u32)],
+    sources: &HashMap<String, String>,
+    limit: usize,
+) -> Vec<StructuralMissSample> {
+    let mut def_loc: HashMap<String, (String, u32)> = HashMap::new();
+    for sym in &graph.symbols {
+        def_loc.insert(sym.id.to_scip_string(), (sym.file.clone(), sym.line));
+    }
+    let mut emitted: HashSet<(String, u32, String, u32)> = HashSet::new();
+    for e in &graph.edges {
+        let scip = e.to.to_scip_string();
+        if let Some((df, dl)) = def_loc
+            .get(&scip)
+            .cloned()
+            .or_else(|| local_def_loc(&scip, sources))
+        {
+            emitted.insert((e.occ.file.clone(), e.occ.line, df, dl));
+        }
+    }
+    let mut symbol_lines_by_file: HashMap<String, Vec<u32>> = HashMap::new();
+    let mut fn_spans_by_file: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+    for sym in &graph.symbols {
+        symbol_lines_by_file
+            .entry(sym.file.clone())
+            .or_default()
+            .push(sym.line);
+        if matches!(sym.kind, SymbolKind::Function | SymbolKind::Method) {
+            fn_spans_by_file
+                .entry(sym.file.clone())
+                .or_default()
+                .push((sym.span.start, sym.span.end));
+        }
+    }
+
+    let mut sorted: Vec<(String, u32, String, u32)> = oracle.to_vec();
+    sorted.sort();
+    sorted.dedup();
+
+    let mut samples = Vec::new();
+    for (rf, rl, df, dl) in &sorted {
+        if samples.len() >= limit {
+            break;
+        }
+        if emitted.contains(&(rf.clone(), *rl, df.clone(), *dl)) {
+            continue;
+        }
+        let near = emitted.iter().any(|(erf, erl, edf, edl)| {
+            erf == rf && edf == df && erl.abs_diff(*rl) <= TOL && edl.abs_diff(*dl) <= TOL
+        });
+        if near {
+            continue;
+        }
+        let def_extracted = symbol_lines_by_file
+            .get(df)
+            .is_some_and(|lines| lines.iter().any(|l| l.abs_diff(*dl) <= TOL));
+        if def_extracted {
+            continue;
+        }
+        let inside_fn = sources
+            .get(df)
+            .and_then(|src| line_start_byte(src, *dl))
+            .zip(fn_spans_by_file.get(df))
+            .is_some_and(|(byte, spans)| spans.iter().any(|(s, e)| *s <= byte && byte < *e));
+        if inside_fn {
+            continue;
+        }
+        samples.push(StructuralMissSample {
+            ref_file: rf.clone(),
+            ref_line: *rl,
+            ref_source: source_line(sources, rf, *rl),
+            def_file: df.clone(),
+            def_line: *dl,
+            def_source: source_line(sources, df, *dl),
+        });
+    }
+    samples
+}
+
+/// Trimmed text of 1-based `line` in `sources[file]`, or empty if unavailable.
+fn source_line(sources: &HashMap<String, String>, file: &str, line: u32) -> String {
+    sources
+        .get(file)
+        .and_then(|src| src.lines().nth((line as usize).saturating_sub(1)))
+        .map(|l| l.trim().to_string())
+        .unwrap_or_default()
+}
+
 /// Byte offset of the start of 1-based `line` in `src`, or `None` if the source
 /// has fewer than `line` lines.
 fn line_start_byte(src: &str, line: u32) -> Option<usize> {

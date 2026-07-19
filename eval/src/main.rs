@@ -105,7 +105,35 @@ fn main() -> ExitCode {
     }
     print_recall_diagnosis(&diag_by_lang);
 
+    // Opt-in: dump a sample of structural-def misses (with source lines) so the
+    // missing definition KINDS can be inspected. `C2G_EVAL_SAMPLES=1 cargo run …`.
+    if std::env::var_os("C2G_EVAL_SAMPLES").is_some() {
+        print_structural_samples(&cases);
+    }
+
     ExitCode::SUCCESS
+}
+
+/// Print up to 15 structural-def misses per real-repo language, each as the ref
+/// source line and the def source line it points at.
+fn print_structural_samples(cases: &[code2graph_eval::corpus::Case]) {
+    println!("\nStructural-miss samples (def not extracted, not a local) — ref → def source\n");
+    for case in cases {
+        if !case.lang.contains("realrepo") {
+            continue;
+        }
+        let samples = code2graph_eval::runner::structural_samples_for_case(case, 15);
+        if samples.is_empty() {
+            continue;
+        }
+        println!("── {} / {} ──", case.lang, case.name);
+        for s in &samples {
+            println!(
+                "  {}:{}  {}\n    → {}:{}  {}",
+                s.ref_file, s.ref_line, s.ref_source, s.def_file, s.def_line, s.def_source
+            );
+        }
+    }
 }
 
 /// Print the per-language recall-gap cause breakdown for the real-repo cases.
