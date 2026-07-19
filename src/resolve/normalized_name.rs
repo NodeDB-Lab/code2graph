@@ -66,6 +66,15 @@ impl Resolver for NormalizedNameResolver {
                     continue; // no definition whose lowercase leaf name matches
                 };
 
+                // Fan-out cap: like the exact-name table, a case-folded name
+                // shared by a huge number of definitions is combinatorial noise,
+                // not recall — skip it rather than emit the full cross-product.
+                // (Counts every candidate; the tiny self / exact-case skip below
+                // never meaningfully lowers a genuinely-hot name below the cap.)
+                if candidates.len() > super::symbol_table::MAX_NAME_FANOUT {
+                    continue;
+                }
+
                 for &to_idx in candidates {
                     // Never emit a self-edge.
                     if to_idx == from_idx {

@@ -9,11 +9,13 @@
 //! single global candidate is tagged [`Confidence::Scoped`]. Additionally, an
 //! import reference whose `from_path` uniquely matches exactly one candidate's
 //! module namespace suffix is tagged [`Confidence::Scoped`] while all other
-//! fan-out edges for that reference stay [`Confidence::NameOnly`] (recall
-//! preserved — no edges are dropped). This is the recall-first baseline that
-//! works for every language without per-language binding rules — no edges are
-//! dropped, only the confidence varies. A precise resolver tags its edges
-//! [`Confidence::Exact`] instead.
+//! fan-out edges for that reference stay [`Confidence::NameOnly`]. This is the
+//! recall-first baseline that works for every language without per-language
+//! binding rules — the confidence varies, edges are otherwise preserved. The one
+//! exception is scalability: a name shared by more than [`MAX_NAME_FANOUT`]
+//! definitions is hopelessly ambiguous, so its combinatorial cross-product is
+//! dropped (keeping any import-disambiguated survivor) — see [`MAX_NAME_FANOUT`].
+//! A precise resolver tags its edges [`Confidence::Exact`] instead.
 //!
 //! It returns neutral [`Edge`]s and never writes to storage.
 
@@ -28,6 +30,16 @@ use super::{
     dedup_files_last_wins, enclosing_symbol_index, namespaces_end_with, normalize_from_path,
     retain_first_symbol_by_id,
 };
+
+/// Fan-out cap: when a leaf name is shared by more than this many definitions,
+/// a bare name match conveys no useful recall — a call to `new`/`get`/`id` in a
+/// large workspace can match thousands of definitions, and emitting an edge to
+/// every one is `O(refs × defs)` combinatorial noise (tens of millions of edges
+/// on a real multi-crate codebase), not signal. Above the cap we keep only an
+/// import-path-disambiguated survivor (still precise) and otherwise emit nothing
+/// for that reference. Genuine small-candidate recall (the common case) is
+/// unaffected; only hopelessly-ambiguous hot names are dropped.
+pub(crate) const MAX_NAME_FANOUT: usize = 64;
 
 /// Name-table resolver. See module docs.
 #[derive(Debug, Default, Clone, Copy)]
@@ -170,6 +182,24 @@ impl Resolver for SymbolTableResolver {
                     None
                 };
 
+                // Fan-out cap: a name shared by too many definitions is
+                // hopelessly ambiguous — the full cross-product is combinatorial
+                // noise, not recall (see `MAX_NAME_FANOUT`). Keep only an
+                // import-disambiguated survivor (still precise) and drop the rest.
+                if non_self_count > MAX_NAME_FANOUT {
+                    if let Some(bound) = import_bound {
+                        edges.push(Edge {
+                            from: symbols[from_idx].id.clone(),
+                            to: symbols[bound].id.clone(),
+                            role: r.role,
+                            confidence: Confidence::Scoped,
+                            provenance: Provenance::SymbolTable,
+                            occ: r.occ.clone(),
+                        });
+                    }
+                    continue;
+                }
+
                 for &to_idx in targets.iter().filter(|&&i| {
                     i != from_idx
                         && !(r.role == RefRole::TypeRef
@@ -238,6 +268,65 @@ mod tests {
     use crate::extract::JavaExtractor;
     #[cfg(feature = "rust")]
     use crate::extract::RustExtractor;
+
+    /// A call whose leaf name is shared by MORE than `MAX_NAME_FANOUT`
+    /// definitions is hopelessly ambiguous — the resolver drops it rather than
+    /// emitting the combinatorial cross-product (the fix for the `O(refs × defs)`
+    /// memory blowup on large real codebases).
+    #[cfg(feature = "rust")]
+    #[test]
+    fn fan_out_beyond_cap_is_dropped() {
+        let mut files: Vec<_> = (0..=MAX_NAME_FANOUT)
+            .map(|i| {
+                RustExtractor
+                    .extract("pub fn hot() {}", &format!("src/def{i}.rs"))
+                    .unwrap()
+            })
+            .collect();
+        files.push(
+            RustExtractor
+                .extract("pub fn caller() { hot() }", "src/caller.rs")
+                .unwrap(),
+        );
+        let graph = SymbolTableResolver.resolve(&files).unwrap();
+        let call_edges = graph
+            .edges
+            .iter()
+            .filter(|e| e.role == RefRole::Call)
+            .count();
+        assert_eq!(
+            call_edges, 0,
+            "a call whose name has > MAX_NAME_FANOUT ({MAX_NAME_FANOUT}) defs must be dropped, got {call_edges}"
+        );
+    }
+
+    /// At or below the cap, the recall-first fan-out is preserved.
+    #[cfg(feature = "rust")]
+    #[test]
+    fn fan_out_at_cap_is_kept() {
+        let mut files: Vec<_> = (0..MAX_NAME_FANOUT)
+            .map(|i| {
+                RustExtractor
+                    .extract("pub fn hot() {}", &format!("src/def{i}.rs"))
+                    .unwrap()
+            })
+            .collect();
+        files.push(
+            RustExtractor
+                .extract("pub fn caller() { hot() }", "src/caller.rs")
+                .unwrap(),
+        );
+        let graph = SymbolTableResolver.resolve(&files).unwrap();
+        let call_edges = graph
+            .edges
+            .iter()
+            .filter(|e| e.role == RefRole::Call)
+            .count();
+        assert_eq!(
+            call_edges, MAX_NAME_FANOUT,
+            "a call at the cap must still fan out to all defs"
+        );
+    }
 
     #[cfg(feature = "rust")]
     #[test]
