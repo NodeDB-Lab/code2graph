@@ -388,7 +388,46 @@ fn string_content<'a>(string_node: &Node, bytes: &'a [u8]) -> &'a str {
 
 fn collect_symbols(root: &Node, ctx: &ExtractCtx, namespaces: &[String]) -> Vec<Symbol> {
     let mut out = Vec::new();
-    for child in root.children(&mut root.walk()) {
+    collect_symbols_in(root, ctx, namespaces, &mut out);
+    out
+}
+
+/// Is `kind` a module-level control-flow container whose body holds statements
+/// that are still *module scope*? Real code guards module globals behind
+/// `if`/`try`/`with`/`for`/`while` (e.g. platform-conditional constants), so we
+/// descend through these — and the `block` suite they wrap — to reach the
+/// conditionally-defined names. A `function_definition`/`class_definition` is
+/// **not** in this set: its body is locals/members, not module scope, and
+/// `collect_symbols_in` deliberately never recurses into it.
+fn is_module_scope_container(kind: &str) -> bool {
+    matches!(
+        kind,
+        "if_statement"
+            | "elif_clause"
+            | "else_clause"
+            | "try_statement"
+            | "except_clause"
+            | "except_group_clause"
+            | "finally_clause"
+            | "with_statement"
+            | "for_statement"
+            | "while_statement"
+            | "block"
+    )
+}
+
+/// Apply the module-scope definition dispatch to every child of `node`, pushing
+/// a `Symbol` for each `function_definition`/`class_definition`/
+/// `decorated_definition`/`expression_statement`/`assignment`, and recursing
+/// through control-flow containers (see [`is_module_scope_container`]) so names
+/// guarded by module-level `if`/`try`/etc. are still emitted at module scope.
+///
+/// The recursion stops at function/class definitions: their symbol is emitted
+/// but their body is never descended into, so locals never leak as globals.
+/// Namespaces pass through unchanged — a constant under `if WIN:` is `module/X`,
+/// exactly as a top-level one.
+fn collect_symbols_in(node: &Node, ctx: &ExtractCtx, namespaces: &[String], out: &mut Vec<Symbol>) {
+    for child in node.children(&mut node.walk()) {
         // (span node, signature node, name, kind, leaf descriptor)
         let parsed = match child.kind() {
             "function_definition" => def_of(&child, &child, ctx.bytes, true),
@@ -405,6 +444,12 @@ fn collect_symbols(root: &Node, ctx: &ExtractCtx, namespaces: &[String]) -> Vec<
                 def_of(&child, &inner, ctx.bytes, is_fn)
             }
             "expression_statement" | "assignment" => const_of(&child, ctx.bytes),
+            // Descend into module-level control flow (and its `block` suites)
+            // to reach conditionally-defined module globals. Visited once each.
+            k if is_module_scope_container(k) => {
+                collect_symbols_in(&child, ctx, namespaces, out);
+                continue;
+            }
             _ => None,
         };
         let Some((span_node, sig_node, name, kind, leaf)) = parsed else {
@@ -435,7 +480,6 @@ fn collect_symbols(root: &Node, ctx: &ExtractCtx, namespaces: &[String]) -> Vec<
         }
         out.push(sym);
     }
-    out
 }
 
 /// Find the first DIRECT child of `node` whose kind is `kind`.
@@ -1344,6 +1388,68 @@ a, b = pair()
         assert!(by_name("a").is_none());
         assert!(by_name("b").is_none());
         assert!(by_name("pair").is_none());
+    }
+
+    /// Constants guarded by a module-level `if`/`else` are still module scope —
+    /// both branches emit their bindings (distinct occurrences; the resolver
+    /// dedups by identity), with plain `module/NAME` descriptors, no `if` segment.
+    #[test]
+    fn extracts_conditional_module_bindings_as_consts() {
+        let src = "if WIN:\n    BEFORE_BAR = \"a\"\nelse:\n    BEFORE_BAR = \"b\"\n    AFTER_BAR = \"c\"\n";
+        let facts = PythonExtractor.extract(src, "src/click/util.py").unwrap();
+
+        assert!(
+            facts
+                .symbols
+                .iter()
+                .any(|s| s.name == "BEFORE_BAR" && s.kind == SymbolKind::Const),
+            "BEFORE_BAR (under if/else) should be a Const module symbol"
+        );
+        let after = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "AFTER_BAR")
+            .expect("AFTER_BAR (under else) should be emitted");
+        assert_eq!(after.kind, SymbolKind::Const);
+        assert_eq!(
+            after.id.to_scip_string(),
+            "codegraph . . . click/util/AFTER_BAR."
+        );
+    }
+
+    /// A function conditionally defined under `try`/`except` (the classic
+    /// optional-import fallback) is emitted as a module-scope Function.
+    #[test]
+    fn extracts_conditional_module_function() {
+        let src = "try:\n    def helper(): pass\nexcept ImportError:\n    def helper(): pass\n";
+        let facts = PythonExtractor.extract(src, "src/click/util.py").unwrap();
+        assert!(
+            facts
+                .symbols
+                .iter()
+                .any(|s| s.name == "helper" && s.kind == SymbolKind::Function),
+            "helper (under try/except) should be a module-scope Function"
+        );
+    }
+
+    /// The recursion descends only through control-flow containers, never into
+    /// function/class bodies: a nested `def` or local binding must NOT surface
+    /// as a module symbol, though the enclosing `def` itself does.
+    #[test]
+    fn recursion_does_not_enter_function_bodies() {
+        let src = "def outer():\n    inner_const = 1\n    def nested(): pass\n";
+        let facts = PythonExtractor.extract(src, "src/click/util.py").unwrap();
+        let by_name = |n: &str| facts.symbols.iter().find(|s| s.name == n).cloned();
+
+        assert!(by_name("outer").is_some(), "outer is a module function");
+        assert!(
+            by_name("inner_const").is_none(),
+            "function-local binding must not leak as a module Const"
+        );
+        assert!(
+            by_name("nested").is_none(),
+            "nested def must not leak as a module Function"
+        );
     }
 
     #[test]
