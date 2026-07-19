@@ -10,6 +10,7 @@
 //! the fixture format.
 
 pub mod corpus;
+pub mod diagnose;
 #[cfg(feature = "oracle-regen")]
 pub mod oracle;
 pub mod runner;

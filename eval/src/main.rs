@@ -8,8 +8,9 @@
 
 use code2graph::{FfiBridgeResolver, ScopeGraphResolver, SymbolTableResolver};
 use code2graph_eval::corpus::load_corpus;
+use code2graph_eval::diagnose::RecallDiagnosis;
 use code2graph_eval::runner::{
-    corpus_total, corpus_total_tiered, per_language, per_language_tiered,
+    corpus_total, corpus_total_tiered, diagnose_case, per_language, per_language_tiered,
 };
 use code2graph_eval::score::{Scorecard, TieredScorecard};
 use std::collections::BTreeMap;
@@ -92,7 +93,67 @@ fn main() -> ExitCode {
          R@Scoped = Scoped+, R@Exact = Exact only, P@Exact = precision at Exact."
     );
 
+    // ── Recall diagnosis — real-repo cases only, dense tier ──────────────────
+    let mut diag_by_lang: BTreeMap<String, RecallDiagnosis> = BTreeMap::new();
+    for case in &cases {
+        if !case.lang.contains("realrepo") {
+            continue;
+        }
+        if let Some(d) = diagnose_case(case) {
+            diag_by_lang.entry(case.lang.clone()).or_default().merge(&d);
+        }
+    }
+    print_recall_diagnosis(&diag_by_lang);
+
     ExitCode::SUCCESS
+}
+
+/// Print the per-language recall-gap cause breakdown for the real-repo cases.
+///
+/// Prints nothing beyond a short note when no real-repo cases are present (the
+/// corpus wasn't generated) — never fails.
+fn print_recall_diagnosis(by_lang: &BTreeMap<String, RecallDiagnosis>) {
+    if by_lang.is_empty() {
+        println!("\nRecall diagnosis — no real-repo cases present.");
+        return;
+    }
+
+    println!("\nRecall diagnosis (dense tier, real-repo misses by cause)\n");
+    print!("{:<16}", "language");
+    println!(
+        " │ {:>6} {:>7} {:>7} {:>7} {:>7}",
+        "missed", "nearln", "nodef", "noref", "other"
+    );
+    print!("{:-<16}", "");
+    println!("-┼{:-<40}", "");
+    for (lang, d) in by_lang {
+        print!("{:<16}", lang);
+        println!(
+            " │ {:>6} {:>7} {:>7} {:>7} {:>7}",
+            d.missed,
+            d.near_miss_line,
+            d.def_not_extracted,
+            d.ref_not_captured,
+            d.resolved_to_other
+        );
+        println!(
+            "  nodef split: in-function (local/param, out of scope) = {}, structural (real gap) = {}",
+            d.def_in_function, d.def_structural,
+        );
+        println!(
+            "  captured_unresolved = {} → by shape: self={} recv={} import={} bare={}",
+            d.captured_unresolved,
+            d.cu_self_receiver,
+            d.cu_qualified_receiver,
+            d.cu_imported,
+            d.cu_bare_name,
+        );
+    }
+    println!(
+        "\nnearln = alignment (edge emitted, line off ≤2), nodef = def not extracted \
+         (split into in-function locals vs structural misses), noref = ref not captured, \
+         other = resolved elsewhere; captured_unresolved = pure resolution gap (the actionable bucket)."
+    );
 }
 
 fn print_tiered_header() {

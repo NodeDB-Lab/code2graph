@@ -192,7 +192,7 @@ pub fn score(graph: &CodeGraph, expected: &[ExpectedEdge]) -> Scorecard {
 ///
 /// Assumption (noted here): the file basename and binding name contain no `@`
 /// character. This holds for the corpus basenames and all valid identifiers.
-fn local_def_loc(
+pub(crate) fn local_def_loc(
     scip: &str,
     sources: &std::collections::HashMap<String, String>,
 ) -> Option<(String, u32)> {

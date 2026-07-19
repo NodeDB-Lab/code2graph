@@ -87,6 +87,31 @@ pub fn score_case_tiered(case: &Case) -> TieredScorecard {
     }
 }
 
+/// Diagnose recall gaps for one case at the DENSE tier (max recall — a miss here
+/// is a gap no current resolver closes). Returns `None` for cases with no oracle.
+pub fn diagnose_case(case: &Case) -> Option<crate::diagnose::RecallDiagnosis> {
+    if case.oracle.is_empty() {
+        return None;
+    }
+    let facts: Vec<_> = case
+        .files
+        .iter()
+        .filter_map(|(name, src)| extract_path(name, src).ok())
+        .collect();
+    let graph = LayeredResolver::default_dense()
+        .resolve(&facts)
+        .expect("extractors must produce resolver-valid FileFacts");
+    // Key sources by the case-relative path, exactly as `score_graph_for_case`
+    // does — `local_def_loc` looks up by that key.
+    let sources: std::collections::HashMap<String, String> = case.files.iter().cloned().collect();
+    Some(crate::diagnose::diagnose_recall(
+        &graph,
+        &facts,
+        &case.oracle,
+        &sources,
+    ))
+}
+
 /// Aggregate `TieredScorecard` over every case, grouped by language directory.
 pub fn per_language_tiered(cases: &[Case]) -> BTreeMap<String, TieredScorecard> {
     let mut by_lang: BTreeMap<String, TieredScorecard> = BTreeMap::new();
