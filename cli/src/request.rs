@@ -77,6 +77,20 @@ pub enum CommandRequest {
         name: Option<String>,
         role: Option<RefRole>,
     },
+    Cache {
+        op: CacheOp,
+    },
+}
+
+/// A cache-management operation. These are requests only: no variant performs I/O.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheOp {
+    /// Report this project's cache directory and database path.
+    Path,
+    /// Report cache footprint and per-snapshot breakdown.
+    Status,
+    /// Delete this project's cache, or every project's cache with `all`.
+    Clear { all: bool },
 }
 
 impl CommandRequest {
@@ -95,6 +109,7 @@ impl CommandRequest {
             Self::Imports { .. } => "imports",
             Self::ModuleDeps => "module-deps",
             Self::References { .. } => "references",
+            Self::Cache { .. } => "cache",
         }
     }
 

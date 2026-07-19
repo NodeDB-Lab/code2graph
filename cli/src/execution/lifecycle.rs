@@ -19,7 +19,7 @@ use crate::refresh::{
     PrepareCandidateInputs, PreparedRefreshCandidate, prepare_and_publish,
     prepare_refresh_candidate,
 };
-use crate::request::{CliRequest, CommandRequest};
+use crate::request::{CacheOp, CliRequest, CommandRequest};
 use crate::result::{
     CacheDisposition, Freshness, IndexOutput, OutputEnvelope, PlanDecisionCountsOutput,
     ProjectOutput, StatusOutput, success_status,
@@ -43,6 +43,7 @@ pub enum CommandOutput {
     Imports(OutputEnvelope<Vec<crate::RelationOutput>>),
     References(OutputEnvelope<Vec<crate::ReferenceOutput>>),
     ModuleDeps(OutputEnvelope<Vec<crate::ModuleDependencyOutput>>),
+    Cache(crate::CacheReport),
     LoadedGraph(LoadedGraph),
 }
 
@@ -412,7 +413,171 @@ pub fn execute(request: CliRequest, context: &ExecutionContext<'_>) -> Result<Co
                 min_confidence,
             },
         ),
+        CommandRequest::Cache { op } => execute_cache(op, request, context),
     }
+}
+
+/// Executes the cache-management operations. `path`/`status`/project `clear`
+/// select the current project; `clear --all` operates on every cached project
+/// without needing a project root.
+fn execute_cache(
+    op: CacheOp,
+    request: CliRequest,
+    context: &ExecutionContext<'_>,
+) -> Result<CommandOutput> {
+    let detail = match op {
+        CacheOp::Path => {
+            let selection = select_project(&request, &context.cwd)?;
+            let location = cache_location(context, &selection)?;
+            crate::CacheDetail::Path {
+                cache_dir: location.directory.display().to_string(),
+                database_path: location.database_path.display().to_string(),
+                exists: location.database_path.exists(),
+            }
+        }
+        CacheOp::Status => {
+            let deadline = deadline_before_selection(&request, context)?;
+            let selection = select_project(&request, &context.cwd)?;
+            let location = cache_location(context, &selection)?;
+            let exists = location.database_path.exists();
+            let size_bytes = cache_size_bytes(&location.database_path);
+            let snapshots = if exists {
+                let store =
+                    CacheStore::open_read_only(&location, &selection.canonical_root, &deadline)?;
+                store
+                    .snapshot_summaries(&deadline)?
+                    .into_iter()
+                    .map(|summary| crate::CacheSnapshotOutput {
+                        tier: crate::ResolverTier::from(summary.tier).as_str().to_owned(),
+                        active: summary.active,
+                        symbols: summary.symbols,
+                        edges: summary.edges,
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            crate::CacheDetail::Status {
+                cache_dir: location.directory.display().to_string(),
+                database_path: location.database_path.display().to_string(),
+                exists,
+                size_bytes,
+                snapshots,
+            }
+        }
+        CacheOp::Clear { all: false } => {
+            let selection = select_project(&request, &context.cwd)?;
+            let location = cache_location(context, &selection)?;
+            let projects_root = cache_projects_root(context)?;
+            let dir = &location.directory;
+            let (removed, freed) = if dir.exists() {
+                // Only ever remove a genuine `<base>/projects/<key>` directory.
+                if dir.parent() != Some(projects_root.as_path()) {
+                    return Err(CliError::Cache(
+                        "refusing to remove a cache directory outside the cache root".into(),
+                    ));
+                }
+                let freed = dir_size(dir);
+                std::fs::remove_dir_all(dir).map_err(|error| {
+                    CliError::Cache(format!("failed to remove cache directory: {error}"))
+                })?;
+                (1, freed)
+            } else {
+                (0, 0)
+            };
+            crate::CacheDetail::Clear {
+                scope: crate::CacheClearScope::Project,
+                removed_projects: removed,
+                freed_bytes: freed,
+            }
+        }
+        CacheOp::Clear { all: true } => {
+            let projects_root = cache_projects_root(context)?;
+            let (removed, freed) = clear_all_projects(&projects_root)?;
+            crate::CacheDetail::Clear {
+                scope: crate::CacheClearScope::All,
+                removed_projects: removed,
+                freed_bytes: freed,
+            }
+        }
+    };
+    Ok(CommandOutput::Cache(crate::CacheReport {
+        status: crate::OutputStatus::Ok,
+        detail,
+    }))
+}
+
+/// The `<base>/projects` directory shared by every project cache.
+fn cache_projects_root(context: &ExecutionContext<'_>) -> Result<std::path::PathBuf> {
+    CacheLocation::projects_root(context.cache_base.as_deref())
+        .ok_or_else(|| CliError::Cache("no operating-system cache directory is available".into()))
+}
+
+/// Removes every immediate project-cache subdirectory of `projects_root`,
+/// leaving `projects_root` itself in place. Non-directory and symlink entries
+/// are skipped so removal can never escape the cache root.
+fn clear_all_projects(projects_root: &std::path::Path) -> Result<(u64, u64)> {
+    if !projects_root.exists() {
+        return Ok((0, 0));
+    }
+    let entries = std::fs::read_dir(projects_root)
+        .map_err(|error| CliError::Cache(format!("failed to read cache root: {error}")))?;
+    let mut removed: u64 = 0;
+    let mut freed: u64 = 0;
+    for entry in entries {
+        let entry = entry
+            .map_err(|error| CliError::Cache(format!("failed to read cache entry: {error}")))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|error| CliError::Cache(format!("failed to inspect cache entry: {error}")))?;
+        if !file_type.is_dir() {
+            continue;
+        }
+        let path = entry.path();
+        freed = freed.saturating_add(dir_size(&path));
+        std::fs::remove_dir_all(&path).map_err(|error| {
+            CliError::Cache(format!("failed to remove cache directory: {error}"))
+        })?;
+        removed += 1;
+    }
+    Ok((removed, freed))
+}
+
+/// Total on-disk size of the SQLite database plus its `-wal`/`-shm` sidecars.
+fn cache_size_bytes(database_path: &std::path::Path) -> u64 {
+    let mut total = file_len(database_path);
+    for suffix in ["-wal", "-shm"] {
+        let mut name = database_path.as_os_str().to_owned();
+        name.push(suffix);
+        total = total.saturating_add(file_len(std::path::Path::new(&name)));
+    }
+    total
+}
+
+fn file_len(path: &std::path::Path) -> u64 {
+    std::fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
+}
+
+/// Recursive on-disk size of a directory, following no symlinks.
+fn dir_size(path: &std::path::Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    let mut total: u64 = 0;
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            total = total.saturating_add(dir_size(&entry.path()));
+        } else if file_type.is_file() {
+            total =
+                total.saturating_add(entry.metadata().map(|metadata| metadata.len()).unwrap_or(0));
+        }
+    }
+    total
 }
 
 fn execute_imports_query(
@@ -1596,6 +1761,160 @@ mod tests {
             load_query_graph(&scope, &context),
             Err(CliError::FrozenSnapshotMissing)
         ));
+    }
+
+    fn cache_request(op: CacheOp) -> CliRequest {
+        CliRequest {
+            global: GlobalOptions::default(),
+            command: CommandRequest::Cache { op },
+        }
+    }
+
+    #[test]
+    fn cache_path_reports_location_before_any_index() {
+        let (_temp, root, cache) = fixture();
+        let cancellation = NeverCancelled;
+        let clock = FixedClock;
+        let context = context(&root, &cache, &cancellation, &clock);
+        let CommandOutput::Cache(report) =
+            execute(cache_request(CacheOp::Path), &context).expect("cache path")
+        else {
+            panic!("cache output")
+        };
+        let crate::CacheDetail::Path {
+            cache_dir,
+            database_path,
+            exists,
+        } = report.detail
+        else {
+            panic!("path detail")
+        };
+        assert!(!exists);
+        assert!(database_path.ends_with("cache.sqlite3"));
+        assert!(cache_dir.starts_with(cache.to_str().expect("utf-8 cache path")));
+    }
+
+    #[test]
+    fn cache_status_after_index_reports_size_and_snapshot_counts() {
+        let (_temp, root, cache) = fixture();
+        fs::write(
+            root.join("a.rs"),
+            "pub fn target() {}\npub fn caller() { target(); }\n",
+        )
+        .expect("source");
+        let cancellation = NeverCancelled;
+        let clock = FixedClock;
+        let context = context(&root, &cache, &cancellation, &clock);
+        // The unit-test harness does not run the extraction worker, so a project
+        // with real sources indexes to a partial snapshot; allow it. This test
+        // covers the cache-status plumbing (size + snapshot rows), not extraction
+        // content — real symbol/edge counts are exercised end-to-end.
+        let mut index = index_request(false);
+        index.global.allow_partial = true;
+        execute(index, &context).expect("index");
+
+        let CommandOutput::Cache(report) =
+            execute(cache_request(CacheOp::Status), &context).expect("cache status")
+        else {
+            panic!("cache output")
+        };
+        let crate::CacheDetail::Status {
+            exists,
+            size_bytes,
+            snapshots,
+            ..
+        } = report.detail
+        else {
+            panic!("status detail")
+        };
+        assert!(exists);
+        assert!(size_bytes > 0);
+        assert!(
+            snapshots
+                .iter()
+                .any(|snapshot| snapshot.active && snapshot.tier == "scope"),
+            "expected an active scope snapshot, got {snapshots:?}"
+        );
+    }
+
+    #[test]
+    fn cache_clear_removes_the_project_cache_and_reports_freed_bytes() {
+        let (_temp, root, cache) = fixture();
+        fs::write(root.join("a.rs"), "pub fn run() {}\n").expect("source");
+        let cancellation = NeverCancelled;
+        let clock = FixedClock;
+        let context = context(&root, &cache, &cancellation, &clock);
+        let mut index = index_request(false);
+        index.global.allow_partial = true;
+        execute(index, &context).expect("index");
+
+        let CommandOutput::Cache(report) =
+            execute(cache_request(CacheOp::Clear { all: false }), &context).expect("cache clear")
+        else {
+            panic!("cache output")
+        };
+        let crate::CacheDetail::Clear {
+            scope,
+            removed_projects,
+            freed_bytes,
+        } = report.detail
+        else {
+            panic!("clear detail")
+        };
+        assert_eq!(scope, crate::CacheClearScope::Project);
+        assert_eq!(removed_projects, 1);
+        assert!(freed_bytes > 0);
+
+        let CommandOutput::Cache(after) =
+            execute(cache_request(CacheOp::Path), &context).expect("cache path")
+        else {
+            panic!("cache output")
+        };
+        let crate::CacheDetail::Path { exists, .. } = after.detail else {
+            panic!("path detail")
+        };
+        assert!(!exists);
+    }
+
+    #[test]
+    fn cache_clear_all_removes_every_project_cache_under_the_injected_base() {
+        let temp = tempdir().expect("fixture");
+        let cache = temp.path().join("cache");
+        let cancellation = NeverCancelled;
+        let clock = FixedClock;
+        for name in ["alpha", "beta"] {
+            let root = temp.path().join(name);
+            fs::create_dir(&root).expect("project");
+            fs::write(root.join("a.rs"), "pub fn run() {}\n").expect("source");
+            let context = context(&root, &cache, &cancellation, &clock);
+            let mut index = index_request(false);
+            index.global.allow_partial = true;
+            execute(index, &context).expect("index");
+        }
+        let projects_root = cache.join("projects");
+        assert_eq!(fs::read_dir(&projects_root).expect("projects").count(), 2);
+
+        // `clear --all` never selects a project, so a missing root is irrelevant.
+        let missing = temp.path().join("no-project");
+        let context = context(&missing, &cache, &cancellation, &clock);
+        let CommandOutput::Cache(report) =
+            execute(cache_request(CacheOp::Clear { all: true }), &context).expect("clear all")
+        else {
+            panic!("cache output")
+        };
+        let crate::CacheDetail::Clear {
+            scope,
+            removed_projects,
+            freed_bytes,
+        } = report.detail
+        else {
+            panic!("clear detail")
+        };
+        assert_eq!(scope, crate::CacheClearScope::All);
+        assert_eq!(removed_projects, 2);
+        assert!(freed_bytes > 0);
+        assert_eq!(fs::read_dir(&projects_root).expect("projects").count(), 0);
+        assert!(projects_root.exists());
     }
 
     #[test]

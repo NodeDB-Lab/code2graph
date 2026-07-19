@@ -31,6 +31,7 @@ pub fn render_human(output: &CommandOutput) -> String {
         CommandOutput::Impact(envelope) => {
             with_query_warning(envelope.project.as_ref(), render_impact(envelope))
         }
+        CommandOutput::Cache(report) => render_cache(report),
         CommandOutput::LoadedGraph(graph) => format!(
             "loaded {} symbols and {} edges\n",
             graph.graph.symbols.len(),
@@ -286,6 +287,60 @@ fn render_module_deps(
         ));
     }
     output
+}
+
+fn render_cache(report: &crate::CacheReport) -> String {
+    match &report.detail {
+        crate::CacheDetail::Path {
+            cache_dir,
+            database_path,
+            exists,
+        } => format!(
+            "cache dir: {cache_dir}\ndatabase: {database_path}\nexists: {}\n",
+            yes_no(*exists)
+        ),
+        crate::CacheDetail::Status {
+            cache_dir,
+            database_path,
+            exists,
+            size_bytes,
+            snapshots,
+        } => {
+            let mut output = format!(
+                "cache dir: {cache_dir}\ndatabase: {database_path}\nexists: {}\nsize: {size_bytes} bytes\nsnapshots:\n",
+                yes_no(*exists)
+            );
+            if snapshots.is_empty() {
+                output.push_str("  (none)\n");
+            } else {
+                for snapshot in snapshots {
+                    output.push_str(&format!(
+                        "  {}  active={}  symbols={}  edges={}\n",
+                        snapshot.tier,
+                        yes_no(snapshot.active),
+                        snapshot.symbols,
+                        snapshot.edges
+                    ));
+                }
+            }
+            output
+        }
+        crate::CacheDetail::Clear {
+            scope,
+            removed_projects,
+            freed_bytes,
+        } => format!(
+            "cleared {} cache: removed {removed_projects} project(s), freed {freed_bytes} bytes\n",
+            match scope {
+                crate::CacheClearScope::Project => "project",
+                crate::CacheClearScope::All => "all",
+            }
+        ),
+    }
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value { "yes" } else { "no" }
 }
 
 fn relation_text(relation: &crate::RelationOutput) -> String {

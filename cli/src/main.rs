@@ -56,6 +56,7 @@ fn finish_success(json: bool, output: CommandOutput) -> ProcessExitCode {
             CommandOutput::Imports(envelope) => serde_json::to_string(envelope),
             CommandOutput::References(envelope) => serde_json::to_string(envelope),
             CommandOutput::ModuleDeps(envelope) => serde_json::to_string(envelope),
+            CommandOutput::Cache(report) => serde_json::to_string(report),
             CommandOutput::LoadedGraph(_) => {
                 eprintln!("graph loading is not a command output");
                 return ProcessExitCode::from(ExitCode::Operational.as_i32() as u8);

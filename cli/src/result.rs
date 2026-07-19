@@ -621,6 +621,54 @@ impl StatusOutput {
     }
 }
 
+/// Cache-management report returned by the `cache` command family.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheReport {
+    pub status: OutputStatus,
+    #[serde(flatten)]
+    pub detail: CacheDetail,
+}
+
+/// The specific cache operation result, tagged by operation name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+pub enum CacheDetail {
+    Path {
+        cache_dir: String,
+        database_path: String,
+        exists: bool,
+    },
+    Status {
+        cache_dir: String,
+        database_path: String,
+        exists: bool,
+        size_bytes: u64,
+        snapshots: Vec<CacheSnapshotOutput>,
+    },
+    Clear {
+        scope: CacheClearScope,
+        removed_projects: u64,
+        freed_bytes: u64,
+    },
+}
+
+/// One persisted snapshot's cache footprint in `cache status` output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheSnapshotOutput {
+    pub tier: String,
+    pub active: bool,
+    pub symbols: u64,
+    pub edges: u64,
+}
+
+/// Whether `cache clear` targeted one project or every cached project.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheClearScope {
+    Project,
+    All,
+}
+
 /// A lossless selector report, emitted before result limiting.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SelectorOutput {

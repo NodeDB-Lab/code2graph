@@ -64,16 +64,23 @@ pub struct CacheLocation {
 }
 
 impl CacheLocation {
-    /// Select an injected base or the OS cache directory; this never places data in `root`.
-    pub fn for_project(cache_base: Option<&Path>, canonical_root: &Path) -> Option<Self> {
+    /// The parent directory holding every project's cache, independent of any
+    /// specific project. Resolves to `<base>/projects` where `<base>` is the
+    /// injected base or the OS cache directory.
+    pub fn projects_root(cache_base: Option<&Path>) -> Option<PathBuf> {
         let base = match cache_base {
             Some(base) => base.to_path_buf(),
             None => ProjectDirs::from("org", "code2graph", "code2graph")?
                 .cache_dir()
                 .to_path_buf(),
         };
+        Some(base.join("projects"))
+    }
+
+    /// Select an injected base or the OS cache directory; this never places data in `root`.
+    pub fn for_project(cache_base: Option<&Path>, canonical_root: &Path) -> Option<Self> {
         let key = ProjectKey::from_canonical_root(canonical_root);
-        let directory = base.join("projects").join(key.to_string());
+        let directory = Self::projects_root(cache_base)?.join(key.to_string());
         let database_path = directory.join("cache.sqlite3");
         Some(Self {
             project_key: key,

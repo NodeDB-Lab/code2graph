@@ -142,6 +142,15 @@ type CachedFileMetadataRow = (
     Option<Vec<u8>>,
 );
 
+/// A read-only introspection row describing one persisted graph snapshot.
+#[derive(Debug, Clone)]
+pub struct SnapshotSummary {
+    pub tier: ResolverCacheTier,
+    pub active: bool,
+    pub symbols: u64,
+    pub edges: u64,
+}
+
 /// An open project-cache database. The SQLite connection remains private so
 /// future cache publication can preserve the transaction protocol.
 pub struct CacheStore {
@@ -756,6 +765,49 @@ impl CacheStore {
                 });
             }
             Ok(files)
+        })
+    }
+
+    /// Summarizes every persisted graph snapshot without decoding facts or graph
+    /// rows: its tier, whether it is the active snapshot, and its symbol/edge counts.
+    pub fn snapshot_summaries(
+        &self,
+        deadline: &Deadline,
+    ) -> Result<Vec<SnapshotSummary>, CacheError> {
+        self.with_read_transaction(deadline, || {
+            let mut statement = self
+                .connection
+                .prepare(
+                    "SELECT gs.resolver_tier, \
+                     EXISTS(SELECT 1 FROM active_snapshots a WHERE a.snapshot_id = gs.snapshot_id) AS active, \
+                     (SELECT count(*) FROM graph_symbols s WHERE s.snapshot_id = gs.snapshot_id), \
+                     (SELECT count(*) FROM graph_edges e WHERE e.snapshot_id = gs.snapshot_id) \
+                     FROM graph_snapshots gs ORDER BY gs.snapshot_id",
+                )
+                .map_err(|error| map_sqlite_error(error, deadline))?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                })
+                .map_err(|error| map_sqlite_error(error, deadline))?;
+            let mut summaries = Vec::new();
+            for row in rows {
+                ensure_time(deadline)?;
+                let (tier, active, symbols, edges) =
+                    row.map_err(|error| map_sqlite_error(error, deadline))?;
+                summaries.push(SnapshotSummary {
+                    tier: ResolverCacheTier::from_sql(tier)?,
+                    active: active != 0,
+                    symbols: nonnegative(symbols)?,
+                    edges: nonnegative(edges)?,
+                });
+            }
+            Ok(summaries)
         })
     }
 

@@ -129,6 +129,15 @@ impl From<crate::cache::ResolverCacheTier> for ResolverTier {
 }
 
 impl ResolverTier {
+    /// Stable kebab-case spelling, matching the serialized representation.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Name => "name",
+            Self::Scope => "scope",
+            Self::Dense => "dense",
+        }
+    }
+
     /// Planned effective minimum when `--min-confidence` is not supplied.
     pub const fn default_min_confidence(self) -> code2graph::Confidence {
         match self {

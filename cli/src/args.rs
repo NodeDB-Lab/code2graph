@@ -8,7 +8,7 @@ use crate::config::{
     DEFAULT_MAX_FILES, DEFAULT_MAX_TOTAL_BYTES, GlobalOptions, ResolverTier, ResourceLimits,
 };
 use crate::error::CliError;
-use crate::request::{CliRequest, CommandRequest, Selector, SourcePosition};
+use crate::request::{CacheOp, CliRequest, CommandRequest, Selector, SourcePosition};
 use clap::{ArgGroup, Args, Parser, Subcommand, error::ErrorKind};
 use code2graph::{Confidence, RefRole, SymbolId, SymbolIdWire, SymbolKind};
 
@@ -132,6 +132,20 @@ enum RawCommand {
         name: Option<String>,
         #[arg(long, value_parser = parse_role)]
         role: Option<RefRole>,
+    },
+    Cache {
+        #[command(subcommand)]
+        op: CacheCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum CacheCommand {
+    Path,
+    Status,
+    Clear {
+        #[arg(long)]
+        all: bool,
     },
 }
 
@@ -330,6 +344,13 @@ impl RawCli {
             RawCommand::References { file, name, role } => {
                 CommandRequest::References { file, name, role }
             }
+            RawCommand::Cache { op } => CommandRequest::Cache {
+                op: match op {
+                    CacheCommand::Path => CacheOp::Path,
+                    CacheCommand::Status => CacheOp::Status,
+                    CacheCommand::Clear { all } => CacheOp::Clear { all },
+                },
+            },
         };
         Ok(CliRequest { global, command })
     }
@@ -500,6 +521,10 @@ mod tests {
             &["code2graph", "imports", "src/a.rs"],
             &["code2graph", "module-deps"],
             &["code2graph", "references", "src/a.rs"],
+            &["code2graph", "cache", "path"],
+            &["code2graph", "cache", "status"],
+            &["code2graph", "cache", "clear"],
+            &["code2graph", "cache", "clear", "--all"],
         ];
         for args in cases {
             assert!(
