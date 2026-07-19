@@ -484,11 +484,41 @@ impl CacheStore {
                     params![graph.tier, encoded.completeness, snapshot_id],
                 ).map_err(|error| map_sqlite_error(error, deadline))?;
             }
+            // Garbage-collect superseded graph snapshots and orphaned candidates.
+            // Runs after every tier published this round is already active, so no
+            // just-published snapshot is ever removed. This is safe: non-active
+            // snapshots are never read (loads always go through active_snapshots),
+            // the incremental scope prior is always hydrated from the ACTIVE scope
+            // candidate, and every other tier's active snapshot is preserved because
+            // it remains referenced in active_snapshots. Without this, snapshots and
+            // their edge/symbol rows accumulate forever as slots are re-published.
+            ensure_time(deadline)?;
+            self.connection
+                .execute(
+                    "DELETE FROM graph_snapshots WHERE snapshot_id NOT IN (SELECT snapshot_id FROM active_snapshots)",
+                    [],
+                )
+                .map_err(|error| map_sqlite_error(error, deadline))?;
+            ensure_time(deadline)?;
+            // A candidate with no remaining snapshot is unreachable; drop it so its
+            // files/omissions cascade away too. The active scope candidate always
+            // retains at least its active snapshot, so its subgraphs are preserved.
+            self.connection
+                .execute(
+                    "DELETE FROM candidates WHERE candidate_id NOT IN (SELECT candidate_id FROM graph_snapshots)",
+                    [],
+                )
+                .map_err(|error| map_sqlite_error(error, deadline))?;
             ensure_time(deadline)
         })();
         match result {
             Ok(()) => match self.connection.execute_batch("COMMIT") {
-                Ok(()) => Ok(()),
+                Ok(()) => {
+                    // Best-effort return of GC-freed pages to the OS. A no-op on
+                    // caches created before auto_vacuum=INCREMENTAL; never fails publish.
+                    let _ = self.connection.execute_batch("PRAGMA incremental_vacuum");
+                    Ok(())
+                }
                 Err(error) => {
                     let mapped = map_sqlite_error(error, deadline);
                     let _ = self.connection.execute_batch("ROLLBACK");
@@ -1716,6 +1746,17 @@ fn initialize_or_join_v1(
     deadline: &Deadline,
 ) -> Result<(), CacheError> {
     set_busy_timeout(connection, deadline)?;
+    // Enable incremental auto-vacuum before the schema's first table is created.
+    // The mode can only be set on a table-less database and never inside a
+    // transaction (SQLite silently ignores it otherwise), so it must precede the
+    // `BEGIN IMMEDIATE` below. A harmless no-op on an already-populated cache
+    // (existing DBs stay auto_vacuum=NONE). This lets publish-time GC reclaim
+    // freed pages to the OS via `PRAGMA incremental_vacuum`. Uses the bare
+    // `INCREMENTAL` keyword: `pragma_update` would bind it as a quoted string,
+    // which SQLite ignores for auto_vacuum.
+    connection
+        .execute_batch("PRAGMA auto_vacuum = INCREMENTAL")
+        .map_err(|error| map_sqlite_error(error, deadline))?;
     connection
         .execute_batch("BEGIN IMMEDIATE")
         .map_err(|error| map_sqlite_error(error, deadline))?;
@@ -2267,6 +2308,14 @@ mod tests {
     }
 
     fn candidate(completeness: CacheCompleteness, tier: ResolverCacheTier) -> CandidateSnapshot {
+        candidate_with_hash(completeness, tier, [3; 32])
+    }
+
+    fn candidate_with_hash(
+        completeness: CacheCompleteness,
+        tier: ResolverCacheTier,
+        content_hash: [u8; 32],
+    ) -> CandidateSnapshot {
         use super::super::{
             CandidateId, CompatibilityFingerprint, LanguageFeatureFingerprint, PackageFingerprint,
             ProjectInputDigest,
@@ -2274,7 +2323,7 @@ mod tests {
         let file = CandidateFileRecord {
             path: "src/a.rs".into(),
             language: "rust".into(),
-            content_hash: [3; 32],
+            content_hash,
             size_bytes: 1,
             mtime: Some(MtimeHint {
                 seconds_since_unix_epoch: 0,
@@ -2284,7 +2333,7 @@ mod tests {
             facts: empty_facts("src/a.rs"),
             subgraph: None,
         };
-        let input_digest = ProjectInputDigest::from_inputs([("src/a.rs", "rust", [3; 32])]);
+        let input_digest = ProjectInputDigest::from_inputs([("src/a.rs", "rust", content_hash)]);
         let omissions = Vec::new();
         let language_fingerprint = LanguageFeatureFingerprint::current();
         let package_fingerprint = PackageFingerprint::from_normalized(["test"]);
@@ -2635,6 +2684,98 @@ mod tests {
         store
             .publish_candidate(&complete, &Deadline::new(None))
             .expect("idempotent publish");
+    }
+
+    #[test]
+    fn fresh_writable_cache_enables_incremental_auto_vacuum() {
+        // Locks the auto_vacuum mode set in `initialize_or_join_v1`: it must be
+        // INCREMENTAL (2) so publish-time GC can reclaim freed pages. The mode is
+        // only settable before the first table exists, so a regression here (e.g.
+        // moving the pragma after schema creation) silently reverts it to NONE (0).
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().join("project");
+        fs::create_dir(&root).expect("project");
+        let cache_location = location(&root, temp.path());
+        let store =
+            CacheStore::open_writable(&cache_location, &root, &Deadline::new(None)).expect("open");
+        let auto_vacuum: i64 = store
+            .connection
+            .pragma_query_value(None, "auto_vacuum", |row| row.get(0))
+            .expect("auto_vacuum");
+        assert_eq!(
+            auto_vacuum, 2,
+            "fresh cache must use INCREMENTAL auto_vacuum"
+        );
+    }
+
+    #[test]
+    fn superseding_a_slot_garbage_collects_the_prior_snapshot_and_candidate() {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().join("project");
+        fs::create_dir(&root).expect("project");
+        let cache_location = location(&root, temp.path());
+        let store =
+            CacheStore::open_writable(&cache_location, &root, &Deadline::new(None)).expect("open");
+        // Two distinct candidates (different input digests) target the same
+        // (tier, completeness) slot; publishing B flips active away from A.
+        let a = candidate_with_hash(
+            CacheCompleteness::Complete,
+            ResolverCacheTier::Name,
+            [3; 32],
+        );
+        let b = candidate_with_hash(
+            CacheCompleteness::Complete,
+            ResolverCacheTier::Name,
+            [7; 32],
+        );
+        assert_ne!(a.candidate_id, b.candidate_id);
+        store
+            .publish_candidate(&a, &Deadline::new(None))
+            .expect("publish a");
+        store
+            .publish_candidate(&b, &Deadline::new(None))
+            .expect("publish b");
+
+        // Only B's snapshot survives; A's snapshot and candidate rows are gone.
+        let snapshot_count: i64 = store
+            .connection
+            .query_row("SELECT count(*) FROM graph_snapshots", [], |row| row.get(0))
+            .expect("snapshot count");
+        assert_eq!(snapshot_count, 1);
+        let surviving_candidate: Vec<u8> = store
+            .connection
+            .query_row("SELECT candidate_id FROM graph_snapshots", [], |row| {
+                row.get(0)
+            })
+            .expect("surviving candidate");
+        assert_eq!(
+            surviving_candidate.as_slice(),
+            b.candidate_id.as_bytes().as_slice()
+        );
+        let a_candidate_count: i64 = store
+            .connection
+            .query_row(
+                "SELECT count(*) FROM candidates WHERE candidate_id = ?1",
+                [a.candidate_id.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .expect("a candidate count");
+        assert_eq!(a_candidate_count, 0);
+
+        // B remains the queryable active snapshot for the slot.
+        assert_eq!(
+            store
+                .load_active(
+                    ResolverCacheTier::Name,
+                    CacheCompleteness::Complete,
+                    b.compatibility.id,
+                    &Deadline::new(None),
+                )
+                .expect("load")
+                .expect("active")
+                .candidate_id,
+            b.candidate_id
+        );
     }
 
     #[test]
