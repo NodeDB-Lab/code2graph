@@ -125,7 +125,13 @@ impl Resolver for LocalTypedCallResolver {
             }
 
             for r in &f.references {
-                if r.role != RefRole::Call {
+                // Receiver-typed calls (`x.method()`) and field/property reads
+                // (`x.field`) resolve identically: both carry the receiver in
+                // `qualifier` and look up a member on the receiver's type. Only
+                // these member-access refs populate `qualifier` on a `Read`, so
+                // the gate stays precise. The emitted edge copies `r.role`, so a
+                // read yields a `Read` edge and a call a `Call` edge.
+                if !matches!(r.role, RefRole::Call | RefRole::Read) {
                     continue;
                 }
                 let Some(receiver) = r.qualifier.as_deref() else {
@@ -216,6 +222,46 @@ mod tests {
         );
         let e = edges[0];
         assert!(e.to.to_scip_string().ends_with("Repo#save()."));
+        assert_eq!(e.confidence, Confidence::Scoped);
+        assert_eq!(e.provenance, Provenance::LocalType);
+        assert!(e.from.to_scip_string().ends_with("f()."));
+    }
+
+    /// A receiver-typed FIELD READ resolves like a method call:
+    /// `struct Repo { count: u32 } fn f() { let r: Repo = Repo { count: 0 }; r.count; }`
+    /// → exactly one `Read` edge from `f` to `Repo#count.`, Scoped/LocalType.
+    #[test]
+    fn resolves_annotated_local_field_read_end_to_end() {
+        let facts = RustExtractor
+            .extract(
+                "struct Repo { count: u32 } fn f() { let r: Repo = Repo { count: 0 }; r.count; }",
+                "src/lib.rs",
+            )
+            .unwrap();
+
+        let graph = LocalTypedCallResolver.resolve(&[facts]).unwrap();
+        let edges: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.provenance == Provenance::LocalType)
+            .collect();
+
+        assert_eq!(
+            edges.len(),
+            1,
+            "expected exactly one LocalType field edge, got {:?}",
+            edges
+                .iter()
+                .map(|e| format!("{} -> {}", e.from.to_scip_string(), e.to.to_scip_string()))
+                .collect::<Vec<_>>()
+        );
+        let e = edges[0];
+        assert!(
+            e.to.to_scip_string().ends_with("Repo#count."),
+            "got {}",
+            e.to.to_scip_string()
+        );
+        assert_eq!(e.role, RefRole::Read, "a field read yields a Read edge");
         assert_eq!(e.confidence, Confidence::Scoped);
         assert_eq!(e.provenance, Provenance::LocalType);
         assert!(e.from.to_scip_string().ends_with("f()."));

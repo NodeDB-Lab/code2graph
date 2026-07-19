@@ -68,7 +68,7 @@ pub struct ConformanceResolver;
 pub(crate) fn member_of_type(sym: &Symbol) -> Option<(String /* type */, String /* member */)> {
     if !matches!(
         sym.kind,
-        SymbolKind::Method | SymbolKind::Const | SymbolKind::Static
+        SymbolKind::Method | SymbolKind::Const | SymbolKind::Static | SymbolKind::Field
     ) {
         return None;
     }
