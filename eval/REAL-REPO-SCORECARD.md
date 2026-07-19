@@ -33,37 +33,54 @@ flatter.
   def_file, def_line)` to equal the oracle's exactly (1-based, role-agnostic).
 - **Reproduce:** `eval/scripts/gen-realrepo-oracle.sh` (needs `rust-analyzer`,
   `npm`/`npx`, network; writes gitignored `eval/corpus/*_realrepo/` cases), then
-  `cargo run -p code2graph-eval` and read the `rust_realrepo` / `ts_realrepo` rows.
+  `cargo run -p code2graph-eval` and read the `rust_realrepo` / `ts_realrepo` /
+  `py_realrepo` rows — the **`Scoped+ (default)`** column is the CLI's default tier.
 
 ## Results
 
+Three resolver views per project: `Tier-A (name)` (`SymbolTableResolver` alone,
+recall-first), `Tier-B (scope)` (`ScopeGraphResolver` alone), and
+**`Scoped+ (default)`** — the CLI's actual default, `LayeredResolver::default_scoped()`
+= scope-path resolution plus the additive receiver-typed passes (conformance +
+local-typed member resolution). `Scoped+` is the honest default-experience number.
+
 | Project (oracle edges) | Resolver | Precision | Recall | F1 |
 |---|---|---|---|---|
-| **anyhow** — Rust (784) | Tier-A (name) | 0.46 | 0.44 | 0.45 |
-| | Tier-B (scope) | 0.52 | 0.36 | 0.43 |
-| **ky** — TypeScript (1995) | Tier-A (name) | 0.92 | 0.22 | 0.36 |
-| | Tier-B (scope) | 0.79 | 0.44 | 0.56 |
-| **click** — Python (6819) | Tier-A (name) | 0.33 | 0.19 | 0.24 |
-| | Tier-B (scope) | 0.73 | 0.53 | 0.61 |
+| **anyhow** — Rust (784) | Tier-A (name) | 0.42 | 0.62 | 0.51 |
+| | Tier-B (scope) | 0.51 | 0.40 | 0.45 |
+| | **Scoped+ (default)** | **0.53** | **0.42** | **0.47** |
+| **ky** — TypeScript (1995) | Tier-A (name) | 0.29 | 0.28 | 0.29 |
+| | Tier-B (scope) | 0.75 | 0.45 | 0.56 |
+| | **Scoped+ (default)** | **0.75** | **0.45** | **0.57** |
+| **click** — Python (6819) | Tier-A (name) | 0.35 | 0.20 | 0.26 |
+| | Tier-B (scope) | 0.74 | 0.53 | 0.61 |
+| | **Scoped+ (default)** | **0.74** | **0.53** | **0.62** |
 
 Layered (dense), recall by minimum-confidence cutoff:
 
 | Project | R@Heuristic | R@Name | R@Scoped | R@Exact | P@Exact |
 |---|---|---|---|---|---|
-| anyhow (Rust) | 0.45 | 0.45 | 0.41 | 0.09 | 0.27 |
-| ky (TypeScript) | 0.46 | 0.46 | 0.46 | 0.38 | 0.76 |
-| click (Python) | 0.55 | 0.55 | 0.54 | 0.43 | 0.71 |
+| anyhow (Rust) | 0.63 | 0.63 | 0.46 | 0.09 | 0.27 |
+| ky (TypeScript) | 0.52 | 0.52 | 0.50 | 0.38 | 0.76 |
+| click (Python) | 0.55 | 0.55 | 0.54 | 0.42 | 0.70 |
 
 For contrast, the toy `*_oracle` fixtures score Tier-B **P=1.00** — the gap
-between that and the `0.52` / `0.79` / `0.73` here is exactly the illusion this
-scorecard exists to dispel. Two real signals emerge across the three:
+between that and the `0.51` / `0.75` / `0.74` here is exactly the illusion this
+scorecard exists to dispel. Three real signals emerge across the three:
 
-- **Tier-B (scope) is consistently the more precise tier, and matters most where
-  name fan-out is worst.** On Python, Tier-A precision collapses to `0.33` (many
-  same-named methods), while Tier-B holds `0.73` — the single clearest
-  demonstration that scope resolution earns its keep on real code.
+- **The composed default (`Scoped+`) beats scope-alone.** Adding the receiver-typed
+  passes lifts anyhow from Tier-B `P 0.51 / R 0.40` to `P 0.53 / R 0.42`, and nudges
+  ky and click up a point of F1 each — precise `Scoped` member edges that
+  `ScopeGraphResolver` alone does not emit. Measuring only `Tier-B` understates the
+  tier the CLI actually ships.
+- **Name fan-out is a real precision cost, and it is confidence-tagged.** `Tier-A`
+  precision runs `0.29` (ky) → `0.35` (click) → `0.42` (anyhow): common member names
+  (`headers`, `json`, a same-named method) link to *every* same-named definition. This
+  is `NameOnly` by contract — the scope tiers hold precision far higher (ky `Tier-B`
+  `P 0.75`) exactly where name fan-out is worst. A consumer filters by `Confidence`
+  to trade recall for precision.
 - **The build-free ceiling is language-shaped.** `P@Exact` runs `0.27` (Rust) →
-  `0.71` (Python) → `0.76` (TypeScript): a macro/generic/trait-heavy Rust crate
+  `0.70` (Python) → `0.76` (TypeScript): a macro/generic/trait-heavy Rust crate
   resolves to a unique `Exact` target far less often than straighter-line Python
   or TypeScript. Same resolver, honestly different ceilings.
 
@@ -72,19 +89,24 @@ scorecard exists to dispel. Two real signals emerge across the three:
 - **This is a floor, not a ceiling, and it is measured — not claimed.** ~0.5
   precision / ~0.4 recall on a real crate is the number to improve against; the
   point of the exercise is that it is now a *number*.
-- **Recall is understated by design.** The oracle is role-agnostic SCIP truth —
-  every variable read/write, type-position use, macro-expanded site, and field
-  access rust-analyzer records is ground truth. code2graph emits a deliberately
-  narrower edge set, so a large slice of "misses" are occurrence kinds it never
-  claims. Read recall as "fraction of type-aware truth recovered syntactically."
+- **Recall is understated, but less than before.** The oracle is role-agnostic
+  SCIP truth — every variable read/write, type-position use, and macro-expanded
+  site rust-analyzer records is ground truth. code2graph now models member-level
+  definitions (struct fields, enum variants, interface/type properties,
+  module-level constants) and captures member-access reads, so field/property
+  access is no longer entirely unclaimed — this is the bulk of the recall lift on
+  anyhow (`Tier-A R 0.44 → 0.62`). What remains deliberately unmodelled: local
+  variables, parameters, and pure type-position uses. Read recall as "fraction of
+  type-aware truth recovered syntactically."
 - **Precision is the actionable signal.** Line-exact, role-agnostic matching
   penalizes real divergences (a call attributed to a macro-expansion line vs the
   written line; name-only fan-out counting `N−1` extra edges). Scope resolution
-  helps where it can (ky Tier-B P 0.79), but the picture is language-dependent:
-  anyhow's low `P@Exact` (0.27) shows how little of a macro/generic/trait-heavy
-  Rust crate resolves to a single `Exact` target syntactically, whereas ky's
-  0.76 shows a straighter-line TypeScript codebase largely does. The build-free
-  ceiling is real and it is not the same height in every language.
+  helps where it can (ky `Tier-B`/`Scoped+` P 0.75), but the picture is
+  language-dependent: anyhow's low `P@Exact` (0.27) shows how little of a
+  macro/generic/trait-heavy Rust crate resolves to a single `Exact` target
+  syntactically, whereas ky's 0.76 shows a straighter-line TypeScript codebase
+  largely does. The build-free ceiling is real and it is not the same height in
+  every language.
 
 ## Extending
 
