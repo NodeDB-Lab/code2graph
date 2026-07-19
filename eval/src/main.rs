@@ -6,7 +6,7 @@
 //! cargo run -p code2graph-eval
 //! ```
 
-use code2graph::{FfiBridgeResolver, ScopeGraphResolver, SymbolTableResolver};
+use code2graph::{FfiBridgeResolver, LayeredResolver, ScopeGraphResolver, SymbolTableResolver};
 use code2graph_eval::corpus::load_corpus;
 use code2graph_eval::diagnose::RecallDiagnosis;
 use code2graph_eval::runner::{
@@ -48,6 +48,15 @@ fn main() -> ExitCode {
             label: "Tier-B (scope)",
             per_lang: per_language(&cases, &ScopeGraphResolver),
             total: corpus_total(&cases, &ScopeGraphResolver),
+        },
+        // The CLI's actual default tier: scope-path resolution plus the additive
+        // receiver-typed passes (Conformance + LocalTypedCall). Measured here so
+        // their precise `Scoped` member edges are visible, unlike the
+        // `ScopeGraphResolver`-only row above.
+        TierReport {
+            label: "Scoped+ (default)",
+            per_lang: per_language(&cases, &LayeredResolver::default_scoped()),
+            total: corpus_total(&cases, &LayeredResolver::default_scoped()),
         },
         TierReport {
             label: "FFI (bridge)",
