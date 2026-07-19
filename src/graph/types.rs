@@ -57,6 +57,10 @@ pub enum SymbolKind {
     Method,
     Struct,
     Enum,
+    /// A field of a struct or struct-like variant (`S { field }`).
+    Field,
+    /// A variant of an enum (`enum E { Variant }`).
+    Variant,
     Trait,
     Interface,
     Class,

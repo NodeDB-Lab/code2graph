@@ -778,6 +778,8 @@ const fn symbol_kind_tag(value: SymbolKind) -> u8 {
         SymbolKind::Column => 14,
         SymbolKind::Resource => 15,
         SymbolKind::Other => 16,
+        SymbolKind::Field => 17,
+        SymbolKind::Variant => 18,
     }
 }
 const fn visibility_tag(value: Visibility) -> u8 {
@@ -891,6 +893,8 @@ impl TryFrom<SymbolWire> for Symbol {
             SymbolKind::Column,
             SymbolKind::Resource,
             SymbolKind::Other,
+            SymbolKind::Field,
+            SymbolKind::Variant,
         ];
         let vis = [
             Visibility::Public,
@@ -1493,9 +1497,13 @@ mod tests {
                 SymbolKind::Column,
                 SymbolKind::Resource,
                 SymbolKind::Other,
+                SymbolKind::Field,
+                SymbolKind::Variant,
             ]
             .map(symbol_kind_tag),
-            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+            [
+                0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18
+            ]
         );
         assert_eq!(
             [

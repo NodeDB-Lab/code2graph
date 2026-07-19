@@ -27,7 +27,7 @@ use crate::symbol::Descriptor;
 use super::emit_embedded_sql_refs;
 use super::{
     BindingRules, ExtractCtx, Extractor, MIN_REF_LEN, attach_reference_scopes, child_text,
-    collect_call_references, definition_bindings, import_bindings, make_symbol,
+    collect_call_references, definition_bindings, field_text, import_bindings, make_symbol,
     mark_receiver_qualifier_calls, mark_self_receiver_calls, member_descriptors, node_occurrence,
     node_span, node_text, one_line_signature, push_binding, push_ref, push_scope,
     push_typed_binding, simple_type_name,
@@ -363,6 +363,16 @@ fn collect_symbols(root: &Node, ctx: &ExtractCtx, namespaces: &[String]) -> Vec<
         if kind == SymbolKind::Trait {
             collect_trait_members(&child, ctx, namespaces, &sym_name, &mut out);
         }
+
+        // For struct/enum definitions, emit symbols for their fields/variants so
+        // consumers can address them by their SCIP identity (`…/S#field.`,
+        // `…/E#Variant.`).
+        if kind == SymbolKind::Struct {
+            collect_struct_fields(&child, ctx, namespaces, &sym_name, &mut out);
+        }
+        if kind == SymbolKind::Enum {
+            collect_enum_variants(&child, ctx, namespaces, &sym_name, &mut out);
+        }
     }
     out
 }
@@ -497,6 +507,97 @@ fn collect_trait_members(
             member_name,
             kind,
             Visibility::Public,
+            descriptors,
+            signature,
+        ));
+    }
+}
+
+/// Walk a `struct_item` node and emit a [`SymbolKind::Field`] symbol per named field.
+///
+/// The `body` field of a named-field struct is a `field_declaration_list`; each
+/// `field_declaration` child carries a `name` field (a `field_identifier`). Each
+/// field's real [`Visibility`] is read from its own `visibility_modifier` child
+/// via [`read_visibility`].
+///
+/// Tuple structs (`struct P(u32);`) have an `ordered_field_declaration_list` body
+/// whose positional fields are unnamed — there is no name to key on, so they are
+/// skipped entirely.
+///
+/// Descriptors: `namespaces.map(Namespace) ++ [Type(struct_name), Term(field)]`.
+/// SCIP renders e.g. `…/Config#value.`.
+fn collect_struct_fields(
+    struct_node: &Node,
+    ctx: &ExtractCtx,
+    namespaces: &[String],
+    struct_name: &str,
+    out: &mut Vec<Symbol>,
+) {
+    let bytes = ctx.bytes;
+    let Some(body) = struct_node.child_by_field_name("body") else {
+        return;
+    };
+
+    for field in body.children(&mut body.walk()) {
+        if field.kind() != "field_declaration" {
+            continue;
+        }
+        let Some(name) = field_text(&field, "name", bytes) else {
+            continue;
+        };
+        let visibility = read_visibility(&field, bytes);
+        let descriptors =
+            member_descriptors(namespaces, struct_name, Descriptor::Term(name.clone()));
+        let signature = one_line_signature(node_text(&field, bytes), &['{']);
+        out.push(make_symbol(
+            ctx,
+            &field,
+            name,
+            SymbolKind::Field,
+            visibility,
+            descriptors,
+            signature,
+        ));
+    }
+}
+
+/// Walk an `enum_item` node and emit a [`SymbolKind::Variant`] symbol per variant.
+///
+/// The `body` field is an `enum_variant_list`; each `enum_variant` child carries
+/// a `type_identifier` naming the variant. A variant's own fields (e.g.
+/// `E { V { x } }`) are NOT descended into — only the bare variant symbol is
+/// emitted.
+///
+/// Descriptors: `namespaces.map(Namespace) ++ [Type(enum_name), Term(variant)]`.
+/// SCIP renders e.g. `…/State#Idle.`.
+fn collect_enum_variants(
+    enum_node: &Node,
+    ctx: &ExtractCtx,
+    namespaces: &[String],
+    enum_name: &str,
+    out: &mut Vec<Symbol>,
+) {
+    let bytes = ctx.bytes;
+    let Some(body) = enum_node.child_by_field_name("body") else {
+        return;
+    };
+
+    for variant in body.children(&mut body.walk()) {
+        if variant.kind() != "enum_variant" {
+            continue;
+        }
+        let Some(name) = field_text(&variant, "name", bytes) else {
+            continue;
+        };
+        let visibility = read_visibility(&variant, bytes);
+        let descriptors = member_descriptors(namespaces, enum_name, Descriptor::Term(name.clone()));
+        let signature = one_line_signature(node_text(&variant, bytes), &['{']);
+        out.push(make_symbol(
+            ctx,
+            &variant,
+            name,
+            SymbolKind::Variant,
+            visibility,
             descriptors,
             signature,
         ));
@@ -1636,6 +1737,62 @@ pub struct Config { pub value: u32 }
             .find(|s| s.name == "private_helper")
             .unwrap();
         assert_eq!(ph.visibility, Visibility::Private);
+    }
+
+    #[test]
+    fn extracts_struct_fields_as_field_symbols() {
+        let src = r#"
+pub struct Config { pub value: u32, name: String }
+pub struct P(u32);
+"#;
+        let facts = RustExtractor.extract(src, "src/cfg.rs").unwrap();
+
+        let value = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "value")
+            .expect("struct field `value`");
+        assert_eq!(value.kind, SymbolKind::Field);
+        assert!(value.id.to_scip_string().contains("Config#value."));
+
+        let name = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "name")
+            .expect("struct field `name`");
+        assert_eq!(name.kind, SymbolKind::Field);
+        assert!(name.id.to_scip_string().contains("Config#name."));
+
+        // Tuple-struct positional fields are unnamed and must emit no Field symbol.
+        assert!(
+            !facts
+                .symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::Field && s.id.to_scip_string().contains("P#")),
+            "tuple-struct positional fields must not be emitted"
+        );
+    }
+
+    #[test]
+    fn extracts_enum_variants_as_variant_symbols() {
+        let src = "pub enum State { Idle, Running }";
+        let facts = RustExtractor.extract(src, "src/state.rs").unwrap();
+
+        let idle = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "Idle")
+            .expect("enum variant `Idle`");
+        assert_eq!(idle.kind, SymbolKind::Variant);
+        assert!(idle.id.to_scip_string().contains("State#Idle."));
+
+        let running = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "Running")
+            .expect("enum variant `Running`");
+        assert_eq!(running.kind, SymbolKind::Variant);
+        assert!(running.id.to_scip_string().contains("State#Running."));
     }
 
     #[test]

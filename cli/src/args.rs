@@ -474,6 +474,8 @@ fn parse_kind(value: &str) -> Result<SymbolKind, String> {
         "method" => Ok(SymbolKind::Method),
         "struct" => Ok(SymbolKind::Struct),
         "enum" => Ok(SymbolKind::Enum),
+        "field" => Ok(SymbolKind::Field),
+        "variant" => Ok(SymbolKind::Variant),
         "trait" => Ok(SymbolKind::Trait),
         "interface" => Ok(SymbolKind::Interface),
         "class" => Ok(SymbolKind::Class),
