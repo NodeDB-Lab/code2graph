@@ -570,7 +570,14 @@ fn def_of<'a>(
     Some((*span_node, *sig_node, name, kind, leaf))
 }
 
-/// Build a constant definition tuple from an ALL_CAPS module-level assignment.
+/// Build a constant definition tuple from a module-level assignment.
+///
+/// Emits one `Const` symbol per module-level `X = …` / `X: T = …` / `X: T` whose
+/// target is a simple identifier (Python has no const/static distinction — every
+/// module global is the same construct, including `TypeVar`s). Tuple, attribute,
+/// and subscript targets are skipped (no single addressable name), as are
+/// pure-underscore throwaways. Module scope is guaranteed by the caller, which
+/// only visits the module root's direct children.
 fn const_of<'a>(
     node: &Node<'a>,
     bytes: &[u8],
@@ -581,15 +588,14 @@ fn const_of<'a>(
         node.children(&mut node.walk())
             .find(|c| c.kind() == "assignment")?
     };
-    let lhs = assign
-        .children(&mut assign.walk())
-        .find(|c| c.kind() == "identifier")?;
+    // The `left:` field is the assignment target: an `identifier` for a simple
+    // binding, or a `pattern_list`/attribute/subscript we deliberately skip.
+    let lhs = assign.child_by_field_name("left")?;
+    if lhs.kind() != "identifier" {
+        return None;
+    }
     let name = node_text(&lhs, bytes).to_owned();
-    if name.len() < 3
-        || !name
-            .chars()
-            .all(|c| c.is_uppercase() || c == '_' || c.is_numeric())
-    {
+    if name.is_empty() || name.chars().all(|c| c == '_') {
         return None;
     }
     Some((
@@ -1304,6 +1310,40 @@ MAX_RETRIES = 3
         assert_eq!(by_name("Config").unwrap().kind, SymbolKind::Class);
         assert!(by_name("fetch_data").is_some());
         assert_eq!(by_name("MAX_RETRIES").unwrap().kind, SymbolKind::Const);
+    }
+
+    /// Every module-level binding — a `TypeVar`, a lowercase/underscore global, an
+    /// annotated one — becomes a `Const` symbol; tuple targets and function-local
+    /// bindings do not.
+    #[test]
+    fn extracts_module_level_bindings_as_consts() {
+        let src = "\
+V = TypeVar('V')
+_default_stream = make_stream()
+timeout: int = 30
+
+def run():
+    local = 1
+    return local
+
+a, b = pair()
+";
+        let facts = PythonExtractor.extract(src, "src/click/util.py").unwrap();
+        let by_name = |n: &str| facts.symbols.iter().find(|s| s.name == n).cloned();
+
+        let v = by_name("V").expect("TypeVar binding");
+        assert_eq!(v.kind, SymbolKind::Const);
+        assert_eq!(v.id.to_scip_string(), "codegraph . . . click/util/V.");
+        assert_eq!(by_name("_default_stream").unwrap().kind, SymbolKind::Const);
+        assert_eq!(by_name("timeout").unwrap().kind, SymbolKind::Const);
+
+        // A function-local binding is not a module symbol.
+        assert!(by_name("local").is_none());
+        // Tuple-unpacking targets have no single addressable name — skipped,
+        // and the right-hand side (`pair`) is never mistaken for the target.
+        assert!(by_name("a").is_none());
+        assert!(by_name("b").is_none());
+        assert!(by_name("pair").is_none());
     }
 
     #[test]
