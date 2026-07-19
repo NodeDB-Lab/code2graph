@@ -307,8 +307,9 @@ fn render_cache(report: &crate::CacheReport) -> String {
             snapshots,
         } => {
             let mut output = format!(
-                "cache dir: {cache_dir}\ndatabase: {database_path}\nexists: {}\nsize: {size_bytes} bytes\nsnapshots:\n",
-                yes_no(*exists)
+                "cache dir: {cache_dir}\ndatabase: {database_path}\nexists: {}\nsize: {}\nsnapshots:\n",
+                yes_no(*exists),
+                human_bytes(*size_bytes)
             );
             if snapshots.is_empty() {
                 output.push_str("  (none)\n");
@@ -330,17 +331,36 @@ fn render_cache(report: &crate::CacheReport) -> String {
             removed_projects,
             freed_bytes,
         } => format!(
-            "cleared {} cache: removed {removed_projects} project(s), freed {freed_bytes} bytes\n",
+            "cleared {} cache: removed {removed_projects} project(s), freed {}\n",
             match scope {
                 crate::CacheClearScope::Project => "project",
                 crate::CacheClearScope::All => "all",
-            }
+            },
+            human_bytes(*freed_bytes)
         ),
     }
 }
 
 fn yes_no(value: bool) -> &'static str {
     if value { "yes" } else { "no" }
+}
+
+/// Render a byte count in `du -h` style: 1024-based units with one decimal
+/// place, exact integer bytes below 1 KB. Machine consumers read the exact
+/// `size_bytes`/`freed_bytes` fields from `--json` instead.
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
 }
 
 fn relation_text(relation: &crate::RelationOutput) -> String {
@@ -417,6 +437,18 @@ mod tests {
         OutputEnvelope, OutputStatus, PlanDecisionCountsOutput, ResolverTier, StatusOutput,
     };
     use code2graph::SymbolId;
+
+    #[test]
+    fn human_bytes_scales_units_at_1024_boundaries() {
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(512), "512 B");
+        assert_eq!(human_bytes(1023), "1023 B");
+        assert_eq!(human_bytes(1024), "1.0 KB");
+        assert_eq!(human_bytes(163_840), "160.0 KB");
+        assert_eq!(human_bytes(1024 * 1024), "1.0 MB");
+        assert_eq!(human_bytes(7_179_542_528), "6.7 GB");
+        assert_eq!(human_bytes(3 * 1024 * 1024 * 1024 * 1024), "3.0 TB");
+    }
 
     fn project(freshness: Freshness, completeness: CacheCompletenessOutput) -> ProjectOutput {
         ProjectOutput {
