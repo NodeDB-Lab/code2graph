@@ -113,6 +113,19 @@ code2graph impact helper --depth 3
 
 `cargo install code2graph-cli` builds the binary from source with Cargo. No prebuilt binary distribution is promised here.
 
+### Managing the cache
+
+The CLI keeps a per-project SQLite cache under the OS cache directory (on Linux, `$XDG_CACHE_HOME/code2graph` or `~/.cache/code2graph`; the equivalent on macOS/Windows), keyed by an opaque hash of the project's canonical root. The cache is incremental and self-bounding: re-indexing reuses unchanged work, and superseded snapshots are garbage-collected on publish so the database does not grow without limit. The `cache` subcommand inspects and manages it — all commands accept `--json`.
+
+```sh
+code2graph --root . cache path       # print this project's cache directory and database path
+code2graph --root . cache status     # + on-disk size and a per-snapshot tier/edge/symbol breakdown
+code2graph --root . cache clear      # delete this project's cache; reports bytes freed
+code2graph cache clear --all         # delete every project's cache (no --root needed)
+```
+
+`cache clear` only ever removes directories under `<cache>/projects/`; it never touches your source tree. Deleting a project's cache simply forces a fresh index on the next command.
+
 The Python and Node/Bun packages expose the conversion and query handles as native language objects; see [`bindings/python`](bindings/python) and [`bindings/node`](bindings/node) for their APIs. A public Pi host integration is available as [`@nodedb-lab/pi-code2graph`](bindings/pi); it composes the native binding for agent-host tools without changing the core library's storage-neutral contract. Other host integrations are described only as integrations, not as part of the core API.
 
 API reference: [docs.rs/code2graph](https://docs.rs/code2graph).
