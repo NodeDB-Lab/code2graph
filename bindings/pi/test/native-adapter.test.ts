@@ -4,9 +4,9 @@ import test from "node:test";
 import { canonicalId } from "../extensions/code2graph/types.ts";
 import { validateNative } from "../extensions/code2graph/code2graph-node.ts";
 
-const complete = { extract() { return {}; }, buildGraph() { return {}; }, languageOf() { return null; }, GraphIndex: class {} };
+const complete = { extract() { return {}; }, extractWithBindings() { return {}; }, buildGraph() { return {}; }, languageOf() { return null; }, GraphIndex: class {} };
 test("native adapter rejects incomplete payloads including GraphIndex", () => {
-  assert.throws(() => validateNative({ extract() {} }), /extract, buildGraph, languageOf, and GraphIndex/);
+  assert.throws(() => validateNative({ extract() {} }), /extract, extractWithBindings, buildGraph, languageOf, and GraphIndex/);
   assert.throws(() => validateNative({ extract() { return {}; }, buildGraph() { return {}; }, languageOf() { return null; } }), /GraphIndex/);
   assert.doesNotThrow(() => validateNative(complete));
 });
