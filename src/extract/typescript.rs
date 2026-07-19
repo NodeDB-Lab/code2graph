@@ -32,8 +32,8 @@ use super::emit_embedded_sql_refs;
 use super::{
     BindingRules, ExtractCtx, Extractor, MIN_REF_LEN, attach_reference_scopes, child_text,
     collect_call_references, definition_bindings, import_bindings, make_symbol,
-    mark_receiver_qualifier_calls, mark_self_receiver_calls, member_descriptors, node_span,
-    node_text, one_line_signature, push_binding, push_ref, push_scope, push_type_ref,
+    mark_receiver_qualifier_calls, mark_self_receiver_calls, member_descriptors, node_occurrence,
+    node_span, node_text, one_line_signature, push_binding, push_ref, push_scope, push_type_ref,
     push_typed_binding, simple_type_name,
 };
 
@@ -165,6 +165,7 @@ pub(super) fn extract_ecmascript(
     collect_imports(&root, bytes, file, &mut references, &module_id);
     collect_type_references(&root, bytes, file, &mut references);
     collect_read_references(&root, bytes, file, &mut references);
+    collect_property_access_references(&root, bytes, file, &mut references);
     collect_write_references(&root, bytes, file, &mut references);
 
     #[cfg(feature = "sql")]
@@ -338,8 +339,31 @@ fn emit_declaration(
                 collect_class_members(decl, ctx, namespaces, &class_name, out);
             }
         }
-        "interface_declaration" => emit_named(decl, ctx.bytes, SymbolKind::Interface, out, &push),
-        "type_alias_declaration" => emit_named(decl, ctx.bytes, SymbolKind::TypeAlias, out, &push),
+        "interface_declaration" => {
+            emit_named(decl, ctx.bytes, SymbolKind::Interface, out, &push);
+            // Members are only meaningful for a named interface (there is always
+            // one — TS has no anonymous interface declaration — but resolving the
+            // name keeps the `Type` descriptor honest, mirroring the class arm).
+            if let Some(iface_name) = child_text(decl, "type_identifier", ctx.bytes) {
+                if let Some(body) = decl.child_by_field_name("body") {
+                    collect_interface_members(&body, ctx, namespaces, &iface_name, out);
+                }
+            }
+        }
+        "type_alias_declaration" => {
+            emit_named(decl, ctx.bytes, SymbolKind::TypeAlias, out, &push);
+            // A `type X = { … }` object-type literal carries the same member
+            // shape as an interface body; descend into its `object_type` value
+            // and emit its members keyed under the alias's `Type` name. Other
+            // aliased forms (unions, function types, …) have no member to emit.
+            if let Some(alias_name) = child_text(decl, "type_identifier", ctx.bytes) {
+                if let Some(value) = decl.child_by_field_name("value") {
+                    if value.kind() == "object_type" {
+                        collect_interface_members(&value, ctx, namespaces, &alias_name, out);
+                    }
+                }
+            }
+        }
         "enum_declaration" => {
             if let Some(n) = child_text(decl, "identifier", ctx.bytes) {
                 push(out, n.clone(), SymbolKind::Enum, Descriptor::Type(n));
@@ -457,6 +481,67 @@ fn member_visibility(member: &Node, bytes: &[u8]) -> Visibility {
             "protected" => Visibility::Protected,
             _ => Visibility::Public,
         })
+}
+
+/// Emit member symbols for an interface body or a `type X = { … }` object-type
+/// literal — the two share the same member shape, so one walk covers both.
+///
+/// `members` is the node whose children are the member signatures: the
+/// `interface_body` of an `interface` declaration, or the `object_type` value of
+/// a type-alias object literal.
+///
+/// - `property_signature` → a [`SymbolKind::Field`] keyed as `Type#prop.`.
+/// - `method_signature`   → a [`SymbolKind::Method`] keyed as `Type#method().`,
+///   for class-method parity (interface methods are referenced as calls).
+/// - Members whose name is not a plain `property_identifier`, and other member
+///   kinds (index / call / construct signatures), are skipped — none produce a
+///   well-formed named SCIP descriptor.
+///
+/// Interface / type-literal members carry no access modifier, so each is
+/// [`Visibility::Public`].
+fn collect_interface_members(
+    members: &Node,
+    ctx: &ExtractCtx,
+    namespaces: &[String],
+    type_name: &str,
+    out: &mut Vec<Symbol>,
+) {
+    for member in members.children(&mut members.walk()) {
+        let is_method = match member.kind() {
+            "property_signature" => false,
+            "method_signature" => true,
+            _ => continue,
+        };
+        let Some(name_node) = member.child_by_field_name("name") else {
+            continue;
+        };
+        if name_node.kind() != "property_identifier" {
+            continue;
+        }
+        let name = node_text(&name_node, ctx.bytes).to_owned();
+        let (kind, descriptor) = if is_method {
+            (
+                SymbolKind::Method,
+                Descriptor::Method {
+                    name: name.clone(),
+                    disambiguator: crate::symbol::MethodDisambiguator::empty(),
+                },
+            )
+        } else {
+            (SymbolKind::Field, Descriptor::Term(name.clone()))
+        };
+        let descriptors = member_descriptors(namespaces, type_name, descriptor);
+        let signature = one_line_signature(node_text(&member, ctx.bytes), &['{']);
+        out.push(make_symbol(
+            ctx,
+            &member,
+            name,
+            kind,
+            Visibility::Public,
+            descriptors,
+            signature,
+        ));
+    }
 }
 
 /// Recursively walk `node` collecting `Inherit` references for every
@@ -861,6 +946,81 @@ fn collect_write_references(node: &Node, bytes: &[u8], file: &str, out: &mut Vec
     }
 }
 
+/// Recursively walk `node` and emit a [`RefRole::Read`] reference for every
+/// property access `x.prop` whose `prop` is a bare `property_identifier` and
+/// which is NOT the callee of a method call.
+///
+/// A method call `x.foo()` is already captured as a [`RefRole::Call`] reference
+/// (its `member_expression` is the `function:` field of a `call_expression`); it
+/// is excluded here by [`is_method_call_callee`] so it is not double-emitted as a
+/// Read — mirroring the Rust field-access collector.
+///
+/// The receiver (`object:` field) populates the reference exactly as the
+/// method-call passes do:
+/// - a `this` receiver (`this.prop`) sets `self_receiver` and clears `qualifier`;
+/// - a bare `identifier` receiver (`x.prop`) sets `qualifier = Some(receiver)`,
+///   the fact a typed resolver needs to map `x` to its declared type;
+/// - any other receiver (`a().prop`, `a.b.prop`) leaves `qualifier = None` —
+///   still captured by name for name-tier resolution.
+///
+/// `scope` is left `None`; the enclosing scope is attached later by
+/// [`attach_reference_scopes`]. Applies [`MIN_REF_LEN`]. Shared with the
+/// JavaScript extractor: JS has no interfaces, but `x.prop` reads apply there
+/// just the same.
+fn collect_property_access_references(
+    node: &Node,
+    bytes: &[u8],
+    file: &str,
+    out: &mut Vec<Reference>,
+) {
+    if node.kind() == "member_expression" {
+        if let Some(property) = node.child_by_field_name("property") {
+            if property.kind() == "property_identifier" && !is_method_call_callee(node) {
+                let name = node_text(&property, bytes);
+                if name.len() >= MIN_REF_LEN {
+                    let (qualifier, self_receiver) = match node.child_by_field_name("object") {
+                        Some(v) if v.kind() == "this" => (None, true),
+                        Some(v) if v.kind() == "identifier" => {
+                            (Some(node_text(&v, bytes).to_owned()), false)
+                        }
+                        _ => (None, false),
+                    };
+                    out.push(Reference {
+                        name: name.to_owned(),
+                        occ: node_occurrence(&property, file),
+                        role: RefRole::Read,
+                        source_module: None,
+                        from_path: None,
+                        is_reexport: false,
+                        imported_name: None,
+                        qualifier,
+                        scope: None,
+                        type_ref_ctx: None,
+                        cross_artifact: false,
+                        self_receiver,
+                    });
+                }
+            }
+        }
+    }
+    for child in node.children(&mut node.walk()) {
+        collect_property_access_references(&child, bytes, file, out);
+    }
+}
+
+/// True when `member_expr` (a `member_expression`) is the `function:` callee of a
+/// parent `call_expression` — i.e. a method call `x.foo()`, already captured as a
+/// [`RefRole::Call`] reference by [`CALL_QUERY`]. Such nodes must NOT also be
+/// emitted as a property Read by [`collect_property_access_references`].
+fn is_method_call_callee(member_expr: &Node) -> bool {
+    member_expr
+        .parent()
+        .filter(|p| p.kind() == "call_expression")
+        .and_then(|p| p.child_by_field_name("function"))
+        .as_ref()
+        == Some(member_expr)
+}
+
 // ── Query-binding scan (cross-artifact code→SQL edges) ───────────────────────
 
 /// Recursively walk `node` looking for call sites matching one of `rules`'s
@@ -1127,6 +1287,14 @@ function internal() {}
         let opts = by_name("Options").unwrap();
         assert_eq!(opts.kind, SymbolKind::Interface);
         assert_eq!(opts.visibility, Visibility::Public);
+
+        // The interface's `timeout` property is now emitted as a Field member.
+        let timeout = by_name("timeout").expect("interface property 'timeout' must be emitted");
+        assert_eq!(timeout.kind, SymbolKind::Field);
+        assert_eq!(
+            timeout.id.to_scip_string(),
+            "codegraph . . . src/auth/jwt/Options#timeout."
+        );
 
         let max = by_name("MAX").unwrap();
         assert_eq!(max.kind, SymbolKind::Const);
@@ -1631,9 +1799,11 @@ export const Y = 2;
     }
 
     #[test]
-    fn ts_property_access_not_a_read_of_property() {
-        // `obj.foo` → no Read ref named "foo" (property_identifier, not identifier).
-        // A Read ref for `obj` is acceptable.
+    fn ts_property_access_is_a_read_of_the_property() {
+        // `obj.foo` → exactly one Read ref "foo" whose `qualifier` is the
+        // bare-identifier receiver "obj" (the fact a typed resolver needs to map
+        // `obj.foo` onto the declared type's `foo` member, exactly as method
+        // calls carry the receiver into `qualifier`).
         let src = "function run() { return obj.foo; }";
         let facts = TypeScriptExtractor.extract(src, "src/main.ts").unwrap();
         let foo_reads: Vec<_> = facts
@@ -1641,10 +1811,83 @@ export const Y = 2;
             .iter()
             .filter(|r| r.role == RefRole::Read && r.name == "foo")
             .collect();
-        assert!(
-            foo_reads.is_empty(),
-            "property 'foo' in member_expression must NOT be a Read ref; got: {foo_reads:?}"
+        assert_eq!(
+            foo_reads.len(),
+            1,
+            "expected exactly one Read ref for property 'foo'; got: {foo_reads:?}"
         );
+        assert_eq!(
+            foo_reads[0].qualifier.as_deref(),
+            Some("obj"),
+            "property read 'foo' must carry the receiver 'obj' as qualifier"
+        );
+        assert!(
+            !foo_reads[0].self_receiver,
+            "a bare-identifier receiver is not a self receiver"
+        );
+    }
+
+    #[test]
+    fn ts_method_call_not_also_a_property_read() {
+        // `x.foo()` → exactly one Call ref "foo" and NO Read ref "foo": the
+        // method-call callee must not be double-emitted as a property read.
+        let src = "function run(x) { x.foo(); }";
+        let facts = TypeScriptExtractor.extract(src, "src/main.ts").unwrap();
+        let call_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Call && r.name == "foo")
+            .collect();
+        assert_eq!(
+            call_refs.len(),
+            1,
+            "expected exactly one Call ref for 'foo'; got: {call_refs:?}"
+        );
+        let read_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Read && r.name == "foo")
+            .collect();
+        assert!(
+            read_refs.is_empty(),
+            "x.foo() must NOT produce a Read ref for 'foo'; got: {read_refs:?}"
+        );
+    }
+
+    #[test]
+    fn ts_this_property_access_marks_self_receiver() {
+        // `this.prop` → a Read ref "prop" with self_receiver == true, qualifier None.
+        let src = "class C { m() { return this.prop; } }";
+        let facts = TypeScriptExtractor.extract(src, "src/main.ts").unwrap();
+        let r = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Read && r.name == "prop")
+            .expect("expected a Read ref for 'prop'");
+        assert!(
+            r.self_receiver,
+            "this.prop should have self_receiver == true"
+        );
+        assert_eq!(r.qualifier, None, "this.prop must not carry a qualifier");
+    }
+
+    #[test]
+    fn ts_chained_property_access_has_no_qualifier() {
+        // `a().prop` → a Read ref "prop" with qualifier None (the receiver is a
+        // call_expression, not a bare identifier), self_receiver false.
+        let src = "function run() { return a().prop; }";
+        let facts = TypeScriptExtractor.extract(src, "src/main.ts").unwrap();
+        let r = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Read && r.name == "prop")
+            .expect("expected a Read ref for 'prop'");
+        assert_eq!(
+            r.qualifier, None,
+            "a().prop must not carry a qualifier, got {:?}",
+            r.qualifier
+        );
+        assert!(!r.self_receiver, "a().prop is not a self receiver");
     }
 
     // ── Query-binding scan (cross-artifact code→SQL edges) ───────────────────
@@ -1853,6 +2096,83 @@ export const Y = 2;
             !facts.symbols.iter().any(|s| s.kind == SymbolKind::Method),
             "anonymous default class members must not be emitted"
         );
+    }
+
+    // ── Interface / type-literal member symbol tests ─────────────────────────
+
+    #[test]
+    fn interface_members_emit_field_and_method_symbols() {
+        let src = "export interface Options { timeout?: number; headers: KyHeadersInit; fetch(): Promise<Response>; }";
+        let facts = TypeScriptExtractor.extract(src, "src/opts.ts").unwrap();
+
+        let timeout = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "timeout")
+            .expect("expected a 'timeout' Field symbol");
+        assert_eq!(timeout.kind, SymbolKind::Field);
+        assert_eq!(
+            timeout.id.to_scip_string(),
+            "codegraph . . . src/opts/Options#timeout."
+        );
+        assert_eq!(timeout.visibility, Visibility::Public);
+
+        let headers = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "headers")
+            .expect("expected a 'headers' Field symbol");
+        assert_eq!(headers.kind, SymbolKind::Field);
+        assert_eq!(
+            headers.id.to_scip_string(),
+            "codegraph . . . src/opts/Options#headers."
+        );
+
+        let fetch = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "fetch")
+            .expect("expected a 'fetch' Method symbol");
+        assert_eq!(fetch.kind, SymbolKind::Method);
+        assert_eq!(
+            fetch.id.to_scip_string(),
+            "codegraph . . . src/opts/Options#fetch()."
+        );
+    }
+
+    #[test]
+    fn type_literal_members_emit_field_symbols() {
+        let src = "type Config = { retries: number };";
+        let facts = TypeScriptExtractor.extract(src, "src/cfg.ts").unwrap();
+
+        let retries = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "retries")
+            .expect("expected a 'retries' Field symbol");
+        assert_eq!(retries.kind, SymbolKind::Field);
+        assert_eq!(
+            retries.id.to_scip_string(),
+            "codegraph . . . src/cfg/Config#retries."
+        );
+        assert_eq!(retries.visibility, Visibility::Public);
+    }
+
+    #[test]
+    fn js_property_access_is_a_read() {
+        // JavaScript routes through the same extract_ecmascript core; a bare
+        // property read `x.prop` is captured there too (JS has no interfaces,
+        // but property reads apply just the same).
+        use crate::extract::JavaScriptExtractor;
+
+        let src = "function run(x) { return x.prop; }";
+        let facts = JavaScriptExtractor.extract(src, "src/m.js").unwrap();
+        let r = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Read && r.name == "prop")
+            .expect("expected a Read ref for 'prop' via the JS extractor");
+        assert_eq!(r.qualifier.as_deref(), Some("x"));
     }
 
     #[test]
