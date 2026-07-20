@@ -464,12 +464,13 @@ fn collect_symbols_in(node: &Node, ctx: &ExtractCtx, namespaces: &[String], out:
         descriptors.push(leaf);
 
         let signature = one_line_signature(node_text(&sig_node, ctx.bytes), &[':']);
+        let visibility = python_visibility(&name);
         let mut sym = make_symbol(
             ctx,
             &span_node,
             name,
             kind,
-            Visibility::Public,
+            visibility,
             descriptors,
             signature,
         );
@@ -571,16 +572,44 @@ fn collect_class_methods(
         );
 
         let signature = one_line_signature(node_text(&sig_node, ctx.bytes), &[':']);
+        let visibility = python_visibility(&name);
         let sym = make_symbol(
             ctx,
             &span_node,
             name,
             SymbolKind::Method,
-            Visibility::Public,
+            visibility,
             descriptors,
             signature,
         );
         out.push(sym);
+    }
+}
+
+/// Map a Python identifier to its [`Visibility`].
+///
+/// Unlike pure lint convention, Python's underscore prefixes carry language-level
+/// meaning: a leading double underscore (without a trailing dunder) triggers
+/// compiler name mangling (`__x` inside a class becomes `_Class__x`), and a leading
+/// single underscore is excluded from `from module import *`. code2graph records
+/// these as real visibility rather than `Unknown`. (This is distinct from Dart's
+/// purely-conventional `_` prefix, which the extractor deliberately leaves `Unknown`.)
+///
+/// - `__dunder__` (>= 2 leading AND >= 2 trailing underscores) -> `Public` (magic/special methods).
+/// - `__name` (>= 2 leading, <= 1 trailing) -> `Private` (name-mangled; scope-local).
+/// - `_name` (exactly 1 leading underscore) -> `Internal` (module-private / conventionally protected).
+/// - everything else, including trailing-underscore-only names like `type_` -> `Public`.
+fn python_visibility(name: &str) -> Visibility {
+    let lead = name.len() - name.trim_start_matches('_').len();
+    let trail = name.len() - name.trim_end_matches('_').len();
+    if lead >= 2 && trail >= 2 {
+        Visibility::Public
+    } else if lead >= 2 {
+        Visibility::Private
+    } else if lead == 1 {
+        Visibility::Internal
+    } else {
+        Visibility::Public
     }
 }
 
@@ -1539,6 +1568,71 @@ a, b = pair()
                 "expected '__init__' to be emitted (only pure-underscore names are skipped)",
             );
         assert_eq!(init.kind, SymbolKind::Method);
+    }
+
+    #[test]
+    fn module_level_visibility_follows_pep8_underscore_convention() {
+        let src = "\
+def public_fn(): pass
+def _internal_fn(): pass
+def __mangled_fn(): pass
+class _Internal: pass
+_INTERNAL_CONST = 1
+PUBLIC_CONST = 2
+";
+        let facts = PythonExtractor.extract(src, "src/m.py").unwrap();
+        let by_name = |n: &str| facts.symbols.iter().find(|s| s.name == n).cloned();
+        assert_eq!(by_name("public_fn").unwrap().visibility, Visibility::Public);
+        assert_eq!(
+            by_name("_internal_fn").unwrap().visibility,
+            Visibility::Internal
+        );
+        assert_eq!(
+            by_name("__mangled_fn").unwrap().visibility,
+            Visibility::Private
+        );
+        assert_eq!(
+            by_name("_Internal").unwrap().visibility,
+            Visibility::Internal
+        );
+        assert_eq!(
+            by_name("_INTERNAL_CONST").unwrap().visibility,
+            Visibility::Internal
+        );
+        assert_eq!(
+            by_name("PUBLIC_CONST").unwrap().visibility,
+            Visibility::Public
+        );
+    }
+
+    #[test]
+    fn class_method_visibility_follows_pep8_underscore_convention() {
+        let src = "\
+class Base:
+    def __init__(self):
+        pass
+
+    def _protected(self):
+        pass
+
+    def __private(self):
+        pass
+
+    def run(self):
+        pass
+";
+        let facts = PythonExtractor.extract(src, "src/m.py").unwrap();
+        let by_name = |n: &str| facts.symbols.iter().find(|s| s.name == n).cloned();
+        assert_eq!(by_name("__init__").unwrap().visibility, Visibility::Public);
+        assert_eq!(
+            by_name("_protected").unwrap().visibility,
+            Visibility::Internal
+        );
+        assert_eq!(
+            by_name("__private").unwrap().visibility,
+            Visibility::Private
+        );
+        assert_eq!(by_name("run").unwrap().visibility, Visibility::Public);
     }
 
     #[test]
