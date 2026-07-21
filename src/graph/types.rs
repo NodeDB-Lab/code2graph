@@ -127,7 +127,7 @@ pub enum Visibility {
     /// Visible only within the defining scope (`private`, C internal linkage).
     Private,
     /// The AST cannot determine visibility syntactically (Ruby runtime visibility,
-    /// dynamic languages, conventions like Dart's `_` prefix). Never guessed.
+    /// dynamic languages). Never guessed.
     Unknown,
 }
 

@@ -199,6 +199,21 @@ fn collect_top_level(node: &Node, ctx: &ExtractCtx, prefix: &[Descriptor], out: 
     }
 }
 
+/// Map a Dart identifier to its [`Visibility`].
+///
+/// Dart's leading underscore is compiler-enforced *library privacy* (a `_name`
+/// is inaccessible outside its defining library), so it is real visibility, not
+/// a lint convention. A single leading underscore -> `Internal` (library-scoped,
+/// like Go's package privacy and Python's `_`); everything else -> `Public`.
+/// Dart has no nested-privacy convention, so there is no `Private` case here.
+fn dart_visibility(name: &str) -> Visibility {
+    if name.starts_with('_') {
+        Visibility::Internal
+    } else {
+        Visibility::Public
+    }
+}
+
 /// Emit a class or extension symbol and recurse into its `class_body` for members.
 fn collect_class(
     node: &Node,
@@ -212,12 +227,13 @@ fn collect_class(
     };
     let mut descriptors = prefix.to_vec();
     descriptors.push(Descriptor::Type(name.clone()));
+    let visibility = dart_visibility(&name);
     out.push(make_symbol(
         ctx,
         node,
         name,
         kind,
-        Visibility::Unknown,
+        visibility,
         descriptors.clone(),
         one_line_signature(node_text(node, ctx.bytes), &['{', ';']),
     ));
@@ -237,12 +253,13 @@ fn collect_mixin(node: &Node, ctx: &ExtractCtx, prefix: &[Descriptor], out: &mut
     };
     let mut descriptors = prefix.to_vec();
     descriptors.push(Descriptor::Type(name.clone()));
+    let visibility = dart_visibility(&name);
     out.push(make_symbol(
         ctx,
         node,
         name,
         SymbolKind::Trait,
-        Visibility::Unknown,
+        visibility,
         descriptors.clone(),
         one_line_signature(node_text(node, ctx.bytes), &['{', ';']),
     ));
@@ -260,12 +277,13 @@ fn collect_enum(node: &Node, ctx: &ExtractCtx, prefix: &[Descriptor], out: &mut 
     };
     let mut descriptors = prefix.to_vec();
     descriptors.push(Descriptor::Type(name.clone()));
+    let visibility = dart_visibility(&name);
     out.push(make_symbol(
         ctx,
         node,
         name,
         SymbolKind::Enum,
-        Visibility::Unknown,
+        visibility,
         descriptors.clone(),
         one_line_signature(node_text(node, ctx.bytes), &['{', ';']),
     ));
@@ -277,12 +295,13 @@ fn collect_enum(node: &Node, ctx: &ExtractCtx, prefix: &[Descriptor], out: &mut 
                 if let Some(const_name) = field_text(&member, "name", ctx.bytes) {
                     let mut const_desc = descriptors.clone();
                     const_desc.push(Descriptor::Term(const_name.clone()));
+                    let visibility = dart_visibility(&const_name);
                     out.push(make_symbol(
                         ctx,
                         &member,
                         const_name,
                         SymbolKind::Const,
-                        Visibility::Unknown,
+                        visibility,
                         const_desc,
                         one_line_signature(node_text(&member, ctx.bytes), &['{', ';', ',']),
                     ));
@@ -301,12 +320,13 @@ fn collect_extension(node: &Node, ctx: &ExtractCtx, prefix: &[Descriptor], out: 
     };
     let mut descriptors = prefix.to_vec();
     descriptors.push(Descriptor::Type(name.clone()));
+    let visibility = dart_visibility(&name);
     out.push(make_symbol(
         ctx,
         node,
         name,
         SymbolKind::Class,
-        Visibility::Unknown,
+        visibility,
         descriptors.clone(),
         one_line_signature(node_text(node, ctx.bytes), &['{', ';']),
     ));
@@ -328,12 +348,13 @@ fn collect_type_alias(node: &Node, ctx: &ExtractCtx, prefix: &[Descriptor], out:
 
     let mut descriptors = prefix.to_vec();
     descriptors.push(Descriptor::Type(name.clone()));
+    let visibility = dart_visibility(&name);
     out.push(make_symbol(
         ctx,
         node,
         name,
         SymbolKind::TypeAlias,
-        Visibility::Unknown,
+        visibility,
         descriptors,
         one_line_signature(node_text(node, ctx.bytes), &['{', ';']),
     ));
@@ -360,12 +381,13 @@ fn collect_top_function(
         name: name.clone(),
         disambiguator: crate::symbol::MethodDisambiguator::empty(),
     });
+    let visibility = dart_visibility(&name);
     out.push(make_symbol(
         ctx,
         node,
         name,
         SymbolKind::Function,
-        Visibility::Unknown,
+        visibility,
         descriptors,
         one_line_signature(node_text(node, ctx.bytes), &['{', ';', '=']),
     ));
@@ -403,12 +425,13 @@ fn emit_initialized_identifiers(
             if let Some(name) = field_text(&item, "name", ctx.bytes) {
                 let mut descriptors = prefix.to_vec();
                 descriptors.push(Descriptor::Term(name.clone()));
+                let visibility = dart_visibility(&name);
                 out.push(make_symbol(
                     ctx,
                     decl_node,
                     name,
                     SymbolKind::Static,
-                    Visibility::Unknown,
+                    visibility,
                     descriptors,
                     one_line_signature(node_text(decl_node, ctx.bytes), &['{', ';']),
                 ));
@@ -504,12 +527,13 @@ fn emit_method(
         name: name.clone(),
         disambiguator: crate::symbol::MethodDisambiguator::empty(),
     });
+    let visibility = dart_visibility(&name);
     out.push(make_symbol(
         ctx,
         node,
         name,
         SymbolKind::Method,
-        Visibility::Unknown,
+        visibility,
         descriptors,
         one_line_signature(node_text(node, ctx.bytes), &['{', ';', '=']),
     ));
@@ -1235,6 +1259,30 @@ void greet(String name) {
             greet.id.to_scip_string(),
             "codegraph . . . utils/greeter/greet()."
         );
+    }
+
+    #[test]
+    fn leading_underscore_maps_to_internal_visibility() {
+        let src = r#"
+void _private() {}
+void publicFn() {}
+
+class _Hidden {}
+class Shown {}
+"#;
+        let facts = extract(src, "lib/models/visibility.dart");
+
+        let private_fn = by_name(&facts, "_private").unwrap();
+        assert_eq!(private_fn.visibility, Visibility::Internal);
+
+        let public_fn = by_name(&facts, "publicFn").unwrap();
+        assert_eq!(public_fn.visibility, Visibility::Public);
+
+        let hidden_class = by_name(&facts, "_Hidden").unwrap();
+        assert_eq!(hidden_class.visibility, Visibility::Internal);
+
+        let shown_class = by_name(&facts, "Shown").unwrap();
+        assert_eq!(shown_class.visibility, Visibility::Public);
     }
 
     #[test]
