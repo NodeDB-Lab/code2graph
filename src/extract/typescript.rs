@@ -136,7 +136,10 @@ pub(super) fn extract_ecmascript(
     let namespaces = module_namespaces(file);
 
     let ctx = ExtractCtx { bytes, file, lang };
-    let defs = collect_symbols(&root, &ctx, &namespaces);
+    let mut defs = collect_symbols(&root, &ctx, &namespaces);
+    // CommonJS `module.exports` / `exports.x` — promote existing top-level
+    // symbols to Public (identity-preserving) or synthesize inline exports.
+    collect_commonjs_exports(&root, &ctx, &namespaces, &mut defs);
     let def_bindings = definition_bindings(&defs);
     let mut symbols = defs;
     let mod_sym = super::module_symbol(lang, &namespaces, file, source.len());
@@ -144,6 +147,10 @@ pub(super) fn extract_ecmascript(
     symbols.push(mod_sym);
     let mut references =
         collect_call_references(&root, &ts_language, CALL_QUERY, lang, bytes, file)?;
+    // `require("m")` is caught by CALL_QUERY as a Call to `require`; that call is
+    // recorded as an Import reference by `collect_commonjs_imports` below, so drop
+    // the redundant Call ref to avoid noise.
+    references.retain(|r| !(r.role == RefRole::Call && r.name == "require"));
     mark_self_receiver_calls(
         &root,
         &ts_language,
@@ -163,6 +170,7 @@ pub(super) fn extract_ecmascript(
     )?;
     collect_inheritance(&root, bytes, file, &mut references);
     collect_imports(&root, bytes, file, &mut references, &module_id);
+    collect_commonjs_imports(&root, bytes, file, &mut references, &module_id);
     collect_type_references(&root, bytes, file, &mut references);
     collect_read_references(&root, bytes, file, &mut references);
     collect_property_access_references(&root, bytes, file, &mut references);
@@ -728,6 +736,368 @@ fn collect_imports(
     for child in node.children(&mut node.walk()) {
         collect_imports(&child, bytes, file, out, module_id);
     }
+}
+
+// ── CommonJS: require(...) imports and module.exports / exports.x exports ─────
+
+/// Recursively walk `node` collecting [`RefRole::Import`] references for every
+/// CommonJS `require("m")` call, mirroring the ES-module [`collect_imports`]
+/// pass (same [`push_import_ref`] shape, same quote/extension stripping).
+///
+/// The imported binding name(s) come from the enclosing `variable_declarator`:
+/// - `const x = require("m")` → one Import ref named `x`.
+/// - `const { a, b } = require("m")` (an `object_pattern` of
+///   `shorthand_property_identifier_pattern`s) → one Import ref per name.
+/// - a bare `require("m")` (side-effect import, no binding) → one Import ref
+///   named after the module's last path segment.
+///
+/// `from_path` is the module string with quotes stripped and a conventional
+/// module extension removed (as [`collect_imports`] does), so it lands on the
+/// same extension-free segments the resolver matches against.
+fn collect_commonjs_imports(
+    node: &Node,
+    bytes: &[u8],
+    file: &str,
+    out: &mut Vec<Reference>,
+    module_id: &str,
+) {
+    if node.kind() == "call_expression" {
+        if let Some(func) = node.child_by_field_name("function") {
+            if func.kind() == "identifier" && node_text(&func, bytes) == "require" {
+                if let Some(from_path) = require_string_arg(node, bytes) {
+                    emit_require_bindings(node, bytes, file, out, module_id, &from_path);
+                }
+            }
+        }
+    }
+    for child in node.children(&mut node.walk()) {
+        collect_commonjs_imports(&child, bytes, file, out, module_id);
+    }
+}
+
+/// The module specifier of a `require(...)` call: the first argument when it is a
+/// string literal, with surrounding quotes and a conventional module extension
+/// stripped (matching [`collect_imports`]). `None` when the first argument is
+/// absent or is not a string literal (a dynamic `require(expr)`).
+fn require_string_arg(call: &Node, bytes: &[u8]) -> Option<String> {
+    let args = call.child_by_field_name("arguments")?;
+    let first = args.named_children(&mut args.walk()).next()?;
+    if first.kind() != "string" {
+        return None;
+    }
+    let raw = node_text(&first, bytes);
+    let unquoted = raw.trim_matches('"').trim_matches('\'');
+    Some(strip_module_extension(unquoted).to_owned())
+}
+
+/// Emit the Import reference(s) for a `require(...)` call from the binding shape
+/// of its enclosing `variable_declarator` (or a bare side-effect import).
+fn emit_require_bindings(
+    call: &Node,
+    bytes: &[u8],
+    file: &str,
+    out: &mut Vec<Reference>,
+    module_id: &str,
+    from_path: &str,
+) {
+    let declarator = call.parent().filter(|p| p.kind() == "variable_declarator");
+    let Some(vd) = declarator else {
+        // Bare `require("m")` with no binding: emit under the module leaf name.
+        emit_bare_require(call, file, out, module_id, from_path);
+        return;
+    };
+    let Some(name) = vd.child_by_field_name("name") else {
+        return;
+    };
+    match name.kind() {
+        // `const x = require("m")`
+        "identifier" => {
+            super::push_import_ref(
+                out,
+                node_text(&name, bytes),
+                &name,
+                file,
+                module_id,
+                from_path,
+            );
+        }
+        // `const { a, b } = require("m")`
+        "object_pattern" => {
+            for child in name.named_children(&mut name.walk()) {
+                if child.kind() == "shorthand_property_identifier_pattern" {
+                    super::push_import_ref(
+                        out,
+                        node_text(&child, bytes),
+                        &child,
+                        file,
+                        module_id,
+                        from_path,
+                    );
+                }
+            }
+        }
+        // Any other binding pattern (array pattern, renamed destructure): fall
+        // back to the side-effect form rather than guess a name.
+        _ => emit_bare_require(call, file, out, module_id, from_path),
+    }
+}
+
+/// Emit a single Import reference for a binding-less `require("m")`, named after
+/// the module's last path segment (`./util` → `util`, `@scope/pkg` → `pkg`).
+/// Skipped when no clean leaf name can be derived.
+fn emit_bare_require(
+    call: &Node,
+    file: &str,
+    out: &mut Vec<Reference>,
+    module_id: &str,
+    from_path: &str,
+) {
+    let leaf = from_path.rsplit('/').next().unwrap_or(from_path).trim();
+    if !leaf.is_empty() {
+        super::push_import_ref(out, leaf, call, file, module_id, from_path);
+    }
+}
+
+/// Scan direct children of `root` for CommonJS export assignments and reflect
+/// them into `defs` — the IDENTITY-PRESERVING pass. A `module.exports` /
+/// `exports.x` target that names an existing top-level symbol PROMOTES that
+/// symbol's visibility to [`Visibility::Public`] in place (never duplicating
+/// its SCIP identity); a genuinely-inline export (function/arrow/literal/object)
+/// with no prior declaration SYNTHESIZES a new `Public` symbol.
+///
+/// Handled LHS shapes (`expression_statement > assignment_expression`):
+/// - `exports.NAME = <expr>` and `module.exports.NAME = <expr>` → named export.
+/// - `module.exports = <expr>` → whole-module export (`<expr>` may be an object
+///   literal of per-key exports, a bare identifier, or an inline value).
+fn collect_commonjs_exports(
+    root: &Node,
+    ctx: &ExtractCtx,
+    namespaces: &[String],
+    defs: &mut Vec<Symbol>,
+) {
+    for stmt in root.children(&mut root.walk()) {
+        if stmt.kind() != "expression_statement" {
+            continue;
+        }
+        let Some(assign) = stmt
+            .named_children(&mut stmt.walk())
+            .find(|c| c.kind() == "assignment_expression")
+        else {
+            continue;
+        };
+        let (Some(lhs), Some(rhs)) = (
+            assign.child_by_field_name("left"),
+            assign.child_by_field_name("right"),
+        ) else {
+            continue;
+        };
+        if lhs.kind() != "member_expression" {
+            continue;
+        }
+        let (Some(obj), Some(prop)) = (
+            lhs.child_by_field_name("object"),
+            lhs.child_by_field_name("property"),
+        ) else {
+            continue;
+        };
+        if prop.kind() != "property_identifier" {
+            continue;
+        }
+        // `module.exports = <rhs>` (whole-module export).
+        if obj.kind() == "identifier"
+            && node_text(&obj, ctx.bytes) == "module"
+            && node_text(&prop, ctx.bytes) == "exports"
+        {
+            handle_module_exports_rhs(&rhs, &assign, ctx, namespaces, defs);
+        }
+        // `exports.NAME = <rhs>` or `module.exports.NAME = <rhs>` (named export).
+        else if is_exports_object(&obj, ctx.bytes) {
+            handle_named_export(
+                node_text(&prop, ctx.bytes),
+                &rhs,
+                &assign,
+                ctx,
+                namespaces,
+                defs,
+            );
+        }
+    }
+}
+
+/// Whether `node` is a CommonJS exports container: the bare `exports` identifier,
+/// or a `module.exports` member expression.
+fn is_exports_object(node: &Node, bytes: &[u8]) -> bool {
+    if node.kind() == "identifier" {
+        return node_text(node, bytes) == "exports";
+    }
+    node.kind() == "member_expression"
+        && node
+            .child_by_field_name("object")
+            .is_some_and(|o| o.kind() == "identifier" && node_text(&o, bytes) == "module")
+        && node
+            .child_by_field_name("property")
+            .is_some_and(|p| node_text(&p, bytes) == "exports")
+}
+
+/// Reflect an `exports.NAME = <rhs>` / `module.exports.NAME = <rhs>` assignment.
+/// A bare-identifier `<rhs>` naming an existing top-level symbol promotes THAT
+/// symbol (identity-preserving); otherwise the export is materialized under
+/// `NAME`.
+fn handle_named_export(
+    export_name: &str,
+    rhs: &Node,
+    span_node: &Node,
+    ctx: &ExtractCtx,
+    namespaces: &[String],
+    defs: &mut Vec<Symbol>,
+) {
+    if rhs.kind() == "identifier" && promote_existing(defs, node_text(rhs, ctx.bytes)) {
+        return;
+    }
+    promote_or_synthesize(export_name, rhs, span_node, ctx, namespaces, defs);
+}
+
+/// Reflect a `module.exports = <rhs>` assignment for every export shape:
+/// an object literal of per-key exports, a bare identifier, or an inline value
+/// (anonymous default → materialized under the module leaf name).
+fn handle_module_exports_rhs(
+    rhs: &Node,
+    span_node: &Node,
+    ctx: &ExtractCtx,
+    namespaces: &[String],
+    defs: &mut Vec<Symbol>,
+) {
+    match rhs.kind() {
+        "object" => {
+            for entry in rhs.named_children(&mut rhs.walk()) {
+                match entry.kind() {
+                    // `{ helper }` — export name is the identifier itself.
+                    "shorthand_property_identifier" => {
+                        let name = node_text(&entry, ctx.bytes);
+                        if !promote_existing(defs, name) {
+                            synthesize_export(name, &entry, &entry, ctx, namespaces, defs);
+                        }
+                    }
+                    // `{ foo: <expr> }` — export name is the key; a bare-identifier
+                    // value naming an existing symbol promotes THAT symbol.
+                    "pair" => {
+                        let (Some(key), Some(value)) = (
+                            entry.child_by_field_name("key"),
+                            entry.child_by_field_name("value"),
+                        ) else {
+                            continue;
+                        };
+                        if value.kind() == "identifier"
+                            && promote_existing(defs, node_text(&value, ctx.bytes))
+                        {
+                            continue;
+                        }
+                        let key_name = node_text(&key, ctx.bytes);
+                        synthesize_export(key_name, &value, &value, ctx, namespaces, defs);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // `module.exports = someSymbol`
+        "identifier" => {
+            promote_or_synthesize(
+                node_text(rhs, ctx.bytes),
+                rhs,
+                span_node,
+                ctx,
+                namespaces,
+                defs,
+            );
+        }
+        // `module.exports = function () {}` / `= { ... }` handled above / literal:
+        // an anonymous default export, materialized under the module leaf name.
+        _ => {
+            let leaf = super::module_name(namespaces, ctx.file);
+            promote_or_synthesize(&leaf, rhs, span_node, ctx, namespaces, defs);
+        }
+    }
+}
+
+/// Promote every existing top-level symbol named `name` to [`Visibility::Public`]
+/// in place, returning whether any were promoted. Class/interface members
+/// (`Method`/`Field`) are excluded so only genuine top-level declarations match —
+/// this is what keeps SCIP identity 1:1 (promote, never duplicate).
+fn promote_existing(defs: &mut [Symbol], name: &str) -> bool {
+    let mut promoted = false;
+    for sym in defs.iter_mut() {
+        if sym.name == name && !matches!(sym.kind, SymbolKind::Method | SymbolKind::Field) {
+            sym.visibility = Visibility::Public;
+            promoted = true;
+        }
+    }
+    promoted
+}
+
+/// Promote an existing top-level symbol named `name`, or synthesize a new
+/// `Public` one when none exists.
+fn promote_or_synthesize(
+    name: &str,
+    rhs: &Node,
+    span_node: &Node,
+    ctx: &ExtractCtx,
+    namespaces: &[String],
+    defs: &mut Vec<Symbol>,
+) {
+    if !promote_existing(defs, name) {
+        synthesize_export(name, rhs, span_node, ctx, namespaces, defs);
+    }
+}
+
+/// Append a new `Public` [`Symbol`] named `name` for a genuinely-inline export
+/// with no prior declaration. The kind is inferred from the export value `rhs`
+/// (function/arrow/generator → [`SymbolKind::Function`] with a `Method` leaf
+/// descriptor, mirroring `emit_declaration`; anything else → [`SymbolKind::Const`]
+/// with a `Term` leaf). `span_node` locates it and drives its signature.
+fn synthesize_export(
+    name: &str,
+    rhs: &Node,
+    span_node: &Node,
+    ctx: &ExtractCtx,
+    namespaces: &[String],
+    defs: &mut Vec<Symbol>,
+) {
+    let (kind, leaf) = if rhs_is_function(rhs) {
+        (
+            SymbolKind::Function,
+            Descriptor::Method {
+                name: name.to_owned(),
+                disambiguator: crate::symbol::MethodDisambiguator::empty(),
+            },
+        )
+    } else {
+        (SymbolKind::Const, Descriptor::Term(name.to_owned()))
+    };
+    let mut descriptors: Vec<Descriptor> = namespaces
+        .iter()
+        .cloned()
+        .map(Descriptor::Namespace)
+        .collect();
+    descriptors.push(leaf);
+    let signature = one_line_signature(node_text(span_node, ctx.bytes), &['{']);
+    defs.push(make_symbol(
+        ctx,
+        span_node,
+        name.to_owned(),
+        kind,
+        Visibility::Public,
+        descriptors,
+        signature,
+    ));
+}
+
+/// Whether an export value node is a function-like expression (so the synthesized
+/// export symbol is a [`SymbolKind::Function`] rather than a [`SymbolKind::Const`]).
+fn rhs_is_function(node: &Node) -> bool {
+    matches!(
+        node.kind(),
+        "function_expression" | "arrow_function" | "generator_function" | "function"
+    )
 }
 
 // ── Edge richness: TypeRef / Read / Write ────────────────────────────────────
@@ -2265,5 +2635,84 @@ export const Y = 2;
             .find(|b| b.name == "y" && b.kind == BindingKind::Local)
             .expect("expected a Local binding for 'y'");
         assert_eq!(b.type_name, None);
+    }
+
+    // ── CommonJS require / module.exports ────────────────────────────────────
+
+    #[test]
+    fn cjs_require_default_binding_emits_import_ref() {
+        use crate::extract::JavaScriptExtractor;
+
+        let src = r#"const x = require("./util");"#;
+        let facts = JavaScriptExtractor.extract(src, "src/x.js").unwrap();
+        let r = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Import && r.name == "x")
+            .expect("expected an Import ref named 'x' for require(\"./util\")");
+        assert_eq!(r.from_path, Some("./util".to_owned()));
+    }
+
+    #[test]
+    fn cjs_require_destructured_binding_emits_import_ref() {
+        use crate::extract::JavaScriptExtractor;
+
+        let src = r#"const { helper } = require("./util");"#;
+        let facts = JavaScriptExtractor.extract(src, "src/x.js").unwrap();
+        let r = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Import && r.name == "helper")
+            .expect("expected an Import ref named 'helper' from the destructured require");
+        assert_eq!(r.from_path, Some("./util".to_owned()));
+    }
+
+    #[test]
+    fn cjs_module_exports_object_promotes_existing_symbol_once() {
+        use crate::extract::JavaScriptExtractor;
+
+        let src = "function helper() {}\nmodule.exports = { helper };";
+        let facts = JavaScriptExtractor.extract(src, "src/x.js").unwrap();
+        let helpers: Vec<_> = facts
+            .symbols
+            .iter()
+            .filter(|s| s.name == "helper")
+            .collect();
+        assert_eq!(
+            helpers.len(),
+            1,
+            "'helper' must be promoted, not duplicated; got {helpers:?}"
+        );
+        assert_eq!(helpers[0].visibility, Visibility::Public);
+    }
+
+    #[test]
+    fn cjs_exports_inline_function_synthesizes_public_function() {
+        use crate::extract::JavaScriptExtractor;
+
+        let src = "exports.run = function() {};";
+        let facts = JavaScriptExtractor.extract(src, "src/x.js").unwrap();
+        let run = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "run")
+            .expect("expected a synthesized 'run' symbol");
+        assert_eq!(run.kind, SymbolKind::Function);
+        assert_eq!(run.visibility, Visibility::Public);
+    }
+
+    #[test]
+    fn cjs_exports_literal_synthesizes_public_const() {
+        use crate::extract::JavaScriptExtractor;
+
+        let src = r#"exports.API_URL = "x";"#;
+        let facts = JavaScriptExtractor.extract(src, "src/x.js").unwrap();
+        let api = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "API_URL")
+            .expect("expected a synthesized 'API_URL' symbol");
+        assert_eq!(api.kind, SymbolKind::Const);
+        assert_eq!(api.visibility, Visibility::Public);
     }
 }
