@@ -44,7 +44,7 @@ pub fn read_frame<R: IoRead>(
         .read_exact(&mut prefix[1..])
         .map_err(|error| match error.kind() {
             std::io::ErrorKind::UnexpectedEof => {
-                WorkerProtocolError::Malformed("truncated length prefix")
+                WorkerProtocolError::Truncated("truncated length prefix")
             }
             _ => WorkerProtocolError::Io(error),
         })?;
@@ -64,7 +64,7 @@ pub fn read_frame<R: IoRead>(
     reader
         .read_exact(&mut frame[4..])
         .map_err(|error| match error.kind() {
-            std::io::ErrorKind::UnexpectedEof => WorkerProtocolError::Malformed("truncated frame"),
+            std::io::ErrorKind::UnexpectedEof => WorkerProtocolError::Truncated("truncated frame"),
             _ => WorkerProtocolError::Io(error),
         })?;
     Ok(Some(frame))

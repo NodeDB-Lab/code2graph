@@ -55,7 +55,7 @@ impl Extractor for LuaExtractor {
         Language::Lua
     }
 
-    fn extract(&self, source: &str, file: &str) -> Result<FileFacts> {
+    fn extract_facts(&self, source: &str, file: &str) -> Result<FileFacts> {
         extract_lua_family(source, file, Language::Lua, crate::grammar::lua())
     }
 }

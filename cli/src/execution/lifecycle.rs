@@ -957,6 +957,7 @@ fn execute_index(request: CliRequest, context: &ExecutionContext<'_>) -> Result<
             &prepared,
             request.global.tier,
             CacheDisposition::Disabled,
+            None,
         )));
     }
 
@@ -988,6 +989,7 @@ fn execute_index(request: CliRequest, context: &ExecutionContext<'_>) -> Result<
         &published.prepared,
         request.global.tier,
         cache,
+        store.recovery_diagnostic(),
     )))
 }
 
@@ -1186,7 +1188,11 @@ pub fn load_query_graph(
             request.global.tier,
             Freshness::Fresh,
             refresh_cache_disposition(prior.as_ref(), &published.prepared),
-        ),
+        )
+        .map(|mut graph| {
+            graph.project.cache_recovery = store.recovery_diagnostic();
+            graph
+        }),
         Err(error) if request.global.allow_stale => {
             latest_active(&store, tier, request.global.allow_partial, &deadline)?
                 .ok_or(error)
@@ -1256,6 +1262,7 @@ fn index_envelope(
     prepared: &PreparedRefreshCandidate,
     tier: crate::ResolverTier,
     cache: CacheDisposition,
+    cache_recovery: Option<String>,
 ) -> OutputEnvelope<IndexOutput> {
     let mut envelope = OutputEnvelope::new(
         success_status(snapshot.completeness, Freshness::Fresh),
@@ -1269,13 +1276,9 @@ fn index_envelope(
             PlanDecisionCountsOutput::from(&prepared.plan),
         ),
     );
-    envelope.project = Some(project_output(
-        selection,
-        snapshot,
-        tier,
-        Freshness::Fresh,
-        cache,
-    ));
+    let mut project = project_output(selection, snapshot, tier, Freshness::Fresh, cache);
+    project.cache_recovery = cache_recovery;
+    envelope.project = Some(project);
     envelope
 }
 
@@ -1341,6 +1344,9 @@ fn project_output(
         completeness: snapshot.completeness.into(),
         omitted_files: snapshot.omissions.len(),
         omissions: snapshot.omissions.iter().map(Into::into).collect(),
+        // Only the paths that actually refreshed against a store can observe a
+        // recovery; they fill this in from the store afterwards.
+        cache_recovery: None,
     }
 }
 
@@ -1418,6 +1424,69 @@ mod tests {
         let output = execute(status(true), &context).expect("status");
         assert!(matches!(output, CommandOutput::Status(_)));
         assert!(!cache.exists());
+    }
+
+    /// A cache whose stored facts stop satisfying their validation contract —
+    /// what an upgrade that tightens or widens that contract produces — is
+    /// silently discarded and rebuilt, which is otherwise indistinguishable from
+    /// a cold cache. The rule that rejected it has to reach the operator.
+    #[test]
+    fn a_silently_discarded_cache_reports_why_in_the_index_output() {
+        let (_temp, root, cache) = fixture();
+        let cancellation = NeverCancelled;
+        let clock = CountingClock(AtomicUsize::new(0));
+        let context = context(&root, &cache, &cancellation, &clock);
+        let deadline = Deadline::new(None);
+        let canonical = fs::canonicalize(&root).expect("canonical root");
+        let location =
+            crate::cache::CacheLocation::for_project(Some(&cache), &canonical).expect("location");
+        // The name tier keeps the seeded candidate free of per-file subgraphs;
+        // the cache-recovery path under test is the same for every tier.
+        let store = CacheStore::open_writable(&location, &canonical, &deadline).expect("store");
+        store
+            .publish_candidate(
+                &crate::cache::single_file_candidate("src/a.rs", ResolverCacheTier::Name),
+                &deadline,
+            )
+            .expect("seed a cache to invalidate");
+        drop(store);
+
+        // Rewrite the cached facts so they claim a different file. The blob
+        // stays structurally valid, so only the context contract rejects it —
+        // exactly how a contract change invalidates a previously good cache.
+        let foreign = code2graph::FileFacts {
+            file: "somewhere-else.rs".into(),
+            lang: "rust".into(),
+            symbols: Vec::new(),
+            references: Vec::new(),
+            scopes: Vec::new(),
+            bindings: Vec::new(),
+            ffi_exports: Vec::new(),
+        };
+        let blob = crate::cache::encode_file_facts(&foreign).expect("encode");
+        let rewritten = rusqlite::Connection::open(&location.database_path)
+            .expect("sqlite")
+            .execute(
+                "UPDATE candidate_files SET file_facts = ?1",
+                rusqlite::params![blob],
+            )
+            .expect("rewrite cached facts");
+        assert_eq!(rewritten, 1, "the seeded cache holds exactly one file");
+
+        let mut request = index_request(false);
+        request.global.tier = ResolverTier::Name;
+        let CommandOutput::Index(output) = execute(request, &context).expect("index") else {
+            panic!("index returned another command output");
+        };
+        let detail = output
+            .project
+            .expect("project")
+            .cache_recovery
+            .expect("a discarded cache must report why");
+        assert!(
+            detail.contains("somewhere-else.rs"),
+            "the diagnostic must name the rejected facts, got {detail}"
+        );
     }
 
     #[test]

@@ -4,7 +4,7 @@
 //! ([`extract_file`], [`extract_path`]).
 
 use crate::error::{CodegraphError, Result};
-use crate::graph::FileFacts;
+use crate::graph::{FileFacts, FileFactsValidationContext, validate_file_facts_with_context};
 use crate::lang::Language;
 
 #[cfg(feature = "c")]
@@ -55,28 +55,78 @@ use super::SwiftExtractor;
 use super::TypeScriptExtractor;
 
 /// A per-language source-to-facts extractor.
+///
+/// Implementors provide the raw tree-sitter pass ([`Extractor::extract_facts`]);
+/// callers use [`Extractor::extract`], which normalizes that output and enforces
+/// the [`FileFacts`] context contract on it. Keeping the contract at this seam —
+/// rather than only at the public dispatch entry points — means a language pass
+/// that emits facts a consumer's deserialization boundary would reject fails
+/// here, in that extractor's own tests, instead of silently degrading into an
+/// omitted file downstream.
 pub trait Extractor {
     /// The language this extractor handles.
     fn lang(&self) -> Language;
 
     /// Parse `source` (the contents of `file`, a project-relative path) and
     /// return its definitions and references.
-    fn extract(&self, source: &str, file: &str) -> Result<FileFacts>;
+    ///
+    /// This is the implementation hook. Call [`Extractor::extract`] instead: it
+    /// applies the normalization and validation every consumer relies on.
+    fn extract_facts(&self, source: &str, file: &str) -> Result<FileFacts>;
 
-    /// Like [`Extractor::extract`], but given a [`crate::extract::BindingRules`]
-    /// registry describing which language constructs carry embedded secondary
-    /// artifacts (e.g. SQL strings). Extractors that don't recognize any such
-    /// construct can ignore `rules` and behave exactly like [`Extractor::extract`]
-    /// — which is what the default implementation does.
-    fn extract_with_bindings(
+    /// Like [`Extractor::extract_facts`], but given a
+    /// [`crate::extract::BindingRules`] registry describing which language
+    /// constructs carry embedded secondary artifacts (e.g. SQL strings).
+    /// Extractors that don't recognize any such construct can ignore `rules` and
+    /// behave exactly like [`Extractor::extract_facts`] — which is what the
+    /// default implementation does.
+    fn extract_facts_with_bindings(
         &self,
         source: &str,
         file: &str,
         rules: &crate::extract::BindingRules,
     ) -> Result<FileFacts> {
         let _ = rules;
-        self.extract(source, file)
+        self.extract_facts(source, file)
     }
+
+    /// Extract normalized, contract-checked facts for `file`.
+    fn extract(&self, source: &str, file: &str) -> Result<FileFacts> {
+        let facts = self.extract_facts(source, file)?;
+        normalize_and_validate(facts, self.lang(), source, file)
+    }
+
+    /// Extract normalized, contract-checked facts for `file`, applying `rules`.
+    fn extract_with_bindings(
+        &self,
+        source: &str,
+        file: &str,
+        rules: &crate::extract::BindingRules,
+    ) -> Result<FileFacts> {
+        let facts = self.extract_facts_with_bindings(source, file, rules)?;
+        normalize_and_validate(facts, self.lang(), source, file)
+    }
+}
+
+/// Normalize a raw language pass's output and hold it to its context contract.
+///
+/// A free function rather than a trait method so no implementor can weaken it.
+fn normalize_and_validate(
+    mut facts: FileFacts,
+    lang: Language,
+    source: &str,
+    file: &str,
+) -> Result<FileFacts> {
+    dedupe_symbol_identities(&mut facts);
+    validate_file_facts_with_context(
+        &facts,
+        FileFactsValidationContext {
+            expected_file: file,
+            expected_language: lang,
+            source_len: source.len(),
+        },
+    )?;
+    Ok(facts)
 }
 
 /// Extract facts from a single file, dispatching on its language, with no
@@ -105,8 +155,7 @@ pub fn extract_file_with_bindings(
     rules: &super::BindingRules,
 ) -> Result<FileFacts> {
     #[allow(unreachable_patterns)]
-    #[cfg_attr(not(feature = "_extractors"), allow(unused_mut))]
-    let mut facts = match lang {
+    let facts = match lang {
         #[cfg(feature = "c")]
         Language::C => CExtractor.extract_with_bindings(source, file, rules),
         #[cfg(feature = "csharp")]
@@ -158,8 +207,8 @@ pub fn extract_file_with_bindings(
             lang.as_str()
         ))),
     }?;
-    #[cfg(feature = "_extractors")]
-    dedupe_symbol_identities(&mut facts);
+    // Every arm above returns through `Extractor::extract_with_bindings`, which
+    // has already deduped and validated against this exact context.
     Ok(facts)
 }
 
@@ -169,7 +218,6 @@ pub fn extract_file_with_bindings(
 /// two occurrences are one logical symbol, so keep the first and drop the
 /// rest. Mirrors the first-seen-wins dedup the layered resolver applies when
 /// merging (see `resolve::layered`).
-#[cfg(feature = "_extractors")]
 fn dedupe_symbol_identities(facts: &mut FileFacts) {
     let mut seen = std::collections::HashSet::with_capacity(facts.symbols.len());
     facts
@@ -226,5 +274,122 @@ fn identity() -> u32 { 2 }
             1,
             "cfg-gated duplicate definitions must dedupe to a single symbol, got {matches:?}"
         );
+    }
+
+    /// The gate that keeps issue-class "the library accepted it, the consumer
+    /// rejected it" bugs from shipping: a language pass whose raw output breaks
+    /// the context contract must fail at the extractor seam, where its own unit
+    /// tests will see it — not silently downstream at a deserialization boundary
+    /// that turns the whole file into an omission.
+    #[test]
+    fn a_contract_violating_pass_fails_at_the_extractor_seam() {
+        struct ViolatingExtractor;
+
+        impl Extractor for ViolatingExtractor {
+            fn lang(&self) -> Language {
+                Language::Rust
+            }
+
+            fn extract_facts(&self, _source: &str, file: &str) -> Result<FileFacts> {
+                Ok(FileFacts {
+                    file: file.to_owned(),
+                    lang: "rust".to_owned(),
+                    symbols: Vec::new(),
+                    // `source_module` is an import-only field. Carrying it on a
+                    // call is exactly the shape of metadata drift that a new
+                    // role-specific field introduces.
+                    references: vec![crate::graph::Reference {
+                        name: "helper".to_owned(),
+                        occ: crate::graph::Occurrence {
+                            file: file.to_owned(),
+                            line: 1,
+                            col: 1,
+                            byte: 0,
+                        },
+                        role: crate::graph::RefRole::Call,
+                        source_module: Some("module".to_owned()),
+                        from_path: None,
+                        imported_name: None,
+                        is_reexport: false,
+                        qualifier: None,
+                        scope: None,
+                        type_ref_ctx: None,
+                        cross_artifact: false,
+                        self_receiver: false,
+                    }],
+                    scopes: Vec::new(),
+                    bindings: Vec::new(),
+                    ffi_exports: Vec::new(),
+                })
+            }
+        }
+
+        let source = "fn caller() { helper() }\n";
+        assert!(
+            ViolatingExtractor
+                .extract_facts(source, "src/lib.rs")
+                .is_ok(),
+            "the raw pass itself is unguarded — the seam is what enforces the contract"
+        );
+        let error = ViolatingExtractor
+            .extract(source, "src/lib.rs")
+            .expect_err("a contract-violating pass must not escape its extractor");
+        assert!(
+            error.to_string().contains("source_module"),
+            "the failure must name the rule that fired, got {error}"
+        );
+    }
+
+    #[test]
+    fn dispatch_returns_context_valid_member_read_facts() {
+        let source = "struct Entry { extra: i64 }\nfn read(entry: &Entry) -> i64 { entry.extra }\n";
+        let facts = extract_path("src/entry.rs", source).expect("dispatch extraction");
+        assert!(facts.references.iter().any(|reference| {
+            reference.role == crate::graph::RefRole::Read
+                && reference.name == "extra"
+                && reference.qualifier.as_deref() == Some("entry")
+        }));
+        validate_file_facts_with_context(
+            &facts,
+            FileFactsValidationContext {
+                expected_file: "src/entry.rs",
+                expected_language: Language::Rust,
+                source_len: source.len(),
+            },
+        )
+        .expect("public dispatch output must satisfy its context contract");
+    }
+
+    #[cfg(feature = "typescript")]
+    #[test]
+    fn dispatch_returns_context_valid_typescript_and_javascript_property_reads() {
+        for (file, language, source) in [
+            (
+                "src/entry.ts",
+                Language::TypeScript,
+                "interface Entry { extra: number }\nfunction read(entry: Entry) { return entry.extra; }\n",
+            ),
+            (
+                "src/entry.js",
+                Language::JavaScript,
+                "function read(entry) { return entry.extra; }\n",
+            ),
+        ] {
+            let facts = extract_path(file, source).expect("dispatch extraction");
+            assert!(facts.references.iter().any(|reference| {
+                reference.role == crate::graph::RefRole::Read
+                    && reference.name == "extra"
+                    && reference.qualifier.as_deref() == Some("entry")
+            }));
+            validate_file_facts_with_context(
+                &facts,
+                FileFactsValidationContext {
+                    expected_file: file,
+                    expected_language: language,
+                    source_len: source.len(),
+                },
+            )
+            .expect("public dispatch output must satisfy its context contract");
+        }
     }
 }

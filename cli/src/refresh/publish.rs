@@ -225,10 +225,21 @@ fn revalidate_candidate<E: FactsExtractor>(
                     inputs.deadline,
                     inputs.cancellation,
                 ) {
+                    Ok(crate::refresh::prepare::ExtractionOutcome::Omitted { detail }) => {
+                        if *omission
+                            != (crate::cache::CacheOmission {
+                                path: omission.path.clone(),
+                                reason: "extraction-error".into(),
+                                detail,
+                            })
+                        {
+                            return Ok(false);
+                        }
+                    }
                     Err(CliError::Worker(crate::worker::WorkerFailure::Remote(
                         crate::worker::WorkerErrorCode::Extraction,
                     ))) => {}
-                    Ok(_) => return Ok(false),
+                    Ok(crate::refresh::prepare::ExtractionOutcome::Facts(_)) => return Ok(false),
                     Err(error) => return Err(error),
                 }
                 revalidation_request_id = revalidation_request_id
@@ -331,6 +342,7 @@ fn prepare_and_publish_with_hook<E: FactsExtractor>(
 mod tests {
     use std::cell::Cell;
     use std::fs;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
     use std::time::Duration;
 
@@ -547,6 +559,78 @@ mod tests {
         assert_eq!(result.loaded.completeness, CacheCompleteness::Complete);
         assert!(result.loaded.omissions.is_empty());
         assert_eq!(result.loaded.files.len(), 1);
+    }
+
+    struct ChangingOmissionDetailExtractor {
+        calls: Arc<AtomicU8>,
+    }
+
+    impl FactsExtractor for ChangingOmissionDetailExtractor {
+        type Session = ChangingOmissionDetailSession;
+
+        fn session(&self, _slot: WorkerSlot) -> Result<ChangingOmissionDetailSession> {
+            Ok(ChangingOmissionDetailSession {
+                calls: Arc::clone(&self.calls),
+            })
+        }
+    }
+
+    struct ChangingOmissionDetailSession {
+        calls: Arc<AtomicU8>,
+    }
+
+    impl ExtractSession for ChangingOmissionDetailSession {
+        fn extract(
+            &mut self,
+            _file: &crate::inventory::InventoryFile,
+            _request_id: RequestId,
+            _deadline: &Deadline,
+            _cancellation: &dyn Cancellation,
+        ) -> Result<code2graph::FileFacts> {
+            Err(CliError::Worker(crate::worker::WorkerFailure::Remote(
+                crate::worker::WorkerErrorCode::Extraction,
+            )))
+        }
+
+        fn extract_outcome(
+            &mut self,
+            _file: &crate::inventory::InventoryFile,
+            _request_id: RequestId,
+            _deadline: &Deadline,
+            _cancellation: &dyn Cancellation,
+        ) -> Result<crate::refresh::prepare::ExtractionOutcome> {
+            let detail = if self.calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                "stage=first error=omitted"
+            } else {
+                "stage=second error=omitted"
+            };
+            Ok(crate::refresh::prepare::ExtractionOutcome::Omitted {
+                detail: detail.into(),
+            })
+        }
+    }
+
+    #[test]
+    fn changed_extraction_omission_detail_reprepares_before_publication() {
+        let (temp, selection) = project("fn omitted() {}\n");
+        let limits = ResourceLimits::default();
+        let deadline = Deadline::new(None);
+        let extractor = ChangingOmissionDetailExtractor {
+            calls: Arc::new(AtomicU8::new(0)),
+        };
+        let result = prepare_and_publish_with(
+            &extractor,
+            &store(&temp, &selection),
+            inputs(&selection, &limits, &deadline),
+            true,
+        )
+        .expect("changed omission detail must reprepare and then publish the stable outcome");
+        assert_eq!(extractor.calls.load(Ordering::Relaxed), 4);
+        assert_eq!(result.loaded.omissions.len(), 1);
+        assert_eq!(
+            result.loaded.omissions[0].detail,
+            "stage=second error=omitted"
+        );
     }
 
     struct AddSourceOnce {

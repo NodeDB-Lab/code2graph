@@ -18,9 +18,13 @@ use crate::InventoryFile;
 use super::WORKER_SENTINEL;
 use super::frame::{decode_response_frame, encode_frame, read_frame};
 use super::platform::{self, Containment, KillHandle};
-use super::process::{STDERR_TAIL_MAX, WorkerFailure, classify_response_error, drain_tail};
+use super::process::{
+    STDERR_TAIL_MAX, WorkerAttemptFailure, WorkerFailure, classify_detailed_response,
+    classify_response_error, drain_tail,
+};
 use super::protocol::{
-    REQUEST_FRAME_MAX, RESPONSE_FRAME_MAX, RequestId, WorkerRequest, validate_response,
+    REQUEST_FRAME_MAX, RESPONSE_FRAME_MAX, RequestId, WorkerProtocolError, WorkerRequest,
+    validate_response_detailed,
 };
 
 /// A handle owning one persistent worker subprocess plus the plumbing that keeps
@@ -109,29 +113,52 @@ impl PersistentWorker {
         request_id: RequestId,
         rules: &[QueryBindingRule],
     ) -> Result<FileFacts, WorkerFailure> {
+        self.extract_one_detailed(file, request_id, rules)
+            .map_err(WorkerAttemptFailure::legacy)
+    }
+
+    /// Crate-private detailed classification used to preserve omission diagnostics
+    /// without extending the public [`WorkerFailure`] contract.
+    pub(crate) fn extract_one_detailed(
+        &mut self,
+        file: &InventoryFile,
+        request_id: RequestId,
+        rules: &[QueryBindingRule],
+    ) -> Result<FileFacts, WorkerAttemptFailure> {
         let request = WorkerRequest::from_inventory_file(request_id, file, rules)
-            .map_err(|_| WorkerFailure::Protocol)?;
-        let frame =
-            encode_frame(&request, REQUEST_FRAME_MAX).map_err(|_| WorkerFailure::Protocol)?;
-        let stdin = self.stdin.as_mut().ok_or(WorkerFailure::Transport)?;
+            .map_err(|_| WorkerAttemptFailure::Failure(WorkerFailure::Protocol))?;
+        let frame = encode_frame(&request, REQUEST_FRAME_MAX)
+            .map_err(|_| WorkerAttemptFailure::Failure(WorkerFailure::Protocol))?;
+        let stdin = self
+            .stdin
+            .as_mut()
+            .ok_or(WorkerAttemptFailure::Failure(WorkerFailure::Transport))?;
         // A write failure means the worker has already gone away.
         if stdin
             .write_all(&frame)
             .and_then(|()| stdin.flush())
             .is_err()
         {
-            return Err(WorkerFailure::Transport);
+            return Err(WorkerAttemptFailure::Failure(WorkerFailure::Transport));
         }
         match read_frame(&mut self.stdout, RESPONSE_FRAME_MAX) {
-            // Clean EOF or a truncated/undecodable stream both mean the worker
-            // died or desynced; either way the connection is no longer usable.
-            Ok(None) | Err(_) => Err(WorkerFailure::Transport),
+            // Clean EOF, or a stream that ends part-way through a frame, both
+            // mean the worker process went away — a crash, the OOM killer, or
+            // the deadline monitor — so crash recovery may respawn and retry.
+            Ok(None) => Err(WorkerAttemptFailure::Failure(WorkerFailure::Transport)),
+            Err(WorkerProtocolError::Truncated(_)) => {
+                Err(WorkerAttemptFailure::Failure(WorkerFailure::Transport))
+            }
+            // A frame the worker fully wrote but we cannot accept (oversized,
+            // empty, structurally invalid) is a genuine protocol defect. It must
+            // stay fatal rather than being laundered into a per-file omission.
+            Err(_) => Err(WorkerAttemptFailure::Failure(WorkerFailure::Protocol)),
             Ok(Some(frame)) => {
-                let response =
-                    decode_response_frame(&frame).map_err(|_| WorkerFailure::Protocol)?;
-                validate_response(&response, &request)
-                    .map_err(classify_response_error)?
-                    .map_err(|remote| WorkerFailure::Remote(remote.code))
+                let response = decode_response_frame(&frame)
+                    .map_err(|_| WorkerAttemptFailure::Failure(WorkerFailure::Protocol))?;
+                validate_response_detailed(&response, &request)
+                    .map_err(classify_response_error)
+                    .and_then(classify_detailed_response)
             }
         }
     }
@@ -242,6 +269,34 @@ mod tests {
         assert!(
             matches!(second, Err(WorkerFailure::Transport)),
             "a dead worker must surface as Transport, got {second:?}"
+        );
+    }
+
+    #[test]
+    fn a_worker_killed_mid_frame_is_a_recoverable_transport_failure() {
+        // Announces a five-byte payload, writes one byte, then dies — exactly
+        // what a crash or the OOM killer leaves in the pipe. Crash recovery must
+        // be allowed to respawn and retry rather than aborting the whole run.
+        let (_dir, path) = script("read_frame; printf '\\000\\000\\000\\005x'; exit 0");
+        let mut worker = PersistentWorker::spawn(&path).expect("spawn persistent worker");
+        let outcome = worker.extract_one(&inventory_file(), 17, &[]);
+        assert!(
+            matches!(outcome, Err(WorkerFailure::Transport)),
+            "a worker that died mid-frame must stay recoverable: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn a_structurally_invalid_response_frame_is_a_fatal_protocol_failure() {
+        // A complete, well-formed prefix declaring an empty payload: the worker
+        // did not die, it spoke the protocol wrongly. That must stay fatal
+        // rather than being laundered into a per-file omission.
+        let (_dir, path) = script("read_frame; printf '\\000\\000\\000\\000'; sleep 30");
+        let mut worker = PersistentWorker::spawn(&path).expect("spawn persistent worker");
+        let outcome = worker.extract_one(&inventory_file(), 17, &[]);
+        assert!(
+            matches!(outcome, Err(WorkerFailure::Protocol)),
+            "a protocol violation must not enter crash recovery: {outcome:?}"
         );
     }
 

@@ -93,6 +93,13 @@ pub struct ProjectOutput {
     #[serde(rename = "omittedFiles")]
     pub omitted_files: usize,
     pub omissions: Vec<CacheOmissionOutput>,
+    /// Why a previously cached snapshot was discarded and rebuilt, when that
+    /// happened during this run. A cache whose stored facts no longer satisfy
+    /// their validation contract — after an upgrade changes that contract, say
+    /// — is silently self-healed, which otherwise reports as an ordinary cache
+    /// miss. Present only when a recovery actually occurred.
+    #[serde(rename = "cacheRecovery", skip_serializing_if = "Option::is_none")]
+    pub cache_recovery: Option<String>,
 }
 
 /// Stable kebab-case spelling of [`SymbolKind`] in CLI output.
@@ -850,6 +857,7 @@ mod tests {
             completeness: snapshot.completeness.into(),
             omitted_files: snapshot.omissions.len(),
             omissions: snapshot.omissions.iter().map(Into::into).collect(),
+            cache_recovery: None,
         }
     }
 
@@ -1000,6 +1008,7 @@ mod tests {
             completeness: CacheCompletenessOutput::Complete,
             omitted_files: 0,
             omissions: Vec::new(),
+            cache_recovery: None,
         };
         assert_eq!(
             serde_json::to_value(complete).unwrap(),
@@ -1071,6 +1080,7 @@ mod tests {
                         completeness: snapshot.completeness.into(),
                         omitted_files: snapshot.omissions.len(),
                         omissions: snapshot.omissions.iter().map(Into::into).collect(),
+                        cache_recovery: None,
                     },
                     &snapshot,
                     &ResourceLimits::default(),

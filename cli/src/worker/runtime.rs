@@ -11,8 +11,9 @@ use code2graph::{
 
 use super::frame::{decode_request_frame, read_frame, write_frame};
 use super::protocol::{
-    FileFactsWire, MAX_STRING_BYTES, PROTOCOL_VERSION, REQUEST_FRAME_MAX, RESPONSE_FRAME_MAX,
-    WorkerErrorCode, WorkerErrorWire, WorkerProtocolError, WorkerResponse, validate_request,
+    FileFactsWire, INVALID_FACTS_ERROR_CODE, MAX_STRING_BYTES, PROTOCOL_VERSION, REQUEST_FRAME_MAX,
+    RESPONSE_FRAME_MAX, WorkerErrorCode, WorkerErrorWire, WorkerProtocolError, WorkerResponse,
+    validate_request,
 };
 
 /// Hidden sole argument which enters the worker runtime before CLI parsing.
@@ -78,30 +79,45 @@ fn process_request(frame: &[u8]) -> Result<WorkerResponse, WorkerProtocolError> 
         }
     }
     let response = match validate_request(&request) {
-        Ok(language) => match std::str::from_utf8(&request.source)
-            .ok()
-            .and_then(|source| {
-                extract_file_with_bindings(language, source, &request.path, &rules).ok()
-            })
-            .filter(|facts| validate_file_facts(std::slice::from_ref(facts)).is_ok())
-        {
-            Some(facts) => WorkerResponse {
-                version: PROTOCOL_VERSION,
-                kind: 2,
-                request_id: request.request_id,
-                facts: Some(FileFactsWire::from(&facts)),
-                error: None,
+        Ok(language) => match std::str::from_utf8(&request.source) {
+            Ok(source) => match extract_file_with_bindings(language, source, &request.path, &rules)
+            {
+                Ok(facts) => match validate_file_facts(std::slice::from_ref(&facts)) {
+                    Ok(()) => WorkerResponse {
+                        version: PROTOCOL_VERSION,
+                        kind: 2,
+                        request_id: request.request_id,
+                        facts: Some(FileFactsWire::from(&facts)),
+                        error: None,
+                    },
+                    Err(error) => {
+                        remote_error(&request, INVALID_FACTS_ERROR_CODE, &error.to_string())
+                    }
+                },
+                Err(error) => remote_error(
+                    &request,
+                    WorkerErrorCode::Extraction as u16,
+                    &error.to_string(),
+                ),
             },
-            None => remote_error(&request, WorkerErrorCode::Extraction, "extraction failed"),
+            Err(_) => remote_error(
+                &request,
+                WorkerErrorCode::InvalidRequest as u16,
+                "invalid request",
+            ),
         },
-        Err(_) => remote_error(&request, WorkerErrorCode::InvalidRequest, "invalid request"),
+        Err(_) => remote_error(
+            &request,
+            WorkerErrorCode::InvalidRequest as u16,
+            "invalid request",
+        ),
     };
     Ok(response)
 }
 
 fn remote_error(
     request: &super::protocol::WorkerRequest,
-    code: WorkerErrorCode,
+    code: u16,
     message: &str,
 ) -> WorkerResponse {
     WorkerResponse {
@@ -110,7 +126,7 @@ fn remote_error(
         request_id: request.request_id,
         facts: None,
         error: Some(WorkerErrorWire {
-            code: code as u16,
+            code,
             message: message.into(),
         }),
     }

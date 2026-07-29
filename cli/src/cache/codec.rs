@@ -67,18 +67,57 @@ struct Envelope<T> {
 pub fn encode_file_facts(facts: &FileFacts) -> Result<Vec<u8>, CacheError> {
     encode("file-facts", FILE_FACTS_SCHEMA_VERSION, facts)
 }
+/// Crate-private cache decode failure that preserves bounded validation detail
+/// without changing the public `CacheError` shape.
+#[derive(Debug)]
+pub(crate) enum DetailedFileFactsDecodeError {
+    Cache(CacheError),
+    InvalidFacts { detail: String },
+}
+
+impl From<DetailedFileFactsDecodeError> for CacheError {
+    fn from(error: DetailedFileFactsDecodeError) -> Self {
+        match error {
+            DetailedFileFactsDecodeError::Cache(error) => error,
+            DetailedFileFactsDecodeError::InvalidFacts { .. } => CacheError::InvalidFacts,
+        }
+    }
+}
+
 pub fn decode_file_facts(
     blob: &[u8],
     context: Option<FileFactsValidationContext<'_>>,
 ) -> Result<FileFacts, CacheError> {
-    let facts = decode("file-facts", FILE_FACTS_SCHEMA_VERSION, blob)?;
+    decode_file_facts_detailed(blob, context).map_err(Into::into)
+}
+
+pub(crate) fn decode_file_facts_detailed(
+    blob: &[u8],
+    context: Option<FileFactsValidationContext<'_>>,
+) -> Result<FileFacts, DetailedFileFactsDecodeError> {
+    let facts = decode("file-facts", FILE_FACTS_SCHEMA_VERSION, blob)
+        .map_err(DetailedFileFactsDecodeError::Cache)?;
     match context {
         Some(context) => validate_file_facts_with_context(&facts, context),
         None => validate_file_facts(std::slice::from_ref(&facts)),
     }
-    .map_err(|_| CacheError::InvalidFacts)?;
+    .map_err(|error| DetailedFileFactsDecodeError::InvalidFacts {
+        detail: bounded_validation_detail(&error.to_string()),
+    })?;
     Ok(facts)
 }
+fn bounded_validation_detail(detail: &str) -> String {
+    const MAX_DETAIL_BYTES: usize = 512;
+    let mut value = detail.to_owned();
+    if value.len() > MAX_DETAIL_BYTES {
+        value.truncate(MAX_DETAIL_BYTES);
+        while !value.is_char_boundary(value.len()) {
+            value.pop();
+        }
+    }
+    value
+}
+
 pub fn encode_subgraph(subgraph: &FileSubgraph) -> Result<Vec<u8>, CacheError> {
     encode("file-subgraph", FILE_SUBGRAPH_SCHEMA_VERSION, subgraph)
 }
@@ -262,6 +301,27 @@ mod tests {
             ids
         );
         assert_eq!(encode_graph(&restored).expect("re-encode graph"), encoded);
+    }
+
+    #[test]
+    fn invalid_facts_preserves_legacy_unit_error_and_private_detail() {
+        let blob = encode_file_facts(&facts()).expect("encode");
+        let context = FileFactsValidationContext {
+            expected_file: "src/other.rs",
+            expected_language: code2graph::Language::Rust,
+            source_len: 0,
+        };
+        assert!(matches!(
+            decode_file_facts(&blob, Some(context)),
+            Err(CacheError::InvalidFacts)
+        ));
+        let detail = decode_file_facts_detailed(&blob, Some(context)).unwrap_err();
+        assert!(matches!(
+            detail,
+            DetailedFileFactsDecodeError::InvalidFacts { ref detail }
+                if detail.contains("file") && detail.len() <= 512
+        ));
+        let _: CacheError = CacheError::InvalidFacts;
     }
 
     #[test]

@@ -53,7 +53,7 @@ impl Extractor for PascalExtractor {
         Language::Pascal
     }
 
-    fn extract(&self, source: &str, file: &str) -> Result<FileFacts> {
+    fn extract_facts(&self, source: &str, file: &str) -> Result<FileFacts> {
         let ts_language = crate::grammar::pascal();
         let mut parser = Parser::new();
         parser

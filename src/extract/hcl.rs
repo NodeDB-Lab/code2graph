@@ -42,7 +42,7 @@ impl Extractor for HclExtractor {
         Language::Hcl
     }
 
-    fn extract(&self, source: &str, file: &str) -> Result<FileFacts> {
+    fn extract_facts(&self, source: &str, file: &str) -> Result<FileFacts> {
         let ts_language = crate::grammar::hcl();
         let mut parser = Parser::new();
         parser

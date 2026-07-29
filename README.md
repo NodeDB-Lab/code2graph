@@ -111,6 +111,10 @@ code2graph callers helper
 code2graph impact helper --depth 3
 ```
 
+By default the CLI rejects an incomplete index. `--allow-partial` explicitly permits
+publishing and querying a partial source set; inspect the reported omissions before
+relying on its results.
+
 `cargo install code2graph-cli` builds the binary from source with Cargo. No prebuilt binary distribution is promised here.
 
 ### Managing the cache

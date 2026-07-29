@@ -77,11 +77,11 @@ impl Extractor for PythonExtractor {
         Language::Python
     }
 
-    fn extract(&self, source: &str, file: &str) -> Result<FileFacts> {
+    fn extract_facts(&self, source: &str, file: &str) -> Result<FileFacts> {
         self.extract_impl(source, file, None)
     }
 
-    fn extract_with_bindings(
+    fn extract_facts_with_bindings(
         &self,
         source: &str,
         file: &str,

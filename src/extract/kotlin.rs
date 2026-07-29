@@ -85,7 +85,7 @@ impl Extractor for KotlinExtractor {
         Language::Kotlin
     }
 
-    fn extract(&self, source: &str, file: &str) -> Result<FileFacts> {
+    fn extract_facts(&self, source: &str, file: &str) -> Result<FileFacts> {
         let ts_language = crate::grammar::kotlin();
         let mut parser = Parser::new();
         parser

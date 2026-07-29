@@ -40,7 +40,7 @@ impl Extractor for SvelteExtractor {
         Language::Svelte
     }
 
-    fn extract(&self, source: &str, file: &str) -> Result<FileFacts> {
+    fn extract_facts(&self, source: &str, file: &str) -> Result<FileFacts> {
         let ts_lang = crate::grammar::svelte();
         let mut parser = Parser::new();
         parser

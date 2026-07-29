@@ -91,7 +91,7 @@ impl Extractor for CppExtractor {
         Language::Cpp
     }
 
-    fn extract(&self, source: &str, file: &str) -> Result<FileFacts> {
+    fn extract_facts(&self, source: &str, file: &str) -> Result<FileFacts> {
         let ts_language = crate::grammar::cpp();
         let mut parser = Parser::new();
         parser

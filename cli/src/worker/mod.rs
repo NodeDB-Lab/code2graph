@@ -14,6 +14,7 @@ mod runtime;
 
 pub use persistent::PersistentWorker;
 pub use platform::KillHandle;
+pub(crate) use process::WorkerAttemptFailure;
 pub use process::{WorkerFailure, extract_inventory_file};
 pub use protocol::{
     BindingWire, EntryPointWire, FfiExportWire, FileFactsWire, OccurrenceWire, PROTOCOL_VERSION,

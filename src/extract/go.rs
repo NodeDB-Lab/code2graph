@@ -56,7 +56,7 @@ impl Extractor for GoExtractor {
         Language::Go
     }
 
-    fn extract(&self, source: &str, file: &str) -> Result<FileFacts> {
+    fn extract_facts(&self, source: &str, file: &str) -> Result<FileFacts> {
         let ts_language = crate::grammar::go();
         let mut parser = Parser::new();
         parser

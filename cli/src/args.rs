@@ -82,6 +82,7 @@ struct RawGlobal {
     frozen: bool,
     #[arg(long, global = true)]
     allow_stale: bool,
+    /// Permit publishing and querying an incomplete source set; inspect reported omissions.
     #[arg(long, global = true)]
     allow_partial: bool,
     #[arg(long, global = true)]

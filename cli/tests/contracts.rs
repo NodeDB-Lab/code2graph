@@ -6,11 +6,24 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 use code2graph::{Descriptor, SymbolId};
-use code2graph_cli::worker::{PROTOCOL_VERSION, WorkerRequest, WorkerResponse, validate_response};
+use code2graph_cli::cache::CacheError;
+use code2graph_cli::worker::{
+    PROTOCOL_VERSION, WorkerErrorCode, WorkerRequest, WorkerResponse, validate_response,
+};
 use code2graph_cli::{
     CommandRequest, OutputEnvelope, OutputStatus, ParseOutcome, Selector, SelectorOutput,
     WORKER_SENTINEL, parse_from,
 };
+
+#[test]
+fn legacy_public_error_enum_shapes_compile() {
+    let cache_error = CacheError::InvalidFacts;
+    assert!(matches!(cache_error, CacheError::InvalidFacts));
+    let worker_error = WorkerErrorCode::Extraction;
+    assert_eq!(worker_error as u16, 1);
+    assert_eq!(WorkerErrorCode::InvalidRequest as u16, 2);
+    assert_eq!(WorkerErrorCode::Internal as u16, 3);
+}
 
 fn parse_request<I, T>(args: I) -> code2graph_cli::CliRequest
 where
@@ -708,6 +721,53 @@ fn binary_index_uses_the_same_binary_worker_and_keeps_success_channels_clean() {
     assert_eq!(
         String::from_utf8(human.stdout).unwrap(),
         "indexed 1 files; 1 changed, 0 deleted; complete\npublication freshness=fresh cache=cache disabled\nomitted files=0\n"
+    );
+}
+
+fn assert_member_read_indexes_completely(path: &str, source: &str) {
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join(path), source).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_code2graph"))
+        .current_dir(project.path())
+        .args(["index", "--no-cache", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "member-read source was rejected: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["status"], "ok");
+    assert_eq!(value["project"]["completeness"], "complete");
+    assert_eq!(value["results"]["inventory_file_count"], 1);
+    assert_eq!(value["results"]["omissions"], serde_json::json!([]));
+}
+
+#[test]
+fn binary_indexes_rust_field_reads_as_complete_facts() {
+    assert_member_read_indexes_completely(
+        "entry.rs",
+        "struct Entry { extra: i64 }\nfn read(entry: &Entry) -> i64 { entry.extra }\n",
+    );
+}
+
+#[test]
+fn binary_indexes_typescript_property_reads_as_complete_facts() {
+    assert_member_read_indexes_completely(
+        "entry.ts",
+        "interface Entry { extra: number }\nfunction read(entry: Entry) { return entry.extra; }\n",
+    );
+}
+
+#[test]
+fn binary_indexes_javascript_property_reads_as_complete_facts() {
+    assert_member_read_indexes_completely(
+        "entry.js",
+        "function read(entry) { return entry.extra; }\n",
     );
 }
 

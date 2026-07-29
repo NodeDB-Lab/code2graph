@@ -7,6 +7,8 @@ mod fingerprint;
 mod location;
 mod schema;
 mod store;
+#[cfg(test)]
+mod testing;
 mod types;
 
 pub use codec::{
@@ -18,9 +20,12 @@ pub use fingerprint::{
     PackageFingerprint, ProjectInputDigest,
 };
 pub use location::{CacheLocation, ProjectKey};
+pub(crate) use store::CacheLoadFailure;
 pub use store::{CacheGraphRead, CacheStore, SnapshotSummary};
 #[cfg(test)]
 pub(crate) use store::{reset_whole_graph_loads, whole_graph_loads};
+#[cfg(test)]
+pub(crate) use testing::single_file_candidate;
 pub use types::{
     ActiveSnapshotMetadata, CacheCompleteness, CacheOmission, CachedFileMetadata,
     CandidateCompleteness, CandidateFileRecord, CandidateSnapshot, CompatibilityRecord,

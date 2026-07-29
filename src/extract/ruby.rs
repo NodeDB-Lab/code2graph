@@ -73,7 +73,7 @@ impl Extractor for RubyExtractor {
         Language::Ruby
     }
 
-    fn extract(&self, source: &str, file: &str) -> Result<FileFacts> {
+    fn extract_facts(&self, source: &str, file: &str) -> Result<FileFacts> {
         let ts_language = crate::grammar::ruby();
         let mut parser = Parser::new();
         parser

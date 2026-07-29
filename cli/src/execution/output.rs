@@ -48,12 +48,15 @@ fn query_warning(project: Option<&ProjectOutput>) -> String {
     let Some(project) = project else {
         return String::new();
     };
+    let mut output = String::new();
+    if let Some(detail) = &project.cache_recovery {
+        output.push_str(&cache_recovery_line(detail));
+    }
     if project.freshness == Freshness::Fresh
         && project.completeness == CacheCompletenessOutput::Complete
     {
-        return String::new();
+        return output;
     }
-    let mut output = String::new();
     match project.freshness {
         Freshness::Fresh => {}
         Freshness::Stale => {
@@ -77,6 +80,13 @@ fn query_warning(project: Option<&ProjectOutput>) -> String {
     output
 }
 
+/// A discarded-and-rebuilt cache otherwise reports as an ordinary miss. Naming
+/// the rule that rejected the stored facts is what lets an operator tell a cold
+/// cache from one an upgrade invalidated.
+fn cache_recovery_line(detail: &str) -> String {
+    format!("warning: cache discarded and rebuilt; detail={detail}\n")
+}
+
 fn render_index(envelope: &crate::OutputEnvelope<crate::IndexOutput>) -> String {
     let mut output = format!(
         "indexed {} files; {} changed, {} deleted; {}\n",
@@ -91,6 +101,9 @@ fn render_index(envelope: &crate::OutputEnvelope<crate::IndexOutput>) -> String 
             freshness(project.freshness),
             cache(project.cache)
         ));
+        if let Some(detail) = &project.cache_recovery {
+            output.push_str(&cache_recovery_line(detail));
+        }
     }
     output.push_str(&format!(
         "omitted files={}\n",
@@ -471,6 +484,7 @@ mod tests {
                     detail: "limit=12".into(),
                 },
             ],
+            cache_recovery: None,
         }
     }
 
@@ -529,6 +543,49 @@ mod tests {
         assert_eq!(
             render_human(&CommandOutput::Index(envelope)),
             "indexed 3 files; 2 changed, 1 deleted; partial\npublication freshness=fresh cache=cache hit\nomitted files=2\nomission reason=file-too-large count=1\nomission reason=read-error:other count=1\nomitted a.rs reason=file-too-large detail=limit=12\nomitted z.rs reason=read-error:other detail=io-error=other\n"
+        );
+    }
+
+    /// A cache the run silently discarded otherwise reads as an ordinary miss.
+    /// Both the index report and every query that refreshed must name why.
+    #[test]
+    fn a_discarded_cache_is_reported_on_index_and_on_query() {
+        let detail = "facts file `stale.rs` does not match expected file `src/a.rs`";
+        let mut project = project(Freshness::Fresh, CacheCompletenessOutput::Complete);
+        project.omitted_files = 0;
+        project.omissions = Vec::new();
+        project.cache_recovery = Some(detail.into());
+
+        let mut envelope = OutputEnvelope::new(
+            OutputStatus::Ok,
+            IndexOutput {
+                candidate: "candidate".into(),
+                snapshot: "snapshot".into(),
+                tier: ResolverTier::Scope,
+                completeness: CacheCompletenessOutput::Complete,
+                inventory_file_count: 1,
+                inventory_total_bytes: 42,
+                omissions: Vec::new(),
+                changed: 1,
+                deleted: 0,
+                ignored_omissions: 0,
+                attempts: 1,
+                plan_decisions: PlanDecisionCountsOutput::default(),
+            },
+        );
+        envelope.project = Some(project.clone());
+        assert_eq!(
+            render_human(&CommandOutput::Index(envelope)),
+            format!(
+                "indexed 1 files; 1 changed, 0 deleted; complete\npublication freshness=fresh cache=cache hit\nwarning: cache discarded and rebuilt; detail={detail}\nomitted files=0\n"
+            )
+        );
+
+        // A fresh, complete query result returns early from the warning block;
+        // the recovery note must still survive that early return.
+        assert_eq!(
+            query_warning(Some(&project)),
+            format!("warning: cache discarded and rebuilt; detail={detail}\n")
         );
     }
 

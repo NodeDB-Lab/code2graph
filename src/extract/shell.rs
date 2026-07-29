@@ -43,7 +43,7 @@ impl Extractor for ShellExtractor {
         Language::Shell
     }
 
-    fn extract(&self, source: &str, file: &str) -> Result<FileFacts> {
+    fn extract_facts(&self, source: &str, file: &str) -> Result<FileFacts> {
         let ts_language = crate::grammar::shell();
         let mut parser = Parser::new();
         parser

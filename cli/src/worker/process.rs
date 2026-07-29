@@ -18,8 +18,8 @@ use super::WORKER_SENTINEL;
 use super::frame::{decode_response_frame, encode_frame};
 use super::platform;
 use super::protocol::{
-    REQUEST_FRAME_MAX, RESPONSE_FRAME_MAX, RequestId, WorkerErrorCode, WorkerProtocolError,
-    WorkerRequest, validate_response,
+    DetailedWorkerResponse, DetailedWorkerResponseError, REQUEST_FRAME_MAX, RESPONSE_FRAME_MAX,
+    RequestId, WorkerErrorCode, WorkerRequest, validate_response_detailed,
 };
 
 pub(super) const STDERR_TAIL_MAX: usize = 64 * 1024;
@@ -41,6 +41,29 @@ pub enum WorkerFailure {
     Cancelled,
     #[error("worker returned a typed error ({0:?})")]
     Remote(WorkerErrorCode),
+}
+
+/// Detailed worker attempt classification retained only inside the refresh pipeline.
+#[derive(Debug)]
+pub(crate) enum WorkerAttemptFailure {
+    Failure(WorkerFailure),
+    Remote {
+        code: WorkerErrorCode,
+        message: String,
+    },
+    InvalidFacts {
+        message: String,
+    },
+}
+
+impl WorkerAttemptFailure {
+    pub(crate) fn legacy(self) -> WorkerFailure {
+        match self {
+            Self::Failure(failure) => failure,
+            Self::Remote { code, .. } => WorkerFailure::Remote(code),
+            Self::InvalidFacts { .. } => WorkerFailure::Remote(WorkerErrorCode::Extraction),
+        }
+    }
 }
 
 impl From<WorkerFailure> for CliError {
@@ -191,15 +214,35 @@ fn extract_with_executable(
         return Err(WorkerFailure::Protocol);
     }
     let response = decode_response_frame(&stdout).map_err(|_| WorkerFailure::Protocol)?;
-    validate_response(&response, &request)
-        .map_err(classify_response_error)?
-        .map_err(|remote| WorkerFailure::Remote(remote.code))
+    validate_response_detailed(&response, &request)
+        .map_err(classify_response_error)
+        .and_then(classify_detailed_response)
+        .map_err(WorkerAttemptFailure::legacy)
 }
 
-pub(super) fn classify_response_error(error: WorkerProtocolError) -> WorkerFailure {
+pub(super) fn classify_response_error(error: DetailedWorkerResponseError) -> WorkerAttemptFailure {
     match error {
-        WorkerProtocolError::Facts(_) => WorkerFailure::Remote(WorkerErrorCode::Extraction),
-        _ => WorkerFailure::Protocol,
+        DetailedWorkerResponseError::InvalidFacts { message } => {
+            WorkerAttemptFailure::InvalidFacts { message }
+        }
+        DetailedWorkerResponseError::Protocol(_) => {
+            WorkerAttemptFailure::Failure(WorkerFailure::Protocol)
+        }
+    }
+}
+
+pub(super) fn classify_detailed_response(
+    response: DetailedWorkerResponse,
+) -> Result<FileFacts, WorkerAttemptFailure> {
+    match response {
+        DetailedWorkerResponse::Facts(facts) => Ok(facts),
+        DetailedWorkerResponse::Remote(remote) => Err(WorkerAttemptFailure::Remote {
+            code: remote.code,
+            message: remote.message,
+        }),
+        DetailedWorkerResponse::InvalidFacts { message } => {
+            Err(WorkerAttemptFailure::InvalidFacts { message })
+        }
     }
 }
 
@@ -268,6 +311,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::worker::WorkerProtocolError;
     use crate::{NeverCancelled, ProjectPath};
 
     struct AtomicCancellation(Arc<AtomicBool>);
@@ -313,13 +357,19 @@ mod tests {
 
     #[test]
     fn invalid_worker_facts_are_classified_as_omittable_extraction_failures() {
+        let failure = classify_response_error(DetailedWorkerResponseError::InvalidFacts {
+            message: "reference 3 has qualifier outside its role".into(),
+        });
         assert!(matches!(
-            classify_response_error(WorkerProtocolError::Facts("invalid facts".into())),
-            WorkerFailure::Remote(WorkerErrorCode::Extraction)
+            &failure,
+            WorkerAttemptFailure::InvalidFacts { message }
+                if message.contains("reference 3 has qualifier outside its role")
         ));
         assert!(matches!(
-            classify_response_error(WorkerProtocolError::Malformed("bad frame")),
-            WorkerFailure::Protocol
+            classify_response_error(DetailedWorkerResponseError::Protocol(
+                WorkerProtocolError::Malformed("bad frame"),
+            )),
+            WorkerAttemptFailure::Failure(WorkerFailure::Protocol)
         ));
     }
 

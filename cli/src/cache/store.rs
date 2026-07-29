@@ -4,6 +4,7 @@
 
 #[cfg(test)]
 use std::cell::Cell;
+use std::cell::RefCell;
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -11,8 +12,8 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use code2graph::{
-    CodeGraph, Confidence, Edge, EdgeKey, FileFacts, FileSubgraph, IncrementalGraph, Symbol,
-    SymbolId,
+    CodeGraph, Confidence, Edge, EdgeKey, FileFacts, FileFactsValidationContext, FileSubgraph,
+    IncrementalGraph, Language, Symbol, SymbolId,
 };
 use code2graph_query::{EdgeFilter, GraphPage, GraphRead};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
@@ -20,6 +21,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use crate::Deadline;
 use crate::inventory::MtimeHint;
 
+use super::codec::{DetailedFileFactsDecodeError, decode_file_facts_detailed};
 use super::schema::{self, SCHEMA_VERSION};
 use super::{
     CacheCompleteness, CacheError, CacheLocation, CandidateFileRecord, CandidateId,
@@ -156,6 +158,24 @@ pub struct SnapshotSummary {
 pub struct CacheStore {
     connection: Connection,
     writable: bool,
+    recovery_diagnostic: RefCell<Option<String>>,
+}
+
+/// Crate-private cache-load failure retaining structural validation detail for
+/// the recovery policy while the public cache API keeps `CacheError::InvalidFacts`.
+#[derive(Debug)]
+pub(crate) enum CacheLoadFailure {
+    Cache(CacheError),
+    InvalidFacts { detail: String },
+}
+
+impl From<CacheLoadFailure> for CacheError {
+    fn from(error: CacheLoadFailure) -> Self {
+        match error {
+            CacheLoadFailure::Cache(error) => error,
+            CacheLoadFailure::InvalidFacts { .. } => CacheError::InvalidFacts,
+        }
+    }
 }
 
 impl CacheStore {
@@ -215,6 +235,7 @@ impl CacheStore {
         Ok(Self {
             connection,
             writable: true,
+            recovery_diagnostic: RefCell::new(None),
         })
     }
 
@@ -242,6 +263,7 @@ impl CacheStore {
         Ok(Self {
             connection,
             writable: false,
+            recovery_diagnostic: RefCell::new(None),
         })
     }
 
@@ -257,6 +279,18 @@ impl CacheStore {
     /// Whether this handle may publish snapshots.
     pub fn is_writable(&self) -> bool {
         self.writable
+    }
+
+    /// Replaces the diagnostic retained by the most recent cache recovery attempt.
+    pub(crate) fn set_recovery_diagnostic(&self, diagnostic: Option<String>) {
+        self.recovery_diagnostic.replace(diagnostic);
+    }
+
+    /// Returns the bounded validation diagnostic retained by the latest recovery
+    /// attempt. The refresh lifecycle reads this after publishing so a cache the
+    /// run silently discarded is reported instead of passing as a cache miss.
+    pub(crate) fn recovery_diagnostic(&self) -> Option<String> {
+        self.recovery_diagnostic.borrow().clone()
     }
 
     /// Atomically discard derived snapshots while preserving cache identity and schema.
@@ -657,8 +691,60 @@ impl CacheStore {
         completeness: CacheCompleteness,
         deadline: &Deadline,
     ) -> Result<Option<LoadedSnapshot>, CacheError> {
-        self.with_read_transaction(deadline, || {
+        self.load_latest_active_detailed(tier, completeness, deadline)
+            .map_err(Into::into)
+    }
+
+    /// Internal cache-load seam for recovery policy diagnostics.
+    pub(crate) fn load_latest_active_detailed(
+        &self,
+        tier: ResolverCacheTier,
+        completeness: CacheCompleteness,
+        deadline: &Deadline,
+    ) -> Result<Option<LoadedSnapshot>, CacheLoadFailure> {
+        match self.with_read_transaction(deadline, || {
             self.load_active_inner(tier, completeness, None, None, deadline)
+        }) {
+            Ok(snapshot) => Ok(snapshot),
+            Err(CacheError::InvalidFacts) => {
+                match self.invalid_facts_detail_for_active(tier, completeness, deadline) {
+                    Ok(detail) => Err(CacheLoadFailure::InvalidFacts { detail }),
+                    Err(error) => Err(CacheLoadFailure::Cache(error)),
+                }
+            }
+            Err(error) => Err(CacheLoadFailure::Cache(error)),
+        }
+    }
+
+    fn invalid_facts_detail_for_active(
+        &self,
+        tier: ResolverCacheTier,
+        completeness: CacheCompleteness,
+        deadline: &Deadline,
+    ) -> Result<String, CacheError> {
+        self.with_read_transaction(deadline, || {
+            let mut statement = self.connection.prepare(
+                "SELECT f.path, f.language, f.size_bytes, f.file_facts FROM active_snapshots a JOIN graph_snapshots g ON g.snapshot_id = a.snapshot_id JOIN candidate_files f ON f.candidate_id = g.candidate_id WHERE a.resolver_tier = ?1 AND a.completeness = ?2 ORDER BY f.path ASC",
+            ).map_err(|error| map_sqlite_error(error, deadline))?;
+            let rows = statement.query_map(params![tier.as_sql(), completeness.as_sql()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?, row.get::<_, Vec<u8>>(3)?))
+            }).map_err(|error| map_sqlite_error(error, deadline))?;
+            for row in rows {
+                let (path, language, size, blob) = row.map_err(|error| map_sqlite_error(error, deadline))?;
+                let source_len = usize::try_from(nonnegative(size)?).map_err(|_| CacheError::Corrupt)?;
+                let expected_language = Language::from_tag(&language).ok_or(CacheError::Corrupt)?;
+                let context = FileFactsValidationContext {
+                    expected_file: &path,
+                    expected_language,
+                    source_len,
+                };
+                match decode_file_facts_detailed(&blob, Some(context)) {
+                    Ok(_) => {}
+                    Err(DetailedFileFactsDecodeError::InvalidFacts { detail }) => return Ok(detail),
+                    Err(DetailedFileFactsDecodeError::Cache(error)) => return Err(error),
+                }
+            }
+            Err(CacheError::Corrupt)
         })
     }
 

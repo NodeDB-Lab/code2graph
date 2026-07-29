@@ -118,11 +118,14 @@ pub fn validate_file_facts_with_context(
         if reference.qualifier.is_some()
             && !matches!(
                 reference.role,
-                super::RefRole::Call | super::RefRole::TypeRef | super::RefRole::IsImplementation
+                super::RefRole::Call
+                    | super::RefRole::TypeRef
+                    | super::RefRole::IsImplementation
+                    | super::RefRole::Read
             )
         {
             return Err(malformed(format!(
-                "reference {index} has qualifier outside call, type-ref, or implementation role"
+                "reference {index} has qualifier outside call, type-ref, implementation, or read role"
             )));
         }
         if let Some(scope) = reference.scope {
@@ -507,7 +510,7 @@ mod tests {
     }
 
     #[test]
-    fn context_rejects_role_specific_metadata_on_other_roles() {
+    fn context_enforces_role_specific_metadata_contracts() {
         let mut value = facts();
         value.references[0].source_module = Some("module".into());
         assert_malformed(
@@ -517,10 +520,10 @@ mod tests {
 
         let mut value = facts();
         value.references[0].role = RefRole::Read;
-        value.references[0].qualifier = Some("module".into());
-        assert_malformed(
-            validate_file_facts_with_context(&value, context()),
-            "reference 0 has qualifier outside call, type-ref, or implementation role",
+        value.references[0].qualifier = Some("receiver".into());
+        assert!(
+            validate_file_facts_with_context(&value, context()).is_ok(),
+            "a field/property read may retain its written receiver for typed resolution"
         );
 
         let mut value = facts();

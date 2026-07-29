@@ -240,10 +240,12 @@ pub struct Reference {
     /// Written context that narrows the referenced relationship. For a
     /// path-qualified call or type reference (`mod_a::process()`, `a::b::Type`),
     /// this is the qualifier immediately before the leaf (for example `"mod_a"`
-    /// or `"a::b"`). For [`RefRole::IsImplementation`], this is the written
-    /// subject type that implements or extends `name`. `None` when no narrowing
-    /// context is available. The extractor preserves syntax; resolvers interpret
-    /// it according to the reference role.
+    /// or `"a::b"`). For a [`RefRole::Read`] field/property access such as
+    /// `entry.extra`, it is the bare receiver (`"entry"`) used by scoped typed
+    /// resolution. For [`RefRole::IsImplementation`], this is the written subject
+    /// type that implements or extends `name`. `None` when no narrowing context
+    /// is available. The extractor preserves syntax; resolvers interpret it
+    /// according to the reference role.
     pub qualifier: Option<String>,
     /// The innermost scope enclosing this reference site; `None` until a
     /// scope-aware extractor populates it.

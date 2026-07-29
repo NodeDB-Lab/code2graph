@@ -86,7 +86,7 @@ impl Extractor for CSharpExtractor {
         Language::CSharp
     }
 
-    fn extract(&self, source: &str, file: &str) -> Result<FileFacts> {
+    fn extract_facts(&self, source: &str, file: &str) -> Result<FileFacts> {
         let ts_language = crate::grammar::csharp();
         let mut parser = Parser::new();
         parser

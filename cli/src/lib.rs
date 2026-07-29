@@ -45,10 +45,10 @@ pub use package_assignment::{
 };
 pub use project::{ProjectPath, ProjectSelection, SelectionProvenance, select_project};
 pub use refresh::{
-    ExtractSession, ExtractionError, FactsExtractor, MAX_REFRESH_ATTEMPTS, PrepareCandidateInputs,
-    PreparedRefreshCandidate, PriorFileRecord, PriorScopeState, ProcessFactsExtractor,
-    ProcessSession, RefreshDecision, RefreshEntry, RefreshInputs, RefreshPlan,
-    ResolveCandidateInputs, ResolvedCandidate, WorkerSlot, prepare_refresh_candidate,
+    ExtractSession, ExtractionError, ExtractionOutcome, FactsExtractor, MAX_REFRESH_ATTEMPTS,
+    PrepareCandidateInputs, PreparedRefreshCandidate, PriorFileRecord, PriorScopeState,
+    ProcessFactsExtractor, ProcessSession, RefreshDecision, RefreshEntry, RefreshInputs,
+    RefreshPlan, ResolveCandidateInputs, ResolvedCandidate, WorkerSlot, prepare_refresh_candidate,
     prepare_refresh_candidate_with, resolve_candidate,
 };
 pub use request::{CacheOp, CliRequest, CommandRequest, Selector, SourcePosition};

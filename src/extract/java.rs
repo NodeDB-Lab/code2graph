@@ -175,7 +175,7 @@ impl Extractor for JavaExtractor {
         Language::Java
     }
 
-    fn extract(&self, source: &str, file: &str) -> Result<FileFacts> {
+    fn extract_facts(&self, source: &str, file: &str) -> Result<FileFacts> {
         let ts_language = crate::grammar::java();
         let mut parser = Parser::new();
         parser

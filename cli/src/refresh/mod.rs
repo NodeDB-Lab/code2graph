@@ -10,9 +10,9 @@ mod types;
 
 pub use plan::{PriorFileRecord, RefreshDecision, RefreshEntry, RefreshInputs, RefreshPlan};
 pub use prepare::{
-    ExtractSession, FactsExtractor, PrepareCandidateInputs, PreparedRefreshCandidate,
-    ProcessFactsExtractor, ProcessSession, WorkerSlot, prepare_refresh_candidate,
-    prepare_refresh_candidate_with,
+    ExtractSession, ExtractionOutcome, FactsExtractor, PrepareCandidateInputs,
+    PreparedRefreshCandidate, ProcessFactsExtractor, ProcessSession, WorkerSlot,
+    prepare_refresh_candidate, prepare_refresh_candidate_with,
 };
 pub use publish::{PublishedRefresh, prepare_and_publish, prepare_and_publish_with};
 pub use resolve::{PriorScopeState, ResolveCandidateInputs, ResolvedCandidate, resolve_candidate};
