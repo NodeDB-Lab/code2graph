@@ -99,39 +99,3 @@ pub(crate) fn positive_limit(limit: u32) -> napi::Result<usize> {
     }
     Ok(limit as usize)
 }
-
-#[cfg(test)]
-mod tests {
-    use code2graph_core::{Descriptor, SymbolId};
-    use serde_json::json;
-
-    use super::{code_graph, edge_filter, positive_limit, symbol_id};
-
-    #[test]
-    fn accepts_only_lossless_structural_id_objects() {
-        let id = SymbolId::global("rust", vec![Descriptor::Term("run".into())]);
-        let value = serde_json::to_value(&id).expect("serialize id");
-        assert_eq!(symbol_id(value).expect("object id"), id);
-        assert!(symbol_id(json!(id.to_scip_string())).is_err());
-        assert!(
-            code_graph(json!({"symbols": [{"id": id.to_scip_string()}], "edges": []})).is_err()
-        );
-    }
-
-    #[test]
-    fn filters_are_canonical_and_limits_are_positive() {
-        assert!(edge_filter(Some("call".into()), None, None).is_err());
-        assert!(edge_filter(None, Some("exact".into()), None).is_err());
-        assert!(edge_filter(None, None, Some("scope_graph".into())).is_err());
-        assert!(
-            edge_filter(
-                Some("Call".into()),
-                Some("Exact".into()),
-                Some("ScopeGraph".into()),
-            )
-            .is_ok()
-        );
-        assert!(positive_limit(0).is_err());
-        assert_eq!(positive_limit(1).expect("positive"), 1);
-    }
-}

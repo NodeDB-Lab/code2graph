@@ -6,9 +6,16 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+# `pyo3/extension-module` deliberately leaves the CPython symbols undefined so
+# the interpreter resolves them at import time. That is correct for the shipped
+# cdylib but makes a cargo test harness — an ordinary executable — unlinkable,
+# so this crate declares no Rust test targets. It is a thin FFI shim; its
+# behaviour is verified through the real boundary by `tests/test_query.py`.
 [lib]
 name = "code2graph"
 crate-type = ["cdylib"]
+test = false
+doctest = false
 
 [dependencies]
 code2graph_core = { package = "code2graph", path = "../..", version = "=0.0.0", default-features = false, features = ["serde", "rust", "python", "typescript", "go", "java", "c", "cpp", "ruby", "php", "shell", "swift", "kotlin", "solidity", "sql", "hcl", "csharp", "scala", "dart", "lua", "luau", "pascal", "svelte"] }

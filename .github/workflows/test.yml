@@ -73,9 +73,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: test
-      # The pyo3/napi cdylib crates are extension modules that cannot be linked
-      # as cargo test binaries; they are built via maturin/napi in the `bindings`
-      # job below. Everything else is tested across all three OSes.
+      # The pyo3/napi cdylib crates declare no Rust test targets (see their
+      # Cargo.toml `[lib]` notes) and need Python/Node toolchains to build, so
+      # they are built and tested through their real FFI boundary by the
+      # `bindings` job. Everything else is tested across all three OSes.
       - name: Run tests
         run: cargo test --workspace --all-features --exclude code2graph-py --exclude code2graph-node
 

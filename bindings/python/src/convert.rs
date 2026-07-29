@@ -100,18 +100,3 @@ pub(crate) fn positive_limit(limit: u32) -> PyResult<usize> {
     }
     Ok(limit as usize)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::{edge_filter, positive_limit};
-
-    #[test]
-    fn filters_are_canonical_and_limits_are_positive() {
-        assert!(edge_filter(Some("call"), None, None).is_err());
-        assert!(edge_filter(None, Some("exact"), None).is_err());
-        assert!(edge_filter(None, None, Some("scope_graph")).is_err());
-        assert!(edge_filter(Some("Call"), Some("Exact"), Some("ScopeGraph")).is_ok());
-        assert!(positive_limit(0).is_err());
-        assert_eq!(positive_limit(1).expect("positive"), 1);
-    }
-}
