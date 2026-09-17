@@ -1885,6 +1885,7 @@ fn project_output(
     freshness: Freshness,
     cache: CacheDisposition,
 ) -> ProjectOutput {
+    let (omissions, omissions_truncated) = crate::result::capped_omissions(&snapshot.omissions);
     ProjectOutput {
         root: selection.canonical_root.to_string_lossy().into_owned(),
         snapshot: snapshot.candidate_id.to_string(),
@@ -1893,7 +1894,8 @@ fn project_output(
         cache,
         completeness: snapshot.completeness.into(),
         omitted_files: snapshot.omissions.len(),
-        omissions: snapshot.omissions.iter().map(Into::into).collect(),
+        omissions,
+        omissions_truncated,
         // Only the paths that actually refreshed against a store can observe a
         // recovery; they fill this in from the store afterwards.
         cache_recovery: None,

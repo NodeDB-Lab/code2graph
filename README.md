@@ -113,7 +113,13 @@ c2g impact helper --depth 3
 
 By default the CLI rejects an incomplete index. `--allow-partial` explicitly permits
 publishing and querying a partial source set; inspect the reported omissions before
-relying on its results.
+relying on its results. Each reported omission list is capped at 256 entries to keep an
+envelope small; `omittedFiles` (and `inventory.omitted_files`) still carries the full
+count, and `omissionsTruncated` marks a list that was capped.
+
+Without `--root`, the selected project is the working directory. A working directory
+that is a home directory or the filesystem root is refused: walking one costs minutes
+and describes no project. Name the project (`--root <DIR>`) to proceed.
 
 Driving the CLI from a coding agent: [`docs/agent-integration.md`](docs/agent-integration.md) carries a copy-pasteable rule block for `CLAUDE.md` / `AGENTS.md` and explains why a mechanical trigger is the only kind an agent reliably follows.
 

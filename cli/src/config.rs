@@ -95,6 +95,13 @@ pub const DEFAULT_MAX_TOTAL_BYTES: usize = 256 * 1_024 * 1_024;
 pub const DEFAULT_MAX_DEPTH: u32 = 32;
 /// Default number of rows rendered by a command.
 pub const DEFAULT_LIMIT: usize = 50;
+/// Default maximum number of individual omission entries reported in any one
+/// list. An over-broad root (a home directory, a parent of many repositories)
+/// omits tens of thousands of files, and a JSON envelope carrying one entry per
+/// omitted file grows to megabytes. The entry lists are diagnostics: each list
+/// is capped to this many entries while the totals (`omittedFiles`,
+/// `inventory.omitted_files`) and the rendered reason counts stay complete.
+pub const DEFAULT_MAX_OMISSIONS: usize = 256;
 /// Default reverse-reachability depth for `impact`.
 pub const DEFAULT_IMPACT_DEPTH: u32 = 2;
 

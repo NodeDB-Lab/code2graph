@@ -4,7 +4,7 @@ use code2graph::{Confidence, Provenance, RefRole, SymbolId, SymbolKind, TypeRefC
 use serde::{Deserialize, Serialize};
 
 use crate::cache::{CacheCompleteness, CacheOmission, LoadedSnapshot};
-use crate::config::{ResolverTier, ResourceLimits};
+use crate::config::{DEFAULT_MAX_OMISSIONS, ResolverTier, ResourceLimits};
 use crate::exit::ExitCode;
 use crate::inventory::{
     InventoryCompleteness, InventorySummary, OmissionReason, StableIoErrorKind,
@@ -92,7 +92,16 @@ pub struct ProjectOutput {
     pub completeness: CacheCompletenessOutput,
     #[serde(rename = "omittedFiles")]
     pub omitted_files: usize,
+    /// Capped to [`DEFAULT_MAX_OMISSIONS`] entries; `omittedFiles` carries the total.
     pub omissions: Vec<CacheOmissionOutput>,
+    /// Present only when `omissions` was capped, so a consumer can tell a short
+    /// list from a complete one.
+    #[serde(
+        rename = "omissionsTruncated",
+        default,
+        skip_serializing_if = "is_false"
+    )]
+    pub omissions_truncated: bool,
     /// Why a previously cached snapshot was discarded and rebuilt, when that
     /// happened during this run. A cache whose stored facts no longer satisfy
     /// their validation contract — after an upgrade changes that contract, say
@@ -509,6 +518,27 @@ impl From<&CacheOmission> for CacheOmissionOutput {
     }
 }
 
+/// Deterministically ordered, capped view of an omission list.
+///
+/// Returns the reported entries (at most [`DEFAULT_MAX_OMISSIONS`]) and whether
+/// entries were held back. Callers keep the full total in their own count field,
+/// so capping the entry list never hides how many files were omitted.
+pub fn capped_omissions(omissions: &[CacheOmission]) -> (Vec<CacheOmissionOutput>, bool) {
+    let mut sorted = omissions.iter().collect::<Vec<_>>();
+    sorted.sort_by(|left, right| {
+        (&left.path, &left.reason, &left.detail).cmp(&(&right.path, &right.reason, &right.detail))
+    });
+    let truncated = sorted.len() > DEFAULT_MAX_OMISSIONS;
+    sorted.truncate(DEFAULT_MAX_OMISSIONS);
+    (sorted.into_iter().map(Into::into).collect(), truncated)
+}
+
+/// `skip_serializing_if` for the additive truncation flags: an untruncated
+/// envelope keeps the exact spelling it had before the flag existed.
+const fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// Counts of decisions made by the refresh planner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct PlanDecisionCountsOutput {
@@ -544,7 +574,14 @@ pub struct IndexOutput {
     pub completeness: CacheCompletenessOutput,
     pub inventory_file_count: u64,
     pub inventory_total_bytes: u64,
+    /// Total extracted-and-omitted files, independent of `omissions` being capped.
+    #[serde(default)]
+    pub omitted_files: usize,
+    /// Capped to [`DEFAULT_MAX_OMISSIONS`] entries; `omitted_files` carries the total.
     pub omissions: Vec<CacheOmissionOutput>,
+    /// Present only when `omissions` was capped.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub omissions_truncated: bool,
     pub changed: usize,
     pub deleted: usize,
     pub ignored_omissions: usize,
@@ -563,6 +600,7 @@ impl IndexOutput {
         attempts: u8,
         plan_decisions: PlanDecisionCountsOutput,
     ) -> Self {
+        let (omissions, omissions_truncated) = capped_omissions(&snapshot.omissions);
         Self {
             candidate: snapshot.candidate_id.to_string(),
             snapshot: snapshot.candidate_id.to_string(),
@@ -570,7 +608,9 @@ impl IndexOutput {
             completeness: snapshot.completeness.into(),
             inventory_file_count: snapshot.inventory_file_count,
             inventory_total_bytes: snapshot.inventory_total_bytes,
-            omissions: snapshot.omissions.iter().map(Into::into).collect(),
+            omitted_files: snapshot.omissions.len(),
+            omissions,
+            omissions_truncated,
             changed,
             deleted,
             ignored_omissions,
@@ -618,7 +658,10 @@ impl StatusOutput {
                 omitted_files: snapshot.omissions.len(),
                 omission_reasons: Vec::new(),
             },
-            cached_omissions: snapshot.omissions.iter().map(Into::into).collect(),
+            // The cached entries mirror `project.omissions` and are capped the
+            // same way; `project.omitted_files` carries the full count and
+            // `project.omissions_truncated` says whether either list is short.
+            cached_omissions: capped_omissions(&snapshot.omissions).0,
             max_files: limits.max_files,
             max_file_bytes: limits.max_file_bytes,
             max_total_bytes: limits.max_total_bytes,
@@ -909,8 +952,29 @@ mod tests {
             completeness: snapshot.completeness.into(),
             omitted_files: snapshot.omissions.len(),
             omissions: snapshot.omissions.iter().map(Into::into).collect(),
+            omissions_truncated: false,
             cache_recovery: None,
         }
+    }
+
+    #[test]
+    fn omission_entry_lists_are_capped_while_the_truncation_is_reported() {
+        let omissions = (0..(DEFAULT_MAX_OMISSIONS + 5))
+            .map(|index| CacheOmission {
+                path: format!("src/file{index:04}.rs"),
+                reason: "file-count-limit".into(),
+                detail: "limit=10000".into(),
+            })
+            .collect::<Vec<_>>();
+
+        let (reported, truncated) = capped_omissions(&omissions);
+        assert_eq!(reported.len(), DEFAULT_MAX_OMISSIONS);
+        assert!(truncated);
+        assert_eq!(reported[0].path, "src/file0000.rs");
+
+        let (short, truncated) = capped_omissions(&omissions[..3]);
+        assert_eq!(short.len(), 3);
+        assert!(!truncated);
     }
 
     #[test]
@@ -962,6 +1026,8 @@ mod tests {
                 reason: "file-too-large".into(),
                 detail: "limit=1024".into(),
             }],
+            omitted_files: 1,
+            omissions_truncated: false,
             changed: 2,
             deleted: 1,
             ignored_omissions: 4,
@@ -986,6 +1052,7 @@ mod tests {
                 "omissions": [{
                     "path": "src/large.rs", "reason": "file-too-large", "detail": "limit=1024"
                 }],
+                "omitted_files": 1,
                 "changed": 2,
                 "deleted": 1,
                 "ignored_omissions": 4,
@@ -1060,6 +1127,7 @@ mod tests {
             completeness: CacheCompletenessOutput::Complete,
             omitted_files: 0,
             omissions: Vec::new(),
+            omissions_truncated: false,
             cache_recovery: None,
         };
         assert_eq!(
@@ -1132,6 +1200,7 @@ mod tests {
                         completeness: snapshot.completeness.into(),
                         omitted_files: snapshot.omissions.len(),
                         omissions: snapshot.omissions.iter().map(Into::into).collect(),
+                        omissions_truncated: false,
                         cache_recovery: None,
                     },
                     &snapshot,

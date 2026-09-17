@@ -68,7 +68,32 @@ pub fn select_project(request: &CliRequest, cwd: &Path) -> Result<ProjectSelecti
         });
     }
 
-    select_directory(&cwd.canonical, &cwd, SelectionProvenance::CurrentDirectory)
+    select_implicit_directory(&cwd)
+}
+
+/// The implicit root is the current directory, and an agent session usually runs
+/// with the working directory set to the user's home. Walking that (or `/`)
+/// costs minutes, omits tens of thousands of files, and describes no project, so
+/// it is refused with a message naming the fix. An explicit `--root` still
+/// selects whatever the caller asks for.
+fn is_forbidden_default_root(path: &Path, home: Option<&Path>) -> bool {
+    path.parent().is_none() || home.is_some_and(|home| path == home)
+}
+
+fn home_directory() -> Option<PathBuf> {
+    directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf())
+}
+
+fn select_implicit_directory(cwd: &ValidatedCwd) -> Result<ProjectSelection> {
+    if is_forbidden_default_root(&cwd.canonical, home_directory().as_deref()) {
+        return Err(CliError::ProjectPath {
+            path: cwd.canonical.clone(),
+            reason: "refusing the current directory as an implicit project root \
+                     (home or filesystem root); pass --root <DIR>"
+                .into(),
+        });
+    }
+    select_directory(&cwd.canonical, cwd, SelectionProvenance::CurrentDirectory)
 }
 
 struct ValidatedCwd {
@@ -222,7 +247,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     use super::is_trusted_system_ancestor;
-    use super::{SelectionProvenance, select_project};
+    use super::{SelectionProvenance, is_forbidden_default_root, select_project};
     use crate::config::GlobalOptions;
     use crate::error::CliError;
     use crate::request::{CliRequest, CommandRequest};
@@ -353,6 +378,19 @@ mod tests {
             cwd_selection.provenance,
             SelectionProvenance::CurrentDirectory
         );
+    }
+
+    #[test]
+    fn implicit_cwd_root_refuses_home_and_filesystem_root_only() {
+        let home = Path::new("/home/example");
+        assert!(is_forbidden_default_root(Path::new("/"), Some(home)));
+        assert!(is_forbidden_default_root(Path::new("/"), None));
+        assert!(is_forbidden_default_root(home, Some(home)));
+        assert!(!is_forbidden_default_root(
+            Path::new("/home/example/project"),
+            Some(home)
+        ));
+        assert!(!is_forbidden_default_root(home, None));
     }
 
     #[test]

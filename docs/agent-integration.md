@@ -32,6 +32,9 @@ strings, config values, comments, error text, non-source files, unsupported lang
 
 - ALWAYS pass `--allow-partial`: real codebases have files that fail extraction, and
   without it any such file aborts the command.
+- ALWAYS pass `--root`: the implicit root is the working directory, and a home directory
+  or filesystem root is refused because walking one costs minutes and describes no
+  project.
 - `--root` a single package for tight results, or the workspace root for cross-package
   questions. `--json` for machine-readable output.
 - `--tier scope` (default) is precise; `--tier name` is recall-first; `--tier dense`
