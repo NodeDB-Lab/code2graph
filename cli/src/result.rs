@@ -3,8 +3,12 @@
 use code2graph::{Confidence, Provenance, RefRole, SymbolId, SymbolKind, TypeRefContext};
 use serde::{Deserialize, Serialize};
 
+mod omissions;
+pub(crate) use omissions::cache_omission_reasons;
+pub use omissions::{CacheReasonCountOutput, capped_omissions};
+
 use crate::cache::{CacheCompleteness, CacheOmission, LoadedSnapshot};
-use crate::config::{DEFAULT_MAX_OMISSIONS, ResolverTier, ResourceLimits};
+use crate::config::{ResolverTier, ResourceLimits};
 use crate::exit::ExitCode;
 use crate::inventory::{
     InventoryCompleteness, InventorySummary, OmissionReason, StableIoErrorKind,
@@ -92,8 +96,11 @@ pub struct ProjectOutput {
     pub completeness: CacheCompletenessOutput,
     #[serde(rename = "omittedFiles")]
     pub omitted_files: usize,
-    /// Capped to [`DEFAULT_MAX_OMISSIONS`] entries; `omittedFiles` carries the total.
+    /// Capped to [`crate::config::DEFAULT_MAX_OMISSIONS`] entries; `omittedFiles` carries the total.
     pub omissions: Vec<CacheOmissionOutput>,
+    /// Full snapshot counts, independent of the capped entry list.
+    #[serde(rename = "omissionReasons", default)]
+    pub omission_reasons: Vec<CacheReasonCountOutput>,
     /// Present only when `omissions` was capped, so a consumer can tell a short
     /// list from a complete one.
     #[serde(
@@ -518,21 +525,6 @@ impl From<&CacheOmission> for CacheOmissionOutput {
     }
 }
 
-/// Deterministically ordered, capped view of an omission list.
-///
-/// Returns the reported entries (at most [`DEFAULT_MAX_OMISSIONS`]) and whether
-/// entries were held back. Callers keep the full total in their own count field,
-/// so capping the entry list never hides how many files were omitted.
-pub fn capped_omissions(omissions: &[CacheOmission]) -> (Vec<CacheOmissionOutput>, bool) {
-    let mut sorted = omissions.iter().collect::<Vec<_>>();
-    sorted.sort_by(|left, right| {
-        (&left.path, &left.reason, &left.detail).cmp(&(&right.path, &right.reason, &right.detail))
-    });
-    let truncated = sorted.len() > DEFAULT_MAX_OMISSIONS;
-    sorted.truncate(DEFAULT_MAX_OMISSIONS);
-    (sorted.into_iter().map(Into::into).collect(), truncated)
-}
-
 /// `skip_serializing_if` for the additive truncation flags: an untruncated
 /// envelope keeps the exact spelling it had before the flag existed.
 const fn is_false(value: &bool) -> bool {
@@ -577,8 +569,11 @@ pub struct IndexOutput {
     /// Total extracted-and-omitted files, independent of `omissions` being capped.
     #[serde(default)]
     pub omitted_files: usize,
-    /// Capped to [`DEFAULT_MAX_OMISSIONS`] entries; `omitted_files` carries the total.
+    /// Capped to [`crate::config::DEFAULT_MAX_OMISSIONS`] entries; `omitted_files` carries the total.
     pub omissions: Vec<CacheOmissionOutput>,
+    /// Full snapshot counts, independent of the capped entry list.
+    #[serde(default)]
+    pub omission_reasons: Vec<CacheReasonCountOutput>,
     /// Present only when `omissions` was capped.
     #[serde(default, skip_serializing_if = "is_false")]
     pub omissions_truncated: bool,
@@ -600,6 +595,7 @@ impl IndexOutput {
         attempts: u8,
         plan_decisions: PlanDecisionCountsOutput,
     ) -> Self {
+        let omission_reasons = cache_omission_reasons(&snapshot.omissions);
         let (omissions, omissions_truncated) = capped_omissions(&snapshot.omissions);
         Self {
             candidate: snapshot.candidate_id.to_string(),
@@ -610,6 +606,7 @@ impl IndexOutput {
             inventory_total_bytes: snapshot.inventory_total_bytes,
             omitted_files: snapshot.omissions.len(),
             omissions,
+            omission_reasons,
             omissions_truncated,
             changed,
             deleted,
@@ -841,6 +838,7 @@ impl ErrorEnvelope {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::DEFAULT_MAX_OMISSIONS;
 
     fn loaded_snapshot(completeness: CacheCompleteness) -> LoadedSnapshot {
         let language = crate::cache::LanguageFeatureFingerprint::current();
@@ -952,6 +950,7 @@ mod tests {
             completeness: snapshot.completeness.into(),
             omitted_files: snapshot.omissions.len(),
             omissions: snapshot.omissions.iter().map(Into::into).collect(),
+            omission_reasons: cache_omission_reasons(&snapshot.omissions),
             omissions_truncated: false,
             cache_recovery: None,
         }
@@ -1027,6 +1026,9 @@ mod tests {
                 detail: "limit=1024".into(),
             }],
             omitted_files: 1,
+            omission_reasons: cache_omission_reasons(
+                &loaded_snapshot(CacheCompleteness::Partial).omissions,
+            ),
             omissions_truncated: false,
             changed: 2,
             deleted: 1,
@@ -1053,6 +1055,7 @@ mod tests {
                     "path": "src/large.rs", "reason": "file-too-large", "detail": "limit=1024"
                 }],
                 "omitted_files": 1,
+                "omission_reasons": [{"reason": "file-too-large", "count": 1}],
                 "changed": 2,
                 "deleted": 1,
                 "ignored_omissions": 4,
@@ -1076,6 +1079,7 @@ mod tests {
                     "root": "/project", "snapshot": "snapshot", "tier": "scope",
                     "freshness": "stale", "cache": "hit", "completeness": "partial",
                     "omittedFiles": 1,
+                    "omissionReasons": [{"reason": "file-too-large", "count": 1}],
                     "omissions": [{
                         "path": "src/large.rs", "reason": "file-too-large", "detail": "limit=1024"
                     }]
@@ -1112,6 +1116,7 @@ mod tests {
                     "root": "/project", "snapshot": "snapshot", "tier": "scope",
                     "freshness": spelling, "cache": "hit", "completeness": "partial",
                     "omittedFiles": 1,
+                    "omissionReasons": [{"reason": "file-too-large", "count": 1}],
                     "omissions": [{
                         "path": "src/large.rs", "reason": "file-too-large", "detail": "limit=1024"
                     }]
@@ -1127,6 +1132,7 @@ mod tests {
             completeness: CacheCompletenessOutput::Complete,
             omitted_files: 0,
             omissions: Vec::new(),
+            omission_reasons: Vec::new(),
             omissions_truncated: false,
             cache_recovery: None,
         };
@@ -1134,7 +1140,7 @@ mod tests {
             serde_json::to_value(complete).unwrap(),
             serde_json::json!({
                 "root": "/project", "snapshot": "snapshot", "tier": "scope", "freshness": "fresh",
-                "cache": "hit", "completeness": "complete", "omittedFiles": 0, "omissions": []
+                "cache": "hit", "completeness": "complete", "omittedFiles": 0, "omissions": [], "omissionReasons": []
             })
         );
     }
@@ -1200,6 +1206,7 @@ mod tests {
                         completeness: snapshot.completeness.into(),
                         omitted_files: snapshot.omissions.len(),
                         omissions: snapshot.omissions.iter().map(Into::into).collect(),
+                        omission_reasons: cache_omission_reasons(&snapshot.omissions),
                         omissions_truncated: false,
                         cache_recovery: None,
                     },

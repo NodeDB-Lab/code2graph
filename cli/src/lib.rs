@@ -54,14 +54,14 @@ pub use refresh::{
 pub use request::{CacheOp, CliRequest, CommandRequest, Selector, SourcePosition};
 pub use result::{
     CacheClearScope, CacheCompletenessOutput, CacheDetail, CacheDisposition, CacheOmissionOutput,
-    CacheProjectOutput, CacheProjectState, CacheReport, CacheSnapshotOutput, ConfidenceOutput,
-    ErrorEnvelope, Freshness, ImpactOutput, IndexOutput, InventoryCompletenessOutput,
-    InventoryOmissionReasonOutput, InventoryReasonCountOutput, InventorySummaryOutput,
-    ModuleDependencyOutput, ModuleDependencyTargetOutput, OUTPUT_SCHEMA_VERSION, OccurrenceOutput,
-    OutputEnvelope, OutputStatus, PlanDecisionCountsOutput, ProjectOutput, ProvenanceOutput,
-    RefRoleOutput, ReferenceOutput, RelationOutput, SelectorOutput, StableIoErrorOutput,
-    StatusOutput, SymbolKindOutput, SymbolOutput, TypeRefContextOutput, success_exit_code,
-    success_status,
+    CacheProjectOutput, CacheProjectState, CacheReasonCountOutput, CacheReport,
+    CacheSnapshotOutput, ConfidenceOutput, ErrorEnvelope, Freshness, ImpactOutput, IndexOutput,
+    InventoryCompletenessOutput, InventoryOmissionReasonOutput, InventoryReasonCountOutput,
+    InventorySummaryOutput, ModuleDependencyOutput, ModuleDependencyTargetOutput,
+    OUTPUT_SCHEMA_VERSION, OccurrenceOutput, OutputEnvelope, OutputStatus,
+    PlanDecisionCountsOutput, ProjectOutput, ProvenanceOutput, RefRoleOutput, ReferenceOutput,
+    RelationOutput, SelectorOutput, StableIoErrorOutput, StatusOutput, SymbolKindOutput,
+    SymbolOutput, TypeRefContextOutput, success_exit_code, success_status,
 };
 pub use selector::{
     SelectorContext, SelectorOptions, SelectorPurpose, SelectorRequest, SelectorResolution,

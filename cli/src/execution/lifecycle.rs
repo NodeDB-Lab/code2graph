@@ -1878,13 +1878,14 @@ fn graph_from_snapshot(
     })
 }
 
-fn project_output(
+pub(super) fn project_output(
     selection: &crate::ProjectSelection,
     snapshot: &LoadedSnapshot,
     tier: crate::ResolverTier,
     freshness: Freshness,
     cache: CacheDisposition,
 ) -> ProjectOutput {
+    let omission_reasons = crate::result::cache_omission_reasons(&snapshot.omissions);
     let (omissions, omissions_truncated) = crate::result::capped_omissions(&snapshot.omissions);
     ProjectOutput {
         root: selection.canonical_root.to_string_lossy().into_owned(),
@@ -1895,6 +1896,7 @@ fn project_output(
         completeness: snapshot.completeness.into(),
         omitted_files: snapshot.omissions.len(),
         omissions,
+        omission_reasons,
         omissions_truncated,
         // Only the paths that actually refreshed against a store can observe a
         // recovery; they fill this in from the store afterwards.

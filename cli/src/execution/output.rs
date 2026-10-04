@@ -124,12 +124,11 @@ fn render_index(envelope: &crate::OutputEnvelope<crate::IndexOutput>) -> String 
         ));
     }
     let omissions = sorted_omissions(&envelope.results.omissions);
-    let mut counts = std::collections::BTreeMap::<&str, usize>::new();
-    for omission in &omissions {
-        *counts.entry(&omission.reason).or_default() += 1;
-    }
-    for (reason, count) in counts {
-        output.push_str(&format!("omission reason={} count={}\n", reason, count));
+    for reason in &envelope.results.omission_reasons {
+        output.push_str(&format!(
+            "omission reason={} count={}\n",
+            reason.reason, reason.count
+        ));
     }
     for omission in omissions {
         output.push_str(&format!(
@@ -169,18 +168,17 @@ fn render_status(status: &crate::StatusOutput) -> String {
     );
     if status.project.omissions_truncated {
         output.push_str(&format!(
-            "warning: omission entries truncated; listing {} of {}; reason counts cover the listed entries only\n",
+            "warning: omission entries truncated; listing {} of {}\n",
             status.project.omissions.len(),
             status.project.omitted_files
         ));
     }
-    let mut counts = std::collections::BTreeMap::<&str, usize>::new();
     let omissions = sorted_omissions(&status.project.omissions);
-    for omission in &omissions {
-        *counts.entry(&omission.reason).or_default() += 1;
-    }
-    for (reason, count) in counts {
-        output.push_str(&format!("omission reason={} count={}\n", reason, count));
+    for reason in &status.project.omission_reasons {
+        output.push_str(&format!(
+            "omission reason={} count={}\n",
+            reason.reason, reason.count
+        ));
     }
     for omission in omissions {
         output.push_str(&format!(
@@ -568,6 +566,16 @@ mod tests {
                     detail: "limit=12".into(),
                 },
             ],
+            omission_reasons: vec![
+                crate::result::CacheReasonCountOutput {
+                    reason: "file-too-large".into(),
+                    count: 1,
+                },
+                crate::result::CacheReasonCountOutput {
+                    reason: "read-error:other".into(),
+                    count: 1,
+                },
+            ],
             omissions_truncated: false,
             cache_recovery: None,
         }
@@ -618,6 +626,8 @@ mod tests {
                 inventory_total_bytes: 42,
                 omissions: project(Freshness::Fresh, CacheCompletenessOutput::Partial).omissions,
                 omitted_files: 2,
+                omission_reasons: project(Freshness::Fresh, CacheCompletenessOutput::Partial)
+                    .omission_reasons,
                 omissions_truncated: false,
                 changed: 2,
                 deleted: 1,
@@ -641,6 +651,7 @@ mod tests {
         let mut project = project(Freshness::Fresh, CacheCompletenessOutput::Complete);
         project.omitted_files = 0;
         project.omissions = Vec::new();
+        project.omission_reasons = Vec::new();
         project.cache_recovery = Some(detail.into());
 
         let mut envelope = OutputEnvelope::new(
@@ -654,6 +665,7 @@ mod tests {
                 inventory_total_bytes: 42,
                 omissions: Vec::new(),
                 omitted_files: 0,
+                omission_reasons: Vec::new(),
                 omissions_truncated: false,
                 changed: 1,
                 deleted: 0,
@@ -729,3 +741,7 @@ mod tests {
         assert_eq!(render_human(&CommandOutput::Impact(impact)), expected);
     }
 }
+
+#[cfg(test)]
+#[path = "omission_output_tests.rs"]
+mod omission_output_tests;

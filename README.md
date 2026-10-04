@@ -111,11 +111,7 @@ c2g callers helper
 c2g impact helper --depth 3
 ```
 
-By default the CLI rejects an incomplete index. `--allow-partial` explicitly permits
-publishing and querying a partial source set; inspect the reported omissions before
-relying on its results. Each reported omission list is capped at 256 entries to keep an
-envelope small; `omittedFiles` (and `inventory.omitted_files`) still carries the full
-count, and `omissionsTruncated` marks a list that was capped.
+By default the CLI rejects an incomplete index. `--allow-partial` explicitly permits publishing and querying a partial source set. Inspect the reported omissions before relying on its results. Each reported omission list is capped at 256 entries. Project metadata retains the full count in `omittedFiles` and full reason totals in `omissionReasons`. Index results use `omitted_files` and `omission_reasons`. Status inventory retains the full count in `inventory.omitted_files`. The `omissionsTruncated` project flag and `omissions_truncated` index flag identify capped lists.
 
 Without `--root`, the selected project is the working directory. A working directory
 that is a home directory or the filesystem root is refused: walking one costs minutes
