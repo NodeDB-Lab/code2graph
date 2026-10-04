@@ -31,9 +31,9 @@ ignore = "0.4"
 blake3 = "1"
 toml = "1"
 directories.workspace = true
-zerompk = { version = "=0.6.1", features = ["derive"] }
+zerompk = { version = "=0.8.0", features = ["derive"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
-zstd = "0.13"
+zstd = "0.14"
 rustc-hash.workspace = true
 
 [target.'cfg(unix)'.dependencies]
