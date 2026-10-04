@@ -2677,11 +2677,11 @@ mod tests {
 
         // One project root disappears; one cache is left on an older schema.
         fs::remove_dir_all(temp.path().join("deleted")).expect("remove project");
-        let stale_key = crate::cache::CacheLocation::for_project(
-            Some(cache.as_path()),
-            &temp.path().join("stale"),
-        )
-        .expect("stale location");
+        let stale_root =
+            fs::canonicalize(temp.path().join(".").join("stale")).expect("canonical stale project");
+        let stale_key =
+            crate::cache::CacheLocation::for_project(Some(cache.as_path()), &stale_root)
+                .expect("stale location");
         let connection =
             rusqlite::Connection::open(&stale_key.database_path).expect("open stale cache");
         connection
