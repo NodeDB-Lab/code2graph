@@ -33,6 +33,14 @@ pub struct ProjectSelection {
 /// An explicit index file may be outside `cwd`; marker discovery climbs from its
 /// parent through the filesystem root.
 pub fn select_project(request: &CliRequest, cwd: &Path) -> Result<ProjectSelection> {
+    select_project_with_home(request, cwd, home_directory)
+}
+
+fn select_project_with_home(
+    request: &CliRequest,
+    cwd: &Path,
+    home_directory: impl FnOnce() -> Option<PathBuf>,
+) -> Result<ProjectSelection> {
     let cwd = validated_cwd(cwd)?;
 
     if let Some(root) = &request.global.root {
@@ -68,7 +76,33 @@ pub fn select_project(request: &CliRequest, cwd: &Path) -> Result<ProjectSelecti
         });
     }
 
-    select_directory(&cwd.canonical, &cwd, SelectionProvenance::CurrentDirectory)
+    select_implicit_directory(&cwd, home_directory().as_deref())
+}
+
+/// The implicit root is the current directory, and an agent session usually runs
+/// with the working directory set to the user's home. Walking that (or `/`)
+/// costs minutes, omits tens of thousands of files, and describes no project, so
+/// it is refused with a message naming the fix. An explicit `--root` still
+/// selects whatever the caller asks for.
+fn is_forbidden_default_root(path: &Path, home: Option<&Path>) -> bool {
+    path.parent().is_none() || home.is_some_and(|home| path == home)
+}
+
+fn home_directory() -> Option<PathBuf> {
+    directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf())
+}
+
+fn select_implicit_directory(cwd: &ValidatedCwd, home: Option<&Path>) -> Result<ProjectSelection> {
+    let home = home.and_then(|path| fs::canonicalize(path).ok());
+    if is_forbidden_default_root(&cwd.canonical, home.as_deref()) {
+        return Err(CliError::ProjectPath {
+            path: cwd.canonical.clone(),
+            reason: "refusing the current directory as an implicit project root \
+                     (home or filesystem root); pass --root <DIR>"
+                .into(),
+        });
+    }
+    select_directory(&cwd.canonical, cwd, SelectionProvenance::CurrentDirectory)
 }
 
 struct ValidatedCwd {
@@ -222,7 +256,9 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     use super::is_trusted_system_ancestor;
-    use super::{SelectionProvenance, select_project};
+    use super::{
+        SelectionProvenance, is_forbidden_default_root, select_project, select_project_with_home,
+    };
     use crate::config::GlobalOptions;
     use crate::error::CliError;
     use crate::request::{CliRequest, CommandRequest};
@@ -353,6 +389,81 @@ mod tests {
             cwd_selection.provenance,
             SelectionProvenance::CurrentDirectory
         );
+    }
+
+    #[test]
+    fn implicit_cwd_root_refuses_home_and_filesystem_root_only() {
+        let home = Path::new("/home/example");
+        assert!(is_forbidden_default_root(Path::new("/"), Some(home)));
+        assert!(is_forbidden_default_root(Path::new("/"), None));
+        assert!(is_forbidden_default_root(home, Some(home)));
+        assert!(!is_forbidden_default_root(
+            Path::new("/home/example/project"),
+            Some(home)
+        ));
+        assert!(!is_forbidden_default_root(home, None));
+    }
+
+    #[test]
+    fn implicit_selection_refuses_canonical_home_and_allows_explicit_home() {
+        let directory = tempdir().expect("temporary directory");
+        let home = directory.path().join("home");
+        let child = home.join("child");
+        fs::create_dir_all(&child).expect("home directories");
+        let canonical_home = fs::canonicalize(&home).expect("canonical home");
+        let discovered_home = home.join("child").join("..");
+
+        match select_project_with_home(&request(None, None), &home, || {
+            Some(discovered_home.clone())
+        }) {
+            Err(CliError::ProjectPath { path, reason }) => {
+                assert_eq!(path, canonical_home);
+                assert!(reason.contains("pass --root <DIR>"));
+            }
+            result => panic!("implicit home selection must be refused, got {result:?}"),
+        }
+
+        let selection = select_project_with_home(&request(Some(&home), None), &home, || {
+            panic!("explicit root must skip home discovery")
+        })
+        .expect("explicit home selection");
+        assert_eq!(selection.canonical_root, canonical_home);
+        assert_eq!(selection.provenance, SelectionProvenance::RootArgument);
+
+        let selection =
+            select_project_with_home(&request(None, None), &child, || Some(discovered_home))
+                .expect("implicit child selection");
+        assert_eq!(
+            selection.canonical_root,
+            fs::canonicalize(&child).expect("canonical child")
+        );
+        assert_eq!(selection.provenance, SelectionProvenance::CurrentDirectory);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn implicit_selection_matches_verbatim_cwd_to_unprefixed_home() {
+        use std::path::{Component, Prefix};
+
+        let directory = tempdir().expect("temporary directory");
+        let canonical_home = fs::canonicalize(directory.path()).expect("canonical home");
+        assert!(matches!(
+            canonical_home.components().next(),
+            Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::VerbatimDisk(_))
+        ));
+        let canonical_text = canonical_home.to_str().expect("temporary path text");
+        let home = Path::new(
+            canonical_text
+                .strip_prefix(r"\\?\")
+                .expect("verbatim disk prefix"),
+        );
+        assert!(home.is_dir());
+        assert!(matches!(
+            select_project_with_home(&request(None, None), &canonical_home, || {
+                Some(home.to_path_buf())
+            }),
+            Err(CliError::ProjectPath { path, .. }) if path == canonical_home
+        ));
     }
 
     #[test]

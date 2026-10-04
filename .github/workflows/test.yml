@@ -138,7 +138,9 @@ jobs:
           set -euo pipefail
           INSTALL_ROOT="$(mktemp -d)"
           cargo install --path cli --root "$INSTALL_ROOT"
-          "$INSTALL_ROOT/bin/code2graph" --help
+          for CLI_BIN in "$INSTALL_ROOT"/bin/*; do
+            "$CLI_BIN" --help
+          done
 
   bindings:
     if: ${{ !inputs.skip_bindings }}

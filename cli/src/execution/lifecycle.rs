@@ -1878,13 +1878,15 @@ fn graph_from_snapshot(
     })
 }
 
-fn project_output(
+pub(super) fn project_output(
     selection: &crate::ProjectSelection,
     snapshot: &LoadedSnapshot,
     tier: crate::ResolverTier,
     freshness: Freshness,
     cache: CacheDisposition,
 ) -> ProjectOutput {
+    let omission_reasons = crate::result::cache_omission_reasons(&snapshot.omissions);
+    let (omissions, omissions_truncated) = crate::result::capped_omissions(&snapshot.omissions);
     ProjectOutput {
         root: selection.canonical_root.to_string_lossy().into_owned(),
         snapshot: snapshot.candidate_id.to_string(),
@@ -1893,7 +1895,9 @@ fn project_output(
         cache,
         completeness: snapshot.completeness.into(),
         omitted_files: snapshot.omissions.len(),
-        omissions: snapshot.omissions.iter().map(Into::into).collect(),
+        omissions,
+        omission_reasons,
+        omissions_truncated,
         // Only the paths that actually refreshed against a store can observe a
         // recovery; they fill this in from the store afterwards.
         cache_recovery: None,
@@ -2675,11 +2679,11 @@ mod tests {
 
         // One project root disappears; one cache is left on an older schema.
         fs::remove_dir_all(temp.path().join("deleted")).expect("remove project");
-        let stale_key = crate::cache::CacheLocation::for_project(
-            Some(cache.as_path()),
-            &temp.path().join("stale"),
-        )
-        .expect("stale location");
+        let stale_root =
+            fs::canonicalize(temp.path().join(".").join("stale")).expect("canonical stale project");
+        let stale_key =
+            crate::cache::CacheLocation::for_project(Some(cache.as_path()), &stale_root)
+                .expect("stale location");
         let connection =
             rusqlite::Connection::open(&stale_key.database_path).expect("open stale cache");
         connection
