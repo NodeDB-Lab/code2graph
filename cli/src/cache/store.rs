@@ -30,6 +30,14 @@ use super::{
     restore_subgraph,
 };
 
+mod candidate_publication;
+mod graph_publication;
+mod publication_error;
+
+pub(crate) use publication_error::{
+    CachePublicationFailure, PublicationConflict, PublicationField, escaped_publication_identifier,
+};
+
 const LOCK_WAIT_CAP: Duration = Duration::from_secs(2);
 
 #[cfg(test)]
@@ -66,18 +74,6 @@ pub struct CacheGraphRead<'store, 'deadline> {
     store: &'store CacheStore,
     snapshot_id: i64,
     deadline: &'deadline Deadline,
-}
-
-#[derive(Debug)]
-struct CandidateFileRow {
-    language: String,
-    content_hash: Vec<u8>,
-    size_bytes: i64,
-    mtime_seconds: Option<i64>,
-    mtime_nanoseconds: Option<i64>,
-    package_assignment: String,
-    file_facts: Vec<u8>,
-    file_subgraph: Option<Vec<u8>>,
 }
 
 #[derive(Debug)]
@@ -349,8 +345,17 @@ impl CacheStore {
         candidate: &CandidateSnapshot,
         deadline: &Deadline,
     ) -> Result<(), CacheError> {
+        self.publish_candidate_detailed(candidate, deadline)
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn publish_candidate_detailed(
+        &self,
+        candidate: &CandidateSnapshot,
+        deadline: &Deadline,
+    ) -> Result<(), CachePublicationFailure> {
         if !self.writable {
-            return Err(CacheError::ReadOnly);
+            return Err(CacheError::ReadOnly.into());
         }
         ensure_time(deadline)?;
         let encoded = PreparedCandidate::new(candidate, deadline)?;
@@ -376,10 +381,24 @@ impl CacheStore {
             // Publication timestamps are store-owned. Fingerprint components,
             // unlike timestamps, are exact compatibility content and conflicts
             // must be rejected even when the derived compatibility id matches.
-            if stored_compatibility.0 != encoded.language_fingerprint
-                || stored_compatibility.1 != encoded.package_fingerprint
-            {
-                return Err(CacheError::CandidateConflict);
+            for (differs, field) in [
+                (
+                    stored_compatibility.0 != encoded.language_fingerprint,
+                    PublicationField::LanguageFingerprint,
+                ),
+                (
+                    stored_compatibility.1 != encoded.package_fingerprint,
+                    PublicationField::PackageFingerprint,
+                ),
+            ] {
+                if differs {
+                    return Err(CachePublicationFailure::conflict(
+                        encoded.candidate_id,
+                        field,
+                        None,
+                        None,
+                    ));
+                }
             }
             let existing: Option<ExistingCandidateRow> = self.connection.query_row(
                 "SELECT compatibility_id, input_digest, completeness, inventory_file_count, inventory_total_bytes FROM candidates WHERE candidate_id = ?1",
@@ -395,13 +414,36 @@ impl CacheStore {
                 },
             ).optional().map_err(|error| map_sqlite_error(error, deadline))?;
             if let Some(existing) = existing {
-                if existing.compatibility_id != encoded.compatibility_id
-                    || existing.input_digest != encoded.input_digest
-                    || existing.completeness != encoded.completeness
-                    || existing.inventory_file_count != encoded.inventory_file_count
-                    || existing.inventory_total_bytes != encoded.inventory_total_bytes
-                {
-                    return Err(CacheError::CandidateConflict);
+                for (differs, field) in [
+                    (
+                        existing.compatibility_id != encoded.compatibility_id,
+                        PublicationField::CompatibilityId,
+                    ),
+                    (
+                        existing.input_digest != encoded.input_digest,
+                        PublicationField::InputDigest,
+                    ),
+                    (
+                        existing.completeness != encoded.completeness,
+                        PublicationField::Completeness,
+                    ),
+                    (
+                        existing.inventory_file_count != encoded.inventory_file_count,
+                        PublicationField::InventoryFileCount,
+                    ),
+                    (
+                        existing.inventory_total_bytes != encoded.inventory_total_bytes,
+                        PublicationField::InventoryTotalBytes,
+                    ),
+                ] {
+                    if differs {
+                        return Err(CachePublicationFailure::conflict(
+                            encoded.candidate_id,
+                            field,
+                            None,
+                            None,
+                        ));
+                    }
                 }
                 self.verify_existing_candidate(&encoded, deadline)?;
             } else {
@@ -456,7 +498,7 @@ impl CacheStore {
                     params![encoded.candidate_id.as_slice(), graph.tier], |row| row.get(0),
                 ).optional().map_err(|error| map_sqlite_error(error, deadline))?;
                 let snapshot_id = if let Some(snapshot_id) = snapshot_id {
-                    self.verify_existing_graph(snapshot_id, graph, deadline)?;
+                    self.verify_existing_graph(encoded.candidate_id, snapshot_id, graph, deadline)?;
                     snapshot_id
                 } else {
                     self.connection.execute(
@@ -567,7 +609,7 @@ impl CacheStore {
                     [],
                 )
                 .map_err(|error| map_sqlite_error(error, deadline))?;
-            ensure_time(deadline)
+            ensure_time(deadline).map_err(CachePublicationFailure::from)
         })();
         match result {
             Ok(()) => match self.connection.execute_batch("COMMIT") {
@@ -580,7 +622,7 @@ impl CacheStore {
                 Err(error) => {
                     let mapped = map_sqlite_error(error, deadline);
                     let _ = self.connection.execute_batch("ROLLBACK");
-                    Err(mapped)
+                    Err(mapped.into())
                 }
             },
             Err(error) => {
@@ -608,82 +650,6 @@ impl CacheStore {
             while rows.next()?.is_some() {}
             Ok(())
         })();
-    }
-
-    fn verify_existing_graph(
-        &self,
-        snapshot_id: i64,
-        graph: &PreparedGraph,
-        deadline: &Deadline,
-    ) -> Result<(), CacheError> {
-        let stored_symbols =
-            self.load_graph_payloads(snapshot_id, "graph_symbols", "symbol", deadline)?;
-        // Edges have no serialized copy to compare, so compare the identity the
-        // columns carry: `edge_key` is the lossless edge identity and
-        // `confidence` is the one attribute it deliberately excludes.
-        let stored_edges =
-            self.load_graph_payloads(snapshot_id, "graph_edges", "edge_key", deadline)?;
-        let stored_confidence =
-            self.load_graph_text(snapshot_id, "graph_edges", "confidence", deadline)?;
-        if stored_symbols.len() != graph.symbols.len()
-            || stored_edges.len() != graph.edges.len()
-            || stored_confidence.len() != graph.edges.len()
-            || stored_symbols
-                .iter()
-                .zip(&graph.symbols)
-                .any(|(stored, row)| *stored != row.payload)
-            || stored_edges
-                .iter()
-                .zip(&graph.edges)
-                .any(|(stored, row)| *stored != row.edge_key)
-            || stored_confidence
-                .iter()
-                .zip(&graph.edges)
-                .any(|(stored, row)| *stored != row.confidence)
-        {
-            return Err(CacheError::CandidateConflict);
-        }
-        Ok(())
-    }
-
-    fn load_graph_payloads(
-        &self,
-        snapshot_id: i64,
-        table: &str,
-        column: &str,
-        deadline: &Deadline,
-    ) -> Result<Vec<Vec<u8>>, CacheError> {
-        let sql =
-            format!("SELECT {column} FROM {table} WHERE snapshot_id = ?1 ORDER BY ordinal ASC");
-        let mut statement = self
-            .connection
-            .prepare(&sql)
-            .map_err(|error| map_sqlite_error(error, deadline))?;
-        statement
-            .query_map([snapshot_id], |row| row.get::<_, Vec<u8>>(0))
-            .map_err(|error| map_sqlite_error(error, deadline))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| map_sqlite_error(error, deadline))
-    }
-
-    fn load_graph_text(
-        &self,
-        snapshot_id: i64,
-        table: &str,
-        column: &str,
-        deadline: &Deadline,
-    ) -> Result<Vec<String>, CacheError> {
-        let sql =
-            format!("SELECT {column} FROM {table} WHERE snapshot_id = ?1 ORDER BY ordinal ASC");
-        let mut statement = self
-            .connection
-            .prepare(&sql)
-            .map_err(|error| map_sqlite_error(error, deadline))?;
-        statement
-            .query_map([snapshot_id], |row| row.get::<_, String>(0))
-            .map_err(|error| map_sqlite_error(error, deadline))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| map_sqlite_error(error, deadline))
     }
 
     fn load_graph_rows(
@@ -1167,95 +1133,6 @@ impl CacheStore {
         }
         self.load_candidate_inner(fingerprint_from_blob(bytes)?, only_tier, deadline)
             .map(Some)
-    }
-
-    fn verify_existing_candidate(
-        &self,
-        candidate: &PreparedCandidate,
-        deadline: &Deadline,
-    ) -> Result<(), CacheError> {
-        let count: i64 = self
-            .connection
-            .query_row(
-                "SELECT count(*) FROM candidate_files WHERE candidate_id = ?1",
-                [candidate.candidate_id.as_slice()],
-                |row| row.get(0),
-            )
-            .map_err(|error| map_sqlite_error(error, deadline))?;
-        if count
-            != i64::try_from(candidate.files.len()).map_err(|_| CacheError::InvalidCandidate)?
-        {
-            return Err(CacheError::CandidateConflict);
-        }
-        let omissions = {
-            let mut statement = self
-                .connection
-                .prepare("SELECT path, reason, detail FROM candidate_omissions WHERE candidate_id = ?1 ORDER BY path ASC, reason ASC, detail ASC")
-                .map_err(|error| map_sqlite_error(error, deadline))?;
-            statement
-                .query_map([candidate.candidate_id.as_slice()], |row| {
-                    Ok(super::CacheOmission {
-                        path: row.get(0)?,
-                        reason: row.get(1)?,
-                        detail: row.get(2)?,
-                    })
-                })
-                .map_err(|error| map_sqlite_error(error, deadline))?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|error| map_sqlite_error(error, deadline))?
-        };
-        if omissions != candidate.omissions {
-            return Err(CacheError::CandidateConflict);
-        }
-        for file in &candidate.files {
-            ensure_time(deadline)?;
-            let found: Option<CandidateFileRow> = self
-                .connection
-                .query_row(
-                    "SELECT language, content_hash, size_bytes, mtime_seconds, mtime_nanoseconds, package_assignment, file_facts, file_subgraph FROM candidate_files WHERE candidate_id = ?1 AND path = ?2",
-                    params![candidate.candidate_id.as_slice(), file.path],
-                    |row| {
-                        Ok(CandidateFileRow {
-                            language: row.get(0)?,
-                            content_hash: row.get(1)?,
-                            size_bytes: row.get(2)?,
-                            mtime_seconds: row.get(3)?,
-                            mtime_nanoseconds: row.get(4)?,
-                            package_assignment: row.get(5)?,
-                            file_facts: row.get(6)?,
-                            file_subgraph: row.get(7)?,
-                        })
-                    },
-                )
-                .optional()
-                .map_err(|error| map_sqlite_error(error, deadline))?;
-            let Some(found) = found else {
-                return Err(CacheError::CandidateConflict);
-            };
-            if found.language != file.language
-                || found.content_hash != file.content_hash
-                || found.size_bytes != file.size_bytes
-                || found.mtime_seconds != file.mtime_seconds
-                || found.mtime_nanoseconds != file.mtime_nanoseconds
-                || found.package_assignment != file.package_assignment
-                || found.file_facts != file.facts
-            {
-                return Err(CacheError::CandidateConflict);
-            }
-            match (found.file_subgraph, &file.subgraph) {
-                (None, Some(subgraph)) => {
-                    self.connection.execute(
-                        "UPDATE candidate_files SET file_subgraph = ?1 WHERE candidate_id = ?2 AND path = ?3 AND file_subgraph IS NULL",
-                        params![subgraph, candidate.candidate_id.as_slice(), file.path],
-                    ).map_err(|error| map_sqlite_error(error, deadline))?;
-                }
-                (Some(stored), Some(incoming)) if stored != *incoming => {
-                    return Err(CacheError::CandidateConflict);
-                }
-                _ => {}
-            }
-        }
-        Ok(())
     }
 
     fn load_candidate_inner(
@@ -2582,6 +2459,12 @@ impl GraphRead for CacheGraphRead<'_, '_> {
 
 #[cfg(test)]
 mod tests {
+    mod candidate_conflicts;
+    mod metadata_refresh;
+    mod publication_diagnostics;
+    mod publication_slots;
+    mod publication_transactions;
+
     use super::*;
     use code2graph::{
         Confidence, Descriptor, Occurrence, Provenance, RefRole, SymbolKind, Visibility,
@@ -3010,85 +2893,6 @@ mod tests {
     }
 
     #[test]
-    fn candidate_publication_keeps_complete_and_partial_slots_independent() {
-        let temp = tempdir().expect("tempdir");
-        let root = temp.path().join("project");
-        fs::create_dir(&root).expect("project");
-        let cache_location = location(&root, temp.path());
-        let store =
-            CacheStore::open_writable(&cache_location, &root, &Deadline::new(None)).expect("open");
-        let complete = candidate(CacheCompleteness::Complete, ResolverCacheTier::Name);
-        let partial = candidate(CacheCompleteness::Partial, ResolverCacheTier::Name);
-        store
-            .publish_candidate(&complete, &Deadline::new(None))
-            .expect("publish complete");
-        store
-            .publish_candidate(&partial, &Deadline::new(None))
-            .expect("publish partial");
-        assert_eq!(
-            store
-                .load_active(
-                    ResolverCacheTier::Name,
-                    CacheCompleteness::Complete,
-                    complete.compatibility.id,
-                    &Deadline::new(None)
-                )
-                .expect("load")
-                .expect("active")
-                .candidate_id,
-            complete.candidate_id
-        );
-        assert_eq!(
-            store
-                .load_active(
-                    ResolverCacheTier::Name,
-                    CacheCompleteness::Partial,
-                    partial.compatibility.id,
-                    &Deadline::new(None)
-                )
-                .expect("load")
-                .expect("active")
-                .candidate_id,
-            partial.candidate_id
-        );
-        let incompatible = CompatibilityFingerprint::new(
-            super::super::LanguageFeatureFingerprint::current(),
-            super::super::PackageFingerprint::from_normalized(["different-package"]),
-        );
-        let loaded_complete = store
-            .load_active(
-                ResolverCacheTier::Name,
-                CacheCompleteness::Complete,
-                complete.compatibility.id,
-                &Deadline::new(None),
-            )
-            .expect("load")
-            .expect("active");
-        assert_eq!(
-            loaded_complete.compatibility.language_fingerprint,
-            complete.compatibility.language_fingerprint
-        );
-        assert_eq!(
-            loaded_complete.compatibility.package_fingerprint,
-            complete.compatibility.package_fingerprint
-        );
-        assert!(
-            store
-                .load_active(
-                    ResolverCacheTier::Name,
-                    CacheCompleteness::Complete,
-                    incompatible,
-                    &Deadline::new(None),
-                )
-                .expect("compatibility miss")
-                .is_none()
-        );
-        store
-            .publish_candidate(&complete, &Deadline::new(None))
-            .expect("idempotent publish");
-    }
-
-    #[test]
     fn fresh_writable_cache_enables_incremental_auto_vacuum() {
         // Locks the auto_vacuum mode set in `initialize_or_join_v1`: it must be
         // INCREMENTAL (2) so publish-time GC can reclaim freed pages. The mode is
@@ -3107,76 +2911,6 @@ mod tests {
         assert_eq!(
             auto_vacuum, 2,
             "fresh cache must use INCREMENTAL auto_vacuum"
-        );
-    }
-
-    #[test]
-    fn superseding_a_slot_garbage_collects_the_prior_snapshot_and_candidate() {
-        let temp = tempdir().expect("tempdir");
-        let root = temp.path().join("project");
-        fs::create_dir(&root).expect("project");
-        let cache_location = location(&root, temp.path());
-        let store =
-            CacheStore::open_writable(&cache_location, &root, &Deadline::new(None)).expect("open");
-        // Two distinct candidates (different input digests) target the same
-        // (tier, completeness) slot; publishing B flips active away from A.
-        let a = candidate_with_hash(
-            CacheCompleteness::Complete,
-            ResolverCacheTier::Name,
-            [3; 32],
-        );
-        let b = candidate_with_hash(
-            CacheCompleteness::Complete,
-            ResolverCacheTier::Name,
-            [7; 32],
-        );
-        assert_ne!(a.candidate_id, b.candidate_id);
-        store
-            .publish_candidate(&a, &Deadline::new(None))
-            .expect("publish a");
-        store
-            .publish_candidate(&b, &Deadline::new(None))
-            .expect("publish b");
-
-        // Only B's snapshot survives; A's snapshot and candidate rows are gone.
-        let snapshot_count: i64 = store
-            .connection
-            .query_row("SELECT count(*) FROM graph_snapshots", [], |row| row.get(0))
-            .expect("snapshot count");
-        assert_eq!(snapshot_count, 1);
-        let surviving_candidate: Vec<u8> = store
-            .connection
-            .query_row("SELECT candidate_id FROM graph_snapshots", [], |row| {
-                row.get(0)
-            })
-            .expect("surviving candidate");
-        assert_eq!(
-            surviving_candidate.as_slice(),
-            b.candidate_id.as_bytes().as_slice()
-        );
-        let a_candidate_count: i64 = store
-            .connection
-            .query_row(
-                "SELECT count(*) FROM candidates WHERE candidate_id = ?1",
-                [a.candidate_id.as_bytes().as_slice()],
-                |row| row.get(0),
-            )
-            .expect("a candidate count");
-        assert_eq!(a_candidate_count, 0);
-
-        // B remains the queryable active snapshot for the slot.
-        assert_eq!(
-            store
-                .load_active(
-                    ResolverCacheTier::Name,
-                    CacheCompleteness::Complete,
-                    b.compatibility.id,
-                    &Deadline::new(None),
-                )
-                .expect("load")
-                .expect("active")
-                .candidate_id,
-            b.candidate_id
         );
     }
 
@@ -3330,109 +3064,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_inconsistent_candidates_and_conflicting_republication() {
-        let temp = tempdir().expect("tempdir");
-        let root = temp.path().join("project");
-        fs::create_dir(&root).expect("project");
-        let cache_location = location(&root, temp.path());
-        let store =
-            CacheStore::open_writable(&cache_location, &root, &Deadline::new(None)).expect("open");
-
-        let mut unsorted = candidate(CacheCompleteness::Partial, ResolverCacheTier::Name);
-        unsorted.omissions = vec![
-            super::super::CacheOmission {
-                path: "z".into(),
-                reason: "x".into(),
-                detail: "detail".into(),
-            },
-            super::super::CacheOmission {
-                path: "a".into(),
-                reason: "x".into(),
-                detail: "detail".into(),
-            },
-        ];
-        unsorted.candidate_id = CandidateId::new(
-            unsorted.compatibility.id,
-            unsorted.input_digest,
-            unsorted.completeness,
-            &unsorted.omissions,
-        );
-        assert!(matches!(
-            store.publish_candidate(&unsorted, &Deadline::new(None)),
-            Err(CacheError::InvalidCandidate)
-        ));
-
-        let mut overflow = candidate(CacheCompleteness::Complete, ResolverCacheTier::Name);
-        overflow.created_at_ns = u64::MAX;
-        assert!(matches!(
-            store.publish_candidate(&overflow, &Deadline::new(None)),
-            Err(CacheError::InvalidCandidate)
-        ));
-
-        let original = candidate(CacheCompleteness::Complete, ResolverCacheTier::Name);
-        store
-            .publish_candidate(&original, &Deadline::new(None))
-            .expect("publish");
-        let mut republished = original.clone();
-        republished.created_at_ns += 1;
-        republished.compatibility.created_at_ns += 1;
-        store
-            .publish_candidate(&republished, &Deadline::new(None))
-            .expect("timestamps are store-owned and do not conflict");
-        assert_eq!(
-            store
-                .load_active(
-                    ResolverCacheTier::Name,
-                    CacheCompleteness::Complete,
-                    original.compatibility.id,
-                    &Deadline::new(None),
-                )
-                .expect("load")
-                .expect("active")
-                .created_at_ns,
-            original.created_at_ns
-        );
-    }
-
-    #[test]
-    fn scope_publication_requires_and_restores_every_owned_subgraph() {
-        let temp = tempdir().expect("tempdir");
-        let root = temp.path().join("project");
-        fs::create_dir(&root).expect("project");
-        let cache_location = location(&root, temp.path());
-        let store =
-            CacheStore::open_writable(&cache_location, &root, &Deadline::new(None)).expect("open");
-        let mut snapshot = candidate(CacheCompleteness::Complete, ResolverCacheTier::Scope);
-        assert!(matches!(
-            store.publish_candidate(&snapshot, &Deadline::new(None)),
-            Err(CacheError::InvalidCandidate)
-        ));
-        // A Name snapshot may be published first; a later Scope publication
-        // for the identical candidate augments its per-file subgraphs.
-        let mut name = snapshot.clone();
-        name.tier_graphs = vec![(
-            ResolverCacheTier::Name,
-            CodeGraph {
-                symbols: Vec::new(),
-                edges: Vec::new(),
-            },
-        )];
-        store
-            .publish_candidate(&name, &Deadline::new(None))
-            .expect("publish name");
-        let mut incremental = IncrementalGraph::new();
-        incremental.upsert(&snapshot.files[0].facts);
-        snapshot.files[0].subgraph = incremental.subgraph("src/a.rs").cloned();
-        store
-            .publish_candidate(&snapshot, &Deadline::new(None))
-            .expect("augment with scope");
-        let restored = store
-            .hydrate_scope_subgraphs(snapshot.candidate_id, &Deadline::new(None))
-            .expect("hydrate");
-        assert!(restored.subgraph("src/a.rs").is_some());
-    }
-
-    #[test]
     fn missing_normalized_graph_snapshot_is_typed() {
         let temp = tempdir().expect("tempdir");
         let root = temp.path().join("project");
@@ -3467,101 +3098,6 @@ mod tests {
             ),
             Err(CacheError::SnapshotMissing)
         ));
-    }
-
-    #[test]
-    fn failed_graph_write_rolls_back_candidate_and_active_publication() {
-        let temp = tempdir().expect("tempdir");
-        let root = temp.path().join("project");
-        fs::create_dir(&root).expect("project");
-        let cache_location = location(&root, temp.path());
-        let store =
-            CacheStore::open_writable(&cache_location, &root, &Deadline::new(None)).expect("open");
-        let candidate = candidate(CacheCompleteness::Complete, ResolverCacheTier::Name);
-        store.connection.execute_batch(
-            "CREATE TEMP TRIGGER fail_graph BEFORE INSERT ON graph_snapshots BEGIN SELECT RAISE(ABORT, 'injected graph failure'); END",
-        ).expect("failure trigger");
-        assert!(matches!(
-            store.publish_candidate(&candidate, &Deadline::new(None)),
-            Err(CacheError::Access)
-        ));
-        let candidate_count: i64 = store
-            .connection
-            .query_row(
-                "SELECT count(*) FROM candidates WHERE candidate_id = ?1",
-                [candidate.candidate_id.as_bytes().as_slice()],
-                |row| row.get(0),
-            )
-            .expect("candidate count");
-        let active_count: i64 = store
-            .connection
-            .query_row("SELECT count(*) FROM active_snapshots", [], |row| {
-                row.get(0)
-            })
-            .expect("active count");
-        assert_eq!((candidate_count, active_count), (0, 0));
-        store
-            .connection
-            .execute_batch("DROP TRIGGER fail_graph")
-            .expect("drop trigger");
-        store
-            .publish_candidate(&candidate, &Deadline::new(None))
-            .expect("retry");
-    }
-
-    #[test]
-    fn concurrent_publishers_commit_whole_candidates() {
-        use std::sync::{Arc, Barrier};
-
-        let temp = tempdir().expect("tempdir");
-        let root = temp.path().join("project");
-        fs::create_dir(&root).expect("project");
-        let cache_location = location(&root, temp.path());
-        CacheStore::open_writable(&cache_location, &root, &Deadline::new(None))
-            .expect("initialize");
-        let barrier = Arc::new(Barrier::new(2));
-        let handles: Vec<_> = [CacheCompleteness::Complete, CacheCompleteness::Partial]
-            .into_iter()
-            .map(|completeness| {
-                let barrier = Arc::clone(&barrier);
-                let root = root.clone();
-                let cache_location = cache_location.clone();
-                std::thread::spawn(move || {
-                    let store =
-                        CacheStore::open_writable(&cache_location, &root, &Deadline::new(None))?;
-                    let candidate = candidate(completeness, ResolverCacheTier::Name);
-                    barrier.wait();
-                    store.publish_candidate(&candidate, &Deadline::new(None))?;
-                    Ok::<_, CacheError>(candidate.candidate_id)
-                })
-            })
-            .collect();
-        let ids: Vec<_> = handles
-            .into_iter()
-            .map(|handle| handle.join().expect("publisher thread").expect("publish"))
-            .collect();
-        let store =
-            CacheStore::open_frozen(&cache_location, &root, &Deadline::new(None)).expect("frozen");
-        for (completeness, id) in [CacheCompleteness::Complete, CacheCompleteness::Partial]
-            .into_iter()
-            .zip(ids)
-        {
-            assert_eq!(
-                store
-                    .load_active(
-                        ResolverCacheTier::Name,
-                        completeness,
-                        candidate(completeness, ResolverCacheTier::Name)
-                            .compatibility
-                            .id,
-                        &Deadline::new(None),
-                    )
-                    .expect("load")
-                    .expect("active")
-                    .candidate_id,
-                id
-            );
-        }
     }
 
     #[test]
