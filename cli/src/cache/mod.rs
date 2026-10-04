@@ -21,8 +21,10 @@ pub use fingerprint::{
 };
 pub use location::{CacheLocation, ProjectKey};
 pub use schema::SCHEMA_VERSION;
-pub(crate) use store::CacheLoadFailure;
 pub use store::{CacheGraphRead, CacheStore, SnapshotSummary};
+pub(crate) use store::{
+    CacheLoadFailure, CachePublicationFailure, PublicationConflict, escaped_publication_identifier,
+};
 #[cfg(test)]
 pub(crate) use store::{reset_whole_graph_loads, whole_graph_loads};
 #[cfg(test)]

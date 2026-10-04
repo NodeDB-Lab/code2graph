@@ -31,6 +31,12 @@ use super::{
 };
 
 mod candidate_publication;
+mod graph_publication;
+mod publication_error;
+
+pub(crate) use publication_error::{
+    CachePublicationFailure, PublicationConflict, PublicationField, escaped_publication_identifier,
+};
 
 const LOCK_WAIT_CAP: Duration = Duration::from_secs(2);
 
@@ -339,8 +345,17 @@ impl CacheStore {
         candidate: &CandidateSnapshot,
         deadline: &Deadline,
     ) -> Result<(), CacheError> {
+        self.publish_candidate_detailed(candidate, deadline)
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn publish_candidate_detailed(
+        &self,
+        candidate: &CandidateSnapshot,
+        deadline: &Deadline,
+    ) -> Result<(), CachePublicationFailure> {
         if !self.writable {
-            return Err(CacheError::ReadOnly);
+            return Err(CacheError::ReadOnly.into());
         }
         ensure_time(deadline)?;
         let encoded = PreparedCandidate::new(candidate, deadline)?;
@@ -366,10 +381,24 @@ impl CacheStore {
             // Publication timestamps are store-owned. Fingerprint components,
             // unlike timestamps, are exact compatibility content and conflicts
             // must be rejected even when the derived compatibility id matches.
-            if stored_compatibility.0 != encoded.language_fingerprint
-                || stored_compatibility.1 != encoded.package_fingerprint
-            {
-                return Err(CacheError::CandidateConflict);
+            for (differs, field) in [
+                (
+                    stored_compatibility.0 != encoded.language_fingerprint,
+                    PublicationField::LanguageFingerprint,
+                ),
+                (
+                    stored_compatibility.1 != encoded.package_fingerprint,
+                    PublicationField::PackageFingerprint,
+                ),
+            ] {
+                if differs {
+                    return Err(CachePublicationFailure::conflict(
+                        encoded.candidate_id,
+                        field,
+                        None,
+                        None,
+                    ));
+                }
             }
             let existing: Option<ExistingCandidateRow> = self.connection.query_row(
                 "SELECT compatibility_id, input_digest, completeness, inventory_file_count, inventory_total_bytes FROM candidates WHERE candidate_id = ?1",
@@ -385,13 +414,36 @@ impl CacheStore {
                 },
             ).optional().map_err(|error| map_sqlite_error(error, deadline))?;
             if let Some(existing) = existing {
-                if existing.compatibility_id != encoded.compatibility_id
-                    || existing.input_digest != encoded.input_digest
-                    || existing.completeness != encoded.completeness
-                    || existing.inventory_file_count != encoded.inventory_file_count
-                    || existing.inventory_total_bytes != encoded.inventory_total_bytes
-                {
-                    return Err(CacheError::CandidateConflict);
+                for (differs, field) in [
+                    (
+                        existing.compatibility_id != encoded.compatibility_id,
+                        PublicationField::CompatibilityId,
+                    ),
+                    (
+                        existing.input_digest != encoded.input_digest,
+                        PublicationField::InputDigest,
+                    ),
+                    (
+                        existing.completeness != encoded.completeness,
+                        PublicationField::Completeness,
+                    ),
+                    (
+                        existing.inventory_file_count != encoded.inventory_file_count,
+                        PublicationField::InventoryFileCount,
+                    ),
+                    (
+                        existing.inventory_total_bytes != encoded.inventory_total_bytes,
+                        PublicationField::InventoryTotalBytes,
+                    ),
+                ] {
+                    if differs {
+                        return Err(CachePublicationFailure::conflict(
+                            encoded.candidate_id,
+                            field,
+                            None,
+                            None,
+                        ));
+                    }
                 }
                 self.verify_existing_candidate(&encoded, deadline)?;
             } else {
@@ -446,7 +498,7 @@ impl CacheStore {
                     params![encoded.candidate_id.as_slice(), graph.tier], |row| row.get(0),
                 ).optional().map_err(|error| map_sqlite_error(error, deadline))?;
                 let snapshot_id = if let Some(snapshot_id) = snapshot_id {
-                    self.verify_existing_graph(snapshot_id, graph, deadline)?;
+                    self.verify_existing_graph(encoded.candidate_id, snapshot_id, graph, deadline)?;
                     snapshot_id
                 } else {
                     self.connection.execute(
@@ -557,7 +609,7 @@ impl CacheStore {
                     [],
                 )
                 .map_err(|error| map_sqlite_error(error, deadline))?;
-            ensure_time(deadline)
+            ensure_time(deadline).map_err(CachePublicationFailure::from)
         })();
         match result {
             Ok(()) => match self.connection.execute_batch("COMMIT") {
@@ -570,7 +622,7 @@ impl CacheStore {
                 Err(error) => {
                     let mapped = map_sqlite_error(error, deadline);
                     let _ = self.connection.execute_batch("ROLLBACK");
-                    Err(mapped)
+                    Err(mapped.into())
                 }
             },
             Err(error) => {
@@ -598,82 +650,6 @@ impl CacheStore {
             while rows.next()?.is_some() {}
             Ok(())
         })();
-    }
-
-    fn verify_existing_graph(
-        &self,
-        snapshot_id: i64,
-        graph: &PreparedGraph,
-        deadline: &Deadline,
-    ) -> Result<(), CacheError> {
-        let stored_symbols =
-            self.load_graph_payloads(snapshot_id, "graph_symbols", "symbol", deadline)?;
-        // Edges have no serialized copy to compare, so compare the identity the
-        // columns carry: `edge_key` is the lossless edge identity and
-        // `confidence` is the one attribute it deliberately excludes.
-        let stored_edges =
-            self.load_graph_payloads(snapshot_id, "graph_edges", "edge_key", deadline)?;
-        let stored_confidence =
-            self.load_graph_text(snapshot_id, "graph_edges", "confidence", deadline)?;
-        if stored_symbols.len() != graph.symbols.len()
-            || stored_edges.len() != graph.edges.len()
-            || stored_confidence.len() != graph.edges.len()
-            || stored_symbols
-                .iter()
-                .zip(&graph.symbols)
-                .any(|(stored, row)| *stored != row.payload)
-            || stored_edges
-                .iter()
-                .zip(&graph.edges)
-                .any(|(stored, row)| *stored != row.edge_key)
-            || stored_confidence
-                .iter()
-                .zip(&graph.edges)
-                .any(|(stored, row)| *stored != row.confidence)
-        {
-            return Err(CacheError::CandidateConflict);
-        }
-        Ok(())
-    }
-
-    fn load_graph_payloads(
-        &self,
-        snapshot_id: i64,
-        table: &str,
-        column: &str,
-        deadline: &Deadline,
-    ) -> Result<Vec<Vec<u8>>, CacheError> {
-        let sql =
-            format!("SELECT {column} FROM {table} WHERE snapshot_id = ?1 ORDER BY ordinal ASC");
-        let mut statement = self
-            .connection
-            .prepare(&sql)
-            .map_err(|error| map_sqlite_error(error, deadline))?;
-        statement
-            .query_map([snapshot_id], |row| row.get::<_, Vec<u8>>(0))
-            .map_err(|error| map_sqlite_error(error, deadline))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| map_sqlite_error(error, deadline))
-    }
-
-    fn load_graph_text(
-        &self,
-        snapshot_id: i64,
-        table: &str,
-        column: &str,
-        deadline: &Deadline,
-    ) -> Result<Vec<String>, CacheError> {
-        let sql =
-            format!("SELECT {column} FROM {table} WHERE snapshot_id = ?1 ORDER BY ordinal ASC");
-        let mut statement = self
-            .connection
-            .prepare(&sql)
-            .map_err(|error| map_sqlite_error(error, deadline))?;
-        statement
-            .query_map([snapshot_id], |row| row.get::<_, String>(0))
-            .map_err(|error| map_sqlite_error(error, deadline))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| map_sqlite_error(error, deadline))
     }
 
     fn load_graph_rows(
@@ -2485,6 +2461,7 @@ impl GraphRead for CacheGraphRead<'_, '_> {
 mod tests {
     mod candidate_conflicts;
     mod metadata_refresh;
+    mod publication_diagnostics;
     mod publication_slots;
     mod publication_transactions;
 

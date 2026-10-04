@@ -4,6 +4,7 @@
 
 mod plan;
 mod prepare;
+mod publication_error;
 mod publish;
 mod resolve;
 mod types;

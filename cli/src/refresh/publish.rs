@@ -117,7 +117,11 @@ fn prepare_and_publish_inner<E: FactsExtractor>(
         // CacheStore begins its SQLite write transaction only here. All
         // filesystem discovery, bounded reads, extraction, and revalidation
         // above deliberately happen outside that transaction.
-        store.publish_candidate(&prepared.snapshot, inputs.deadline)?;
+        store
+            .publish_candidate_detailed(&prepared.snapshot, inputs.deadline)
+            .map_err(|error| {
+                super::publication_error::publication_error(error, &inputs.selection.canonical_root)
+            })?;
         inputs.deadline.check(inputs.cancellation)?;
         // The snapshot was just published verbatim; build the loaded view from
         // the in-memory candidate instead of re-decoding it back out of SQLite.
@@ -356,6 +360,8 @@ mod tests {
     use crate::project::{ProjectSelection, SelectionProvenance};
     use crate::worker::RequestId;
     use crate::{Cancellation, Deadline, NeverCancelled};
+
+    mod publication_diagnostics;
 
     struct Extractor;
     impl FactsExtractor for Extractor {

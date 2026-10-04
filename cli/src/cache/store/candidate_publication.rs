@@ -3,7 +3,8 @@
 use rusqlite::{OptionalExtension, params};
 
 use super::{
-    CacheError, CacheStore, CandidateId, Deadline, PreparedCandidate, ensure_time, map_sqlite_error,
+    CacheError, CachePublicationFailure, CacheStore, CandidateId, Deadline, PreparedCandidate,
+    PublicationField, ensure_time, map_sqlite_error,
 };
 
 #[derive(Debug)]
@@ -23,7 +24,7 @@ impl CacheStore {
         &self,
         candidate: &PreparedCandidate,
         deadline: &Deadline,
-    ) -> Result<(), CacheError> {
+    ) -> Result<(), CachePublicationFailure> {
         let count: i64 = self
             .connection
             .query_row(
@@ -35,12 +36,22 @@ impl CacheStore {
         if count
             != i64::try_from(candidate.files.len()).map_err(|_| CacheError::InvalidCandidate)?
         {
-            return Err(CacheError::CandidateConflict);
+            return Err(CachePublicationFailure::conflict(
+                candidate.candidate_id,
+                PublicationField::FileCount,
+                None,
+                None,
+            ));
         }
         let omissions =
             self.load_omissions(CandidateId::from_bytes(candidate.candidate_id), deadline)?;
         if omissions != candidate.omissions {
-            return Err(CacheError::CandidateConflict);
+            return Err(CachePublicationFailure::conflict(
+                candidate.candidate_id,
+                PublicationField::Omissions,
+                None,
+                None,
+            ));
         }
         let mut update_mtime = self.connection.prepare(
             "UPDATE candidate_files SET mtime_seconds = ?1, mtime_nanoseconds = ?2 WHERE candidate_id = ?3 AND path = ?4",
@@ -68,15 +79,37 @@ impl CacheStore {
                 .optional()
                 .map_err(|error| map_sqlite_error(error, deadline))?;
             let Some(found) = found else {
-                return Err(CacheError::CandidateConflict);
+                return Err(CachePublicationFailure::conflict(
+                    candidate.candidate_id,
+                    PublicationField::FilePresence,
+                    Some(&file.path),
+                    None,
+                ));
             };
-            if found.language != file.language
-                || found.content_hash != file.content_hash
-                || found.size_bytes != file.size_bytes
-                || found.package_assignment != file.package_assignment
-                || found.file_facts != file.facts
-            {
-                return Err(CacheError::CandidateConflict);
+            for (differs, field) in [
+                (found.language != file.language, PublicationField::Language),
+                (
+                    found.content_hash != file.content_hash,
+                    PublicationField::ContentHash,
+                ),
+                (
+                    found.size_bytes != file.size_bytes,
+                    PublicationField::SizeBytes,
+                ),
+                (
+                    found.package_assignment != file.package_assignment,
+                    PublicationField::PackageAssignment,
+                ),
+                (found.file_facts != file.facts, PublicationField::FileFacts),
+            ] {
+                if differs {
+                    return Err(CachePublicationFailure::conflict(
+                        candidate.candidate_id,
+                        field,
+                        Some(&file.path),
+                        None,
+                    ));
+                }
             }
             match (found.file_subgraph, &file.subgraph) {
                 (None, Some(subgraph)) => {
@@ -86,7 +119,12 @@ impl CacheStore {
                     ).map_err(|error| map_sqlite_error(error, deadline))?;
                 }
                 (Some(stored), Some(incoming)) if stored != *incoming => {
-                    return Err(CacheError::CandidateConflict);
+                    return Err(CachePublicationFailure::conflict(
+                        candidate.candidate_id,
+                        PublicationField::FileSubgraph,
+                        Some(&file.path),
+                        None,
+                    ));
                 }
                 _ => {}
             }

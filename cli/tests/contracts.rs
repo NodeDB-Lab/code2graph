@@ -19,6 +19,8 @@ use code2graph_cli::{
 fn legacy_public_error_enum_shapes_compile() {
     let cache_error = CacheError::InvalidFacts;
     assert!(matches!(cache_error, CacheError::InvalidFacts));
+    let conflict = CacheError::CandidateConflict;
+    assert!(matches!(conflict, CacheError::CandidateConflict));
     let worker_error = WorkerErrorCode::Extraction;
     assert_eq!(worker_error as u16, 1);
     assert_eq!(WorkerErrorCode::InvalidRequest as u16, 2);
