@@ -42,6 +42,9 @@ impl CacheStore {
         if omissions != candidate.omissions {
             return Err(CacheError::CandidateConflict);
         }
+        let mut update_mtime = self.connection.prepare(
+            "UPDATE candidate_files SET mtime_seconds = ?1, mtime_nanoseconds = ?2 WHERE candidate_id = ?3 AND path = ?4",
+        ).map_err(|error| map_sqlite_error(error, deadline))?;
         for file in &candidate.files {
             ensure_time(deadline)?;
             let found: Option<CandidateFileRow> = self
@@ -70,8 +73,6 @@ impl CacheStore {
             if found.language != file.language
                 || found.content_hash != file.content_hash
                 || found.size_bytes != file.size_bytes
-                || found.mtime_seconds != file.mtime_seconds
-                || found.mtime_nanoseconds != file.mtime_nanoseconds
                 || found.package_assignment != file.package_assignment
                 || found.file_facts != file.facts
             {
@@ -88,6 +89,18 @@ impl CacheStore {
                     return Err(CacheError::CandidateConflict);
                 }
                 _ => {}
+            }
+            if found.mtime_seconds != file.mtime_seconds
+                || found.mtime_nanoseconds != file.mtime_nanoseconds
+            {
+                update_mtime
+                    .execute(params![
+                        file.mtime_seconds,
+                        file.mtime_nanoseconds,
+                        candidate.candidate_id.as_slice(),
+                        file.path,
+                    ])
+                    .map_err(|error| map_sqlite_error(error, deadline))?;
             }
         }
         Ok(())

@@ -2484,6 +2484,7 @@ impl GraphRead for CacheGraphRead<'_, '_> {
 #[cfg(test)]
 mod tests {
     mod candidate_conflicts;
+    mod metadata_refresh;
     mod publication_slots;
     mod publication_transactions;
 

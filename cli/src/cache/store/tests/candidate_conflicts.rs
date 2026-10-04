@@ -104,3 +104,48 @@ fn scope_publication_requires_and_restores_every_owned_subgraph() {
         .expect("hydrate");
     assert!(restored.subgraph("src/a.rs").is_some());
 }
+
+#[test]
+fn metadata_refresh_rejects_each_conflicting_immutable_file_payload() {
+    use super::metadata_refresh::{Fixture, add_scope, hint};
+
+    let changes = [
+        "size_bytes = size_bytes + 1",
+        "language = 'python'",
+        "content_hash = zeroblob(32)",
+        "package_assignment = 'different-package'",
+        "file_facts = X'00'",
+        "file_subgraph = X'00'",
+    ];
+    for change in changes {
+        let fixture = Fixture::new();
+        let mut original = candidate(CacheCompleteness::Complete, ResolverCacheTier::Scope);
+        add_scope(&mut original);
+        fixture.publish(&original);
+        fixture
+            .store
+            .connection
+            .execute(
+                &format!("UPDATE candidate_files SET {change} WHERE candidate_id = ?1"),
+                [original.candidate_id.as_bytes().as_slice()],
+            )
+            .expect("conflicting payload");
+        let mut incoming = original.clone();
+        incoming.files[0].mtime = hint(1_000_000_000, 0);
+        assert!(
+            matches!(
+                fixture
+                    .store
+                    .publish_candidate(&incoming, &Deadline::new(None)),
+                Err(CacheError::CandidateConflict)
+            ),
+            "{change}"
+        );
+        let stored: (Option<i64>, Option<i64>) = fixture.store.connection.query_row(
+            "SELECT mtime_seconds, mtime_nanoseconds FROM candidate_files WHERE candidate_id = ?1",
+            [original.candidate_id.as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).expect("stored hint");
+        assert_eq!(stored, (Some(0), Some(4)), "{change}");
+    }
+}
